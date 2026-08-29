@@ -13,17 +13,17 @@
     {
       "id": "pages-foundation",
       "title": "Publish the status-only progress hub",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "foundation-contracts"
       ],
-      "summary": "Rendered the status, plan, challenge, comparison, test, and commit sections for the status-only Pages hub.",
-      "completed_commit": null
+      "summary": "Published the status, plan, challenge, comparison, test, and commit sections as the status-only Pages hub.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "autonomous-assets",
       "title": "Build the autonomous no-Blender asset pipeline",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "pages-foundation"
       ],

@@ -7,7 +7,7 @@ use std::{
 
 use midcreek_cs_1::sitegen::{
     ProgressDocument, ProgressStatus, ReferenceManifest, RepoFacts, SiteInputs,
-    VerificationSummary, WorkflowSummary, build_site, plan_task_ids_from_markdown,
+    VerificationSummary, WorkflowSummary, assemble_site, build_site, plan_task_ids_from_markdown,
     validate_progress, validate_reference_manifest,
 };
 use serde::Deserialize;
@@ -52,18 +52,7 @@ fn main() -> ExitCode {
             current,
             result,
             output,
-        } => {
-            let previous = previous
-                .as_deref()
-                .map_or_else(|| "<none>".into(), |path| path.display().to_string());
-            eprintln!(
-                "assemble is not available yet (previous: {previous}, current: {}, result: {}, output: {})",
-                current.display(),
-                result.display(),
-                output.display()
-            );
-            ExitCode::from(2)
-        }
+        } => assemble(previous.as_deref(), &current, &result, &output),
     }
 }
 
@@ -224,6 +213,25 @@ fn build(inputs_path: &Path, output: &Path) -> ExitCode {
     match build_site(&inputs, output) {
         Ok(manifest) => {
             println!("{}", manifest.source_commit);
+            ExitCode::SUCCESS
+        }
+        Err(error) => content_error(error.to_string()),
+    }
+}
+
+fn assemble(
+    previous: Option<&Path>,
+    current: &Path,
+    result_path: &Path,
+    output: &Path,
+) -> ExitCode {
+    let workflow = match read_json::<WorkflowSummary>(result_path) {
+        Ok(value) => value,
+        Err(message) => return content_error(message),
+    };
+    match assemble_site(previous, current, &workflow, output) {
+        Ok(disposition) => {
+            println!("{disposition:?}");
             ExitCode::SUCCESS
         }
         Err(error) => content_error(error.to_string()),

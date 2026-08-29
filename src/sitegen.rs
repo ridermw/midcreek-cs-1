@@ -361,6 +361,7 @@ pub enum SitegenError {
     MissingAltText { source: PathBuf },
     InvalidHtml { path: PathBuf, message: String },
     MissingPreviousArtifact { path: PathBuf },
+    OutputNotEmpty { path: PathBuf },
 }
 
 impl fmt::Display for SitegenError {
@@ -419,6 +420,13 @@ impl fmt::Display for SitegenError {
                 write!(
                     formatter,
                     "previous artifact is missing: {}",
+                    path.display()
+                )
+            }
+            Self::OutputNotEmpty { path } => {
+                write!(
+                    formatter,
+                    "assembly output directory is not empty: {}",
                     path.display()
                 )
             }
@@ -819,6 +827,29 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
     })
 }
 
+pub fn assemble_site(
+    previous: Option<&Path>,
+    current: &Path,
+    workflow: &WorkflowSummary,
+    output: &Path,
+) -> Result<BuildDisposition, SitegenError> {
+    require_directory(current)?;
+    prepare_assembly_output(output)?;
+
+    let green = workflow.native == GateStatus::Passed && workflow.web == GateStatus::Passed;
+    let disposition = if green {
+        BuildDisposition::GreenReplacement
+    } else if let Some(previous) = previous {
+        copy_retained_artifacts(previous, output)?;
+        BuildDisposition::FailedRetainLastGreen
+    } else {
+        BuildDisposition::FirstRunStatusOnly
+    };
+
+    copy_site_tree(current, current, output, !green)?;
+    Ok(disposition)
+}
+
 pub fn validate_site_output(
     output: &Path,
     progress: &ProgressDocument,
@@ -929,6 +960,149 @@ fn prepare_output(output: &Path) -> Result<(), SitegenError> {
     })
 }
 
+fn prepare_assembly_output(output: &Path) -> Result<(), SitegenError> {
+    validate_output_path(output)?;
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(SitegenError::UnsafeOutputPath {
+                path: output.to_path_buf(),
+            })
+        }
+        Ok(_) => {
+            let mut entries = fs::read_dir(output).map_err(|error| SitegenError::Io {
+                path: output.to_path_buf(),
+                message: error.to_string(),
+            })?;
+            if entries.next().is_some() {
+                return Err(SitegenError::OutputNotEmpty {
+                    path: output.to_path_buf(),
+                });
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(output)
+            .map_err(|error| SitegenError::Io {
+                path: output.to_path_buf(),
+                message: error.to_string(),
+            }),
+        Err(error) => Err(SitegenError::Io {
+            path: output.to_path_buf(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+fn require_directory(path: &Path) -> Result<(), SitegenError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(SitegenError::MissingInput {
+            path: path.to_path_buf(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(SitegenError::MissingInput {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(error) => Err(SitegenError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+fn copy_retained_artifacts(previous: &Path, output: &Path) -> Result<(), SitegenError> {
+    require_directory(previous)?;
+    for relative in ["play", "screenshots", "last-green.json"] {
+        let source = previous.join(relative);
+        match fs::symlink_metadata(&source) {
+            Ok(_) => copy_artifact(&source, &output.join(relative))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SitegenError::Io {
+                    path: source,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_site_tree(
+    root: &Path,
+    source: &Path,
+    output: &Path,
+    skip_retained: bool,
+) -> Result<(), SitegenError> {
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| SitegenError::Io {
+            path: source.to_path_buf(),
+            message: error.to_string(),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| SitegenError::Io {
+            path: source.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("directory entries remain below the copied root");
+        if skip_retained && is_retained_artifact(relative) {
+            continue;
+        }
+        copy_artifact(&path, &output.join(relative))?;
+    }
+    Ok(())
+}
+
+fn copy_artifact(source: &Path, destination: &Path) -> Result<(), SitegenError> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| SitegenError::Io {
+        path: source.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(SitegenError::UnsafeOutputPath {
+            path: source.to_path_buf(),
+        });
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(destination).map_err(|error| SitegenError::Io {
+            path: destination.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        return copy_site_tree(source, source, destination, false);
+    }
+    if !metadata.is_file() {
+        return Err(SitegenError::MissingPreviousArtifact {
+            path: source.to_path_buf(),
+        });
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| SitegenError::Io {
+            path: parent.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    }
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| SitegenError::Io {
+            path: destination.to_path_buf(),
+            message: error.to_string(),
+        })
+}
+
+fn is_retained_artifact(relative: &Path) -> bool {
+    matches!(
+        relative.components().next(),
+        Some(std::path::Component::Normal(name))
+            if name == "play" || name == "screenshots" || name == "last-green.json"
+    )
+}
+
 pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
     if output.as_os_str().is_empty() || output == Path::new(".") {
         return Err(SitegenError::UnsafeOutputPath {
@@ -1036,13 +1210,19 @@ fn render_status(
     source_commit: &str,
     updated_at: &str,
 ) -> String {
+    let source_label =
+        if [inputs.workflow.native, inputs.workflow.web].contains(&GateStatus::Failed) {
+            format!("CURRENT SOURCE: FAILED AT {}", short_sha(source_commit))
+        } else {
+            short_sha(source_commit)
+        };
     format!(
         r#"<div class="status-item"><span>Source</span><strong>{}</strong></div>
         <div class="status-item"><span>Native</span><strong class="status-{}">{}</strong></div>
         <div class="status-item"><span>Web</span><strong class="status-{}">{}</strong></div>
         <div class="status-item status-current"><span>Working now</span><strong>{}</strong></div>
         <div class="status-item"><span>Updated</span><strong>{}</strong></div>"#,
-        escape_html(&short_sha(source_commit)),
+        escape_html(&source_label),
         gate_class(inputs.workflow.native),
         gate_label(inputs.workflow.native),
         gate_class(inputs.workflow.web),

@@ -83,6 +83,13 @@ impl Drop for GeneratedSite {
 
 pub fn build_fixture_site(name: &str) -> Result<GeneratedSite, SitegenError> {
     let inputs = site_inputs(name);
+    build_site_from_inputs(name, &inputs)
+}
+
+pub fn build_site_from_inputs(
+    name: &str,
+    inputs: &SiteInputs,
+) -> Result<GeneratedSite, SitegenError> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after the Unix epoch")
@@ -93,7 +100,7 @@ pub fn build_fixture_site(name: &str) -> Result<GeneratedSite, SitegenError> {
         name,
         SITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let manifest = build_site(&inputs, &output)?;
+    let manifest = build_site(inputs, &output)?;
 
     Ok(GeneratedSite {
         root: output,

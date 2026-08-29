@@ -12,8 +12,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use support::{
-    assert_has_element_id, assert_text, build_fixture_site, fixture, plan_ids, read, repo_facts,
-    sha256, site_inputs, validate_fixture,
+    assert_has_element_id, assert_text, build_fixture_site, build_site_from_inputs, fixture,
+    plan_ids, read, repo_facts, sha256, site_inputs, validate_fixture,
 };
 
 mod generated_site_contract {
@@ -46,6 +46,17 @@ mod generated_site_contract {
         assert_text(&html, "#play", "No verified playable build yet");
         assert!(!html.contains("<canvas"));
         assert!(!html.contains("<iframe"));
+    }
+
+    #[test]
+    fn labels_the_current_source_when_verification_failed() {
+        let mut inputs = site_inputs("green");
+        inputs.workflow.native = midcreek_cs_1::sitegen::GateStatus::Failed;
+        let html = build_site_from_inputs("failed-native", &inputs)
+            .unwrap()
+            .index_html();
+
+        assert_text(&html, "#build-status", "CURRENT SOURCE: FAILED AT 11111111");
     }
 
     #[test]
@@ -447,7 +458,7 @@ mod progress_contract {
             assert_eq!(output.status.code(), Some(0));
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                "pages-foundation\n"
+                "autonomous-assets\n"
             );
             assert!(output.stderr.is_empty());
         }
@@ -472,14 +483,14 @@ mod progress_contract {
                 ),
                 (
                     "pages-foundation",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["foundation-contracts"][..],
-                    "Rendered the status, plan, challenge, comparison, test, and commit sections for the status-only Pages hub.",
-                    None,
+                    "Published the status, plan, challenge, comparison, test, and commit sections as the status-only Pages hub.",
+                    Some("HEAD"),
                 ),
                 (
                     "autonomous-assets",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["pages-foundation"][..],
                     "Generate autonomous rigged and modular game assets after the status hub is live.",
                     None,

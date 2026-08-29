@@ -1,0 +1,193 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Test site generation
+        run: |
+          cargo test --test sitegen_contract
+          cargo test --test pages_assembly_contract
+
+      - name: Validate publication inputs
+        run: |
+          cargo run --bin sitegen -- validate \
+            --progress docs/progress.json \
+            --plan docs/implementation-plan.md \
+            --repository .
+
+  publish:
+    name: Publish
+    if: always()
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check out previous Pages site
+        id: previous
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          ref: pages-live
+          path: previous-pages
+
+      - name: Build and assemble current status
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+
+          pages_root="$RUNNER_TEMP/pages"
+          current="$pages_root/current"
+          output="$pages_root/output"
+          mkdir -p "$pages_root" "$output"
+
+          if [[ "$VERIFY_RESULT" == "success" ]]; then
+            native_status="passed"
+            passed=1
+            failed=0
+          else
+            native_status="failed"
+            passed=0
+            failed=1
+          fi
+
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n \
+            --arg source_commit "$GITHUB_SHA" \
+            --arg run_url "$run_url" \
+            --arg native "$native_status" \
+            --argjson passed "$passed" \
+            --argjson failed "$failed" \
+            '{
+              source_commit: $source_commit,
+              run_url: $run_url,
+              native: $native,
+              web: "skipped_dependency",
+              gates: [{
+                name: "Progress and site tests",
+                status: $native,
+                passed: $passed,
+                failed: $failed,
+                duration_ms: 0,
+                artifact_url: null
+              }]
+            }' > "$pages_root/workflow.json"
+
+          known_commits="$(git rev-list --all | jq -R -s 'split("\n") | map(select(length > 0))')"
+          commits='[]'
+          while IFS= read -r sha; do
+            subject="$(git show -s --format=%s "$sha")"
+            committed_at="$(git show -s --format=%cI "$sha")"
+            commits="$(jq \
+              --arg sha "$sha" \
+              --arg subject "$subject" \
+              --arg committed_at "$committed_at" \
+              '. + [{
+                sha: $sha,
+                subject: $subject,
+                committed_at: $committed_at,
+                task_id: null
+              }]' <<< "$commits")"
+          done < <(git rev-list --max-count=20 HEAD)
+
+          jq -n \
+            --arg head_sha "$GITHUB_SHA" \
+            --argjson known_commits "$known_commits" \
+            --argjson commits "$commits" \
+            '{
+              head_sha: $head_sha,
+              known_commits: $known_commits,
+              commits: $commits
+            }' > "$pages_root/repo.json"
+
+          jq -n \
+            --arg progress "$GITHUB_WORKSPACE/docs/progress.json" \
+            --arg plan "$GITHUB_WORKSPACE/docs/implementation-plan.md" \
+            --arg reference_manifest "$GITHUB_WORKSPACE/docs/reference/manifest.json" \
+            --arg workflow "$pages_root/workflow.json" \
+            --arg repo "$pages_root/repo.json" \
+            '{
+              progress: $progress,
+              plan: $plan,
+              reference_manifest: $reference_manifest,
+              workflow: $workflow,
+              repo: $repo,
+              verification: null
+            }' > "$pages_root/inputs.json"
+
+          cargo run --bin sitegen -- build \
+            --inputs "$pages_root/inputs.json" \
+            --output "$current"
+
+          previous_args=()
+          if [[ "${{ steps.previous.outcome }}" == "success" ]]; then
+            previous_args=(--previous "$GITHUB_WORKSPACE/previous-pages")
+          fi
+          cargo run --bin sitegen -- assemble \
+            "${previous_args[@]}" \
+            --current "$current" \
+            --result "$pages_root/workflow.json" \
+            --output "$output"
+          touch "$output/.nojekyll"
+
+      - name: Push generated Pages branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          pages_root="$RUNNER_TEMP/pages"
+          output="$pages_root/output"
+          git_dir="$pages_root/publish.git"
+          git init --bare "$git_dir"
+          git --git-dir="$git_dir" symbolic-ref HEAD refs/heads/pages-live
+          git --git-dir="$git_dir" --work-tree="$output" config user.name github-actions[bot]
+          git --git-dir="$git_dir" --work-tree="$output" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git --git-dir="$git_dir" --work-tree="$output" add -A
+          git --git-dir="$git_dir" --work-tree="$output" commit \
+            -m "docs: publish status for ${GITHUB_SHA}"
+          git --git-dir="$git_dir" remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git --git-dir="$git_dir" push --force origin pages-live
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/pages/output
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
