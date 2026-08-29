@@ -387,6 +387,10 @@ permissions:
 
 ## Commit and Push Policy
 
+This unattended hill climb works directly on `main`. It does not depend on pull
+requests or human review. Before each push, confirm the current branch is
+`main`.
+
 The project uses frequent, green checkpoints:
 
 1. Mark a task `in_progress`, validate progress data, commit, and push.
