@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -29,7 +30,43 @@ fn first_run_without_game_publishes_status_only() {
 }
 
 #[test]
-fn failed_run_retains_previous_game() {
+fn status_only_run_retains_previous_game_without_failure_disposition() {
+    let previous = fixture_site(
+        "previous-green",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+            ("screenshots/center.png", "last-known-good-frame"),
+            ("last-green.json", r#"{"source_commit":"old"}"#),
+        ],
+    );
+    let current = fixture_site(
+        "current-status-only",
+        &[
+            ("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN"),
+            ("site.css", "current styles"),
+        ],
+    );
+    let output = TempDirectory::new("status-only-output");
+    let old_hash = sha256(previous.path().join("play/game_bg.wasm"));
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    assert_eq!(sha256(output.path().join("play/game_bg.wasm")), old_hash);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(index.contains("CURRENT SOURCE: PASSED; WEB NOT RUN"));
+    assert!(!index.contains("FAILED"));
+}
+
+#[test]
+fn native_failure_retains_previous_game_with_failure_disposition() {
     let previous = fixture_site(
         "previous-green",
         &[
@@ -72,6 +109,67 @@ fn failed_run_retains_previous_game() {
             .unwrap()
             .contains("CURRENT SOURCE: FAILED")
     );
+}
+
+#[test]
+fn web_failure_retains_previous_game_with_failure_disposition() {
+    let previous = fixture_site(
+        "previous-green-web-failure",
+        &[("play/game_bg.wasm", "last-known-good-game")],
+    );
+    let current = fixture_site(
+        "current-web-failure",
+        &[("index.html", "CURRENT SOURCE: FAILED")],
+    );
+    let output = TempDirectory::new("web-failure-output");
+    let old_hash = sha256(previous.path().join("play/game_bg.wasm"));
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Failed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    assert_eq!(sha256(output.path().join("play/game_bg.wasm")), old_hash);
+}
+
+#[test]
+fn assemble_cli_reports_status_only_retention_without_failure_label() {
+    let previous = fixture_site(
+        "previous-green-cli",
+        &[("play/game_bg.wasm", "last-known-good-game")],
+    );
+    let current = fixture_site(
+        "current-status-only-cli",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let output = TempDirectory::new("status-only-cli-output");
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    let command = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+        .args([
+            "assemble",
+            "--previous",
+            previous.path().to_str().unwrap(),
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--output",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("sitegen should launch");
+
+    assert_eq!(command.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(command.stdout).unwrap(),
+        "RetainLastGreen\n"
+    );
+    assert!(command.stderr.is_empty());
 }
 
 #[test]
@@ -202,6 +300,17 @@ fn workflow_summary(native: GateStatus, web: GateStatus) -> WorkflowSummary {
         web,
         gates: Vec::new(),
     }
+}
+
+fn status_only_workflow() -> WorkflowSummary {
+    serde_json::from_str(
+        &fs::read_to_string(fixture_root().join("pages/native-passed-web-skipped.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 fn fixture_site(name: &str, files: &[(&str, &str)]) -> TempDirectory {

@@ -231,7 +231,7 @@ fn assemble(
     };
     match assemble_site(previous, current, &workflow, output) {
         Ok(disposition) => {
-            println!("{disposition:?}");
+            println!("{disposition}");
             ExitCode::SUCCESS
         }
         Err(error) => content_error(error.to_string()),

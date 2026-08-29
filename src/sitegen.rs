@@ -146,8 +146,20 @@ pub struct SiteInputs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildDisposition {
     GreenReplacement,
+    RetainLastGreen,
     FailedRetainLastGreen,
     FirstRunStatusOnly,
+}
+
+impl fmt::Display for BuildDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GreenReplacement => formatter.write_str("GreenReplacement"),
+            Self::RetainLastGreen => formatter.write_str("RetainLastGreen"),
+            Self::FailedRetainLastGreen => formatter.write_str("FailedRetainLastGreen"),
+            Self::FirstRunStatusOnly => formatter.write_str("FirstRunStatusOnly"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -836,17 +848,28 @@ pub fn assemble_site(
     require_directory(current)?;
     prepare_assembly_output(output)?;
 
-    let green = workflow.native == GateStatus::Passed && workflow.web == GateStatus::Passed;
-    let disposition = if green {
-        BuildDisposition::GreenReplacement
-    } else if let Some(previous) = previous {
-        copy_retained_artifacts(previous, output)?;
-        BuildDisposition::FailedRetainLastGreen
-    } else {
-        BuildDisposition::FirstRunStatusOnly
+    let disposition = match (workflow.native, workflow.web, previous) {
+        (GateStatus::Passed, GateStatus::Passed, _) => BuildDisposition::GreenReplacement,
+        (GateStatus::Failed, _, Some(previous)) | (_, GateStatus::Failed, Some(previous)) => {
+            copy_retained_artifacts(previous, output)?;
+            BuildDisposition::FailedRetainLastGreen
+        }
+        (GateStatus::Failed, _, None) | (_, GateStatus::Failed, None) => {
+            BuildDisposition::FirstRunStatusOnly
+        }
+        (_, _, Some(previous)) => {
+            copy_retained_artifacts(previous, output)?;
+            BuildDisposition::RetainLastGreen
+        }
+        (_, _, None) => BuildDisposition::FirstRunStatusOnly,
     };
 
-    copy_site_tree(current, current, output, !green)?;
+    copy_site_tree(
+        current,
+        current,
+        output,
+        disposition != BuildDisposition::GreenReplacement,
+    )?;
     Ok(disposition)
 }
 
