@@ -23,17 +23,17 @@
     {
       "id": "autonomous-assets",
       "title": "Build the autonomous no-Blender asset pipeline",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "pages-foundation"
       ],
-      "summary": "Generate autonomous rigged and modular game assets after the status hub is live.",
-      "completed_commit": null
+      "summary": "Generated every cel-shift asset autonomously from declarative RON: an 11-bone rigged technician with Idle, Walk and Repair clips, a merged eight-cabinet rack row with server slots and status lights, a cooling unit, the red utility cart and yellow step stool, and overhead tray plus black hose modules.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "data-hall",
       "title": "Load assets and build the data hall",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "autonomous-assets"
       ],
@@ -134,5 +134,15 @@
       "completed_commit": null
     }
   ],
-  "challenges": []
+  "challenges": [
+    {
+      "id": "byte-reproducible-assets-without-a-dcc",
+      "title": "Byte-reproducible rigged assets with no external content tool",
+      "status": "resolved",
+      "impact": "The plan forbids Blender, manual export, and human approval, so the rig, animation clips, and merged equipment geometry had to come from repository-owned source that a build gate can regenerate and byte-compare. Any hash-ordered map, embedded timestamp, or unquantized trigonometric value would have made the committed GLBs unverifiable.",
+      "approach": "Assets are declared in assets/source/*.ron and tessellated by src/assetgen.rs. Every collection is ordered by declaration order or by the fixed PaletteRole order, every float is quantized onto a 1e-6 grid with negative zero normalised away, and the asset generator string is a constant with no version, host, path, or time data. Static geometry is merged into one primitive per palette role so server slots and LEDs never become runtime entities.",
+      "resolution": "assetgen --check regenerates all five assets into two separate temporary roots, requires the two generations to be byte identical, and then requires the committed GLBs to match them exactly. tests/asset_contract.rs additionally parses every output and asserts node and scene names, the 11 named joints, the three clips, rigid skin weights, approved palette materials, finite bounds, valid indices, and the merge and triangle budgets.",
+      "resolved_commit": "HEAD"
+    }
+  ]
 }

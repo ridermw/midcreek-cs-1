@@ -12,10 +12,39 @@ scope.
 - Typed palette, scene, collider, camera, and timing contracts
 - Approved cel-shift key art and character sheet in `docs/reference/`
 
+## Autonomous asset pipeline
+
+Every mesh is generated from repository-owned declarative RON. There is no
+external content tool, no third-party art, and no manual export step.
+
+- `assets/source/*.ron` — primitives, repeat lattices, palette roles, bone
+  bindings, and animation keyframes
+- `src/assetgen.rs` — validation, deterministic tessellation, merge by palette
+  role, rigid skinning, animation sampling, and the glTF writer
+- `assets/generated/*.glb` — committed outputs, regenerated and byte compared by
+  `assetgen --check`
+
+Generated assets:
+
+| Asset | Scenes | Highlights |
+|---|---|---|
+| `technician.glb` | `technician` | adult silhouette, 11-bone rigid skin, Idle/Walk/Repair clips, blue hard hat, hi-vis vest, slate shirt, dark trousers, brown boots, tool belt and wrench |
+| `rack.glb` | `rack-row` | eight merged cabinets, readable top plus lit and shadow faces, 96 server slots, 96 status lights, ink outline hull, contact shadow |
+| `cooling-unit.glb` | `cooling-unit` | grille fins, teal fan, coolant risers, status panel |
+| `utility-props.glb` | `utility-cart`, `step-stool` | red service cart with toolbox and casters, yellow stool with treads |
+| `infrastructure.glb` | `overhead-tray`, `hose-drop` | cable tray with hangers and bundles, black hose trunk with collars |
+
+Determinism rules: declaration or `PaletteRole::ALL` ordering everywhere, every
+written float quantized to a 1e-6 grid with negative zero normalized away, a
+constant generator string, and no timestamp, host, user, or path data in any
+output.
+
 ## Foundation gates
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test design
+cargo run --bin assetgen -- --write
+cargo run --bin assetgen -- --check
+cargo test
 ```

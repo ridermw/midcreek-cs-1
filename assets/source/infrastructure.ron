@@ -1,0 +1,133 @@
+// Cell Shift infrastructure: the overhead cable tray module and the black hose
+// drop module. Both are authored around their own origin so the hall can place
+// them at ceiling and drop height.
+(
+    asset: "infrastructure",
+    modules: [
+        (
+            name: "overhead-tray",
+            shapes: [
+                (
+                    name: "tray-base",
+                    role: RackShadow,
+                    primitive: Box(
+                        center: (0.0, 0.0, 0.0),
+                        half_extents: (0.35, 0.015, 8.0),
+                    ),
+                ),
+                (
+                    name: "tray-rail",
+                    role: RackShadow,
+                    repeat: [(count: 2, step: (0.68, 0.0, 0.0))],
+                    outline: Some(0.012),
+                    primitive: Box(
+                        center: (-0.34, 0.07, 0.0),
+                        half_extents: (0.015, 0.085, 8.0),
+                    ),
+                ),
+                (
+                    name: "tray-rung",
+                    role: RackShadow,
+                    repeat: [(count: 17, step: (0.0, 0.0, 1.0))],
+                    primitive: Box(
+                        center: (0.0, 0.02, -8.0),
+                        half_extents: (0.33, 0.010, 0.06),
+                    ),
+                ),
+                (
+                    name: "tray-hanger",
+                    role: HoseCharcoal,
+                    repeat: [(count: 9, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 0.50, -8.0),
+                        half_extents: (0.025, 0.42, 0.025),
+                    ),
+                ),
+                (
+                    name: "tray-bracket",
+                    role: Ink,
+                    repeat: [(count: 9, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 0.92, -8.0),
+                        half_extents: (0.10, 0.03, 0.10),
+                    ),
+                ),
+                (
+                    name: "tray-cable-bundle",
+                    role: TealAccent,
+                    primitive: Box(
+                        center: (-0.10, 0.09, 0.0),
+                        half_extents: (0.11, 0.035, 7.9),
+                    ),
+                ),
+                (
+                    name: "tray-cable-accent",
+                    role: SignatureYellow,
+                    primitive: Box(
+                        center: (0.15, 0.09, 0.0),
+                        half_extents: (0.06, 0.035, 7.9),
+                    ),
+                ),
+            ],
+        ),
+        (
+            name: "hose-drop",
+            shapes: [
+                (
+                    name: "hose-trunk",
+                    role: HoseCharcoal,
+                    outline: Some(0.014),
+                    primitive: Cylinder(
+                        center: (0.0, 0.0, 0.0),
+                        radius: 0.09,
+                        half_height: 1.90,
+                        axis: Y,
+                        segments: 10,
+                    ),
+                ),
+                (
+                    name: "hose-elbow",
+                    role: HoseCharcoal,
+                    primitive: Cylinder(
+                        center: (0.0, 1.86, 0.16),
+                        radius: 0.09,
+                        half_height: 0.18,
+                        axis: Z,
+                        segments: 10,
+                    ),
+                ),
+                (
+                    name: "hose-collar",
+                    role: RackShadow,
+                    repeat: [(count: 4, step: (0.0, -0.90, 0.0))],
+                    primitive: Cylinder(
+                        center: (0.0, 1.40, 0.0),
+                        radius: 0.115,
+                        half_height: 0.045,
+                        axis: Y,
+                        segments: 10,
+                    ),
+                ),
+                (
+                    name: "hose-cap",
+                    role: SignatureYellow,
+                    primitive: Cylinder(
+                        center: (0.0, -1.92, 0.0),
+                        radius: 0.12,
+                        half_height: 0.05,
+                        axis: Y,
+                        segments: 10,
+                    ),
+                ),
+                (
+                    name: "hose-contact-shadow",
+                    role: FloorShadow,
+                    primitive: Box(
+                        center: (0.14, -1.996, 0.0),
+                        half_extents: (0.28, 0.004, 0.26),
+                    ),
+                ),
+            ],
+        ),
+    ],
+)

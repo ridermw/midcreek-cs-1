@@ -1,0 +1,16 @@
+// A box with a zero half extent produces no surface and must be rejected.
+(
+    asset: "degenerate-box",
+    modules: [
+        (
+            name: "degenerate-box",
+            shapes: [
+                (
+                    name: "body",
+                    role: RackWhite,
+                    primitive: Box(center: (0.0, 1.0, 0.0), half_extents: (0.7, 0.0, 0.9)),
+                ),
+            ],
+        ),
+    ],
+)

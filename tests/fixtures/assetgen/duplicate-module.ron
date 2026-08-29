@@ -1,0 +1,26 @@
+// Two modules may not share a scene name.
+(
+    asset: "duplicate-module",
+    modules: [
+        (
+            name: "rack-row",
+            shapes: [
+                (
+                    name: "body",
+                    role: RackWhite,
+                    primitive: Box(center: (0.0, 1.0, 0.0), half_extents: (0.7, 1.0, 0.9)),
+                ),
+            ],
+        ),
+        (
+            name: "rack-row",
+            shapes: [
+                (
+                    name: "body",
+                    role: RackShadow,
+                    primitive: Box(center: (0.0, 1.0, 0.0), half_extents: (0.7, 1.0, 0.9)),
+                ),
+            ],
+        ),
+    ],
+)

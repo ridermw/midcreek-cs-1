@@ -456,10 +456,7 @@ mod progress_contract {
                 .expect("sitegen should launch");
 
             assert_eq!(output.status.code(), Some(0));
-            assert_eq!(
-                String::from_utf8(output.stdout).unwrap(),
-                "autonomous-assets\n"
-            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), "data-hall\n");
             assert!(output.stderr.is_empty());
         }
     }
@@ -490,14 +487,14 @@ mod progress_contract {
                 ),
                 (
                     "autonomous-assets",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["pages-foundation"][..],
-                    "Generate autonomous rigged and modular game assets after the status hub is live.",
-                    None,
+                    "Generated every cel-shift asset autonomously from declarative RON: an 11-bone rigged technician with Idle, Walk and Repair clips, a merged eight-cabinet rack row with server slots and status lights, a cooling unit, the red utility cart and yellow step stool, and overhead tray plus black hose modules.",
+                    Some("HEAD"),
                 ),
                 (
                     "data-hall",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["autonomous-assets"][..],
                     "Build the authored cel-shift data hall.",
                     None,
@@ -569,7 +566,6 @@ mod progress_contract {
 
             assert_eq!(document.schema_version, 1);
             assert_eq!(document.project, "Cell Shift Data Center POC");
-            assert!(document.challenges.is_empty());
             assert_eq!(document.tasks.len(), expected.len());
             for (task, (id, status, dependencies, summary, commit)) in
                 document.tasks.iter().zip(expected)
@@ -579,6 +575,26 @@ mod progress_contract {
                 assert_eq!(task.depends_on, dependencies);
                 assert_eq!(task.summary, summary);
                 assert_eq!(task.completed_commit.as_deref(), commit);
+            }
+
+            let challenges = document
+                .challenges
+                .iter()
+                .map(|challenge| challenge.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(challenges, vec!["byte-reproducible-assets-without-a-dcc"]);
+            for challenge in &document.challenges {
+                assert!(!challenge.title.trim().is_empty());
+                assert!(!challenge.impact.trim().is_empty());
+                assert!(!challenge.approach.trim().is_empty());
+                assert_eq!(challenge.status, ChallengeStatus::Resolved);
+                assert!(
+                    challenge
+                        .resolution
+                        .as_deref()
+                        .is_some_and(|resolution| !resolution.trim().is_empty())
+                );
+                assert_eq!(challenge.resolved_commit.as_deref(), Some("HEAD"));
             }
         }
 

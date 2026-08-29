@@ -1,0 +1,24 @@
+// A shape bound to a bone the rig never declares must be rejected.
+(
+    asset: "unknown-bone",
+    modules: [
+        (
+            name: "unknown-bone",
+            rig: Some((
+                skin_node: "unknown-bone-skin",
+                bones: [
+                    (name: "bone-hips", parent: None, translation: (0.0, 0.95, 0.0)),
+                ],
+                clips: [],
+            )),
+            shapes: [
+                (
+                    name: "body",
+                    role: WorkerSlate,
+                    bone: Some("bone-nope"),
+                    primitive: Box(center: (0.0, 0.95, 0.0), half_extents: (0.2, 0.2, 0.1)),
+                ),
+            ],
+        ),
+    ],
+)

@@ -12,8 +12,8 @@ bench = false
 
 [dependencies]
 bevy = { version = "=0.19.1", default-features = false, features = ["3d", "ui", "png", "serialize"] }
-gltf = "=1.4.1"
-gltf-json = "=1.4.1"
+gltf = { version = "=1.4.1", features = ["KHR_materials_unlit"] }
+gltf-json = { version = "=1.4.1", features = ["KHR_materials_unlit"] }
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
 pulldown-cmark = "=0.13.4"
 rand = "=0.10.2"

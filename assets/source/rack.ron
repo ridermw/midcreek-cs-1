@@ -1,0 +1,133 @@
+// Cell Shift rack row: eight merged cabinets with readable top, lit face, and
+// shadow face. Every server slot and status light is merged into the row mesh so
+// no slot becomes a runtime entity.
+(
+    asset: "rack",
+    modules: [
+        (
+            name: "rack-row",
+            shapes: [
+                (
+                    name: "cabinet-body",
+                    role: RackWhite,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    outline: Some(0.035),
+                    primitive: Box(
+                        center: (0.0, 1.08, -7.0),
+                        half_extents: (0.74, 1.05, 0.96),
+                    ),
+                ),
+                (
+                    name: "cabinet-top",
+                    role: RackWhite,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 2.16, -7.0),
+                        half_extents: (0.76, 0.03, 0.98),
+                    ),
+                ),
+                (
+                    name: "cabinet-plinth",
+                    role: Ink,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 0.02, -7.0),
+                        half_extents: (0.70, 0.02, 0.92),
+                    ),
+                ),
+                (
+                    name: "cabinet-shadow-face",
+                    role: RackShadow,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (-0.748, 1.08, -7.0),
+                        half_extents: (0.008, 1.02, 0.93),
+                    ),
+                ),
+                (
+                    name: "cabinet-seam",
+                    role: RackShadow,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 1.08, -7.955),
+                        half_extents: (0.745, 1.05, 0.005),
+                    ),
+                ),
+                (
+                    name: "server-slot-lit-face",
+                    role: Ink,
+                    repeat: [
+                        (count: 8, step: (0.0, 0.0, 2.0)),
+                        (count: 6, step: (0.0, 0.30, 0.0)),
+                    ],
+                    primitive: Box(
+                        center: (0.752, 0.42, -7.0),
+                        half_extents: (0.012, 0.075, 0.78),
+                    ),
+                ),
+                (
+                    name: "server-slot-shadow-face",
+                    role: Ink,
+                    repeat: [
+                        (count: 8, step: (0.0, 0.0, 2.0)),
+                        (count: 6, step: (0.0, 0.30, 0.0)),
+                    ],
+                    primitive: Box(
+                        center: (-0.752, 0.42, -7.0),
+                        half_extents: (0.012, 0.075, 0.78),
+                    ),
+                ),
+                (
+                    name: "status-light-lit-face",
+                    role: HealthyGreen,
+                    repeat: [
+                        (count: 8, step: (0.0, 0.0, 2.0)),
+                        (count: 6, step: (0.0, 0.30, 0.0)),
+                    ],
+                    primitive: Box(
+                        center: (0.760, 0.42, -7.62),
+                        half_extents: (0.008, 0.028, 0.05),
+                    ),
+                ),
+                (
+                    name: "status-light-shadow-face",
+                    role: HealthyGreen,
+                    repeat: [
+                        (count: 8, step: (0.0, 0.0, 2.0)),
+                        (count: 6, step: (0.0, 0.30, 0.0)),
+                    ],
+                    primitive: Box(
+                        center: (-0.760, 0.42, -7.62),
+                        half_extents: (0.008, 0.028, 0.05),
+                    ),
+                ),
+                (
+                    name: "link-strip-lit-face",
+                    role: TealAccent,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.746, 2.02, -7.0),
+                        half_extents: (0.012, 0.03, 0.62),
+                    ),
+                ),
+                (
+                    name: "link-strip-shadow-face",
+                    role: TealAccent,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (-0.746, 2.02, -7.0),
+                        half_extents: (0.012, 0.03, 0.62),
+                    ),
+                ),
+                (
+                    name: "rack-contact-shadow",
+                    role: FloorShadow,
+                    primitive: Box(
+                        center: (0.30, 0.004, 0.0),
+                        half_extents: (0.95, 0.004, 8.05),
+                    ),
+                ),
+            ],
+        ),
+    ],
+)

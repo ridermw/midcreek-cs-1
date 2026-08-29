@@ -1,0 +1,36 @@
+// Keyframe times must strictly ascend so the sampler is well defined.
+(
+    asset: "unsorted-keys",
+    modules: [
+        (
+            name: "unsorted-keys",
+            rig: Some((
+                skin_node: "unsorted-keys-skin",
+                bones: [
+                    (name: "bone-hips", parent: None, translation: (0.0, 0.95, 0.0)),
+                ],
+                clips: [
+                    (
+                        name: "Idle",
+                        duration: 1.0,
+                        tracks: [
+                            (bone: "bone-hips", channel: Rotation, keys: [
+                                (time: 0.0, value: (0.0, 0.0, 0.0)),
+                                (time: 0.0, value: (0.0, 5.0, 0.0)),
+                                (time: 1.0, value: (0.0, 0.0, 0.0)),
+                            ]),
+                        ],
+                    ),
+                ],
+            )),
+            shapes: [
+                (
+                    name: "body",
+                    role: WorkerSlate,
+                    bone: Some("bone-hips"),
+                    primitive: Box(center: (0.0, 0.95, 0.0), half_extents: (0.2, 0.2, 0.1)),
+                ),
+            ],
+        ),
+    ],
+)

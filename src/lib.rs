@@ -1,3 +1,4 @@
+pub mod assetgen;
 pub mod design;
 pub mod sitegen;
 
