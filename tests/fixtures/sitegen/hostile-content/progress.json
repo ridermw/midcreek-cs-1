@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "project": "Cell Shift {{PLAY}} <script>alert(\"project\")</script>",
+  "tasks": [
+    {
+      "id": "foundation-contracts",
+      "title": "Established <script>alert(\"task\")</script>",
+      "status": "done",
+      "depends_on": [],
+      "summary": "Pinned <script>alert(\"summary\")</script>.",
+      "completed_commit": "2222222222222222222222222222222222222222"
+    },
+    {
+      "id": "pages-foundation",
+      "title": "Publish the status-only progress hub",
+      "status": "in_progress",
+      "depends_on": [
+        "foundation-contracts"
+      ],
+      "summary": "Escaping source content.",
+      "completed_commit": null
+    },
+    {
+      "id": "autonomous-assets",
+      "title": "Build the autonomous no-Blender asset pipeline",
+      "status": "future",
+      "depends_on": [
+        "pages-foundation"
+      ],
+      "summary": "Generate assets later.",
+      "completed_commit": null
+    }
+  ],
+  "challenges": [
+    {
+      "id": "hostile-content",
+      "title": "Challenge <script>alert(\"challenge\")</script>",
+      "status": "open",
+      "impact": "Source content could execute as markup.",
+      "approach": "Escape every generated string.",
+      "resolution": null,
+      "resolved_commit": null
+    }
+  ]
+}

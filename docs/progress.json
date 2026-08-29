@@ -17,7 +17,7 @@
       "depends_on": [
         "foundation-contracts"
       ],
-      "summary": "Building the canonical progress model and status-only Pages site.",
+      "summary": "Rendered the status, plan, challenge, comparison, test, and commit sections for the status-only Pages hub.",
       "completed_commit": null
     },
     {

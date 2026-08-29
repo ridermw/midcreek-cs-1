@@ -2,8 +2,8 @@ mod support;
 
 use midcreek_cs_1::sitegen::{
     Challenge, ChallengeStatus, ProgressError, ProgressStatus, ReferenceError, ReferenceManifest,
-    plan_task_ids_from_markdown, resolve_commit_ref, validate_progress,
-    validate_reference_manifest,
+    SitegenError, build_site, plan_task_ids_from_markdown, resolve_commit_ref,
+    validate_output_path, validate_progress, validate_reference_manifest, validate_site_output,
 };
 use std::{
     fs,
@@ -11,7 +11,346 @@ use std::{
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use support::{fixture, plan_ids, read, repo_facts, sha256, validate_fixture};
+use support::{
+    assert_has_element_id, assert_text, build_fixture_site, fixture, plan_ids, read, repo_facts,
+    sha256, site_inputs, validate_fixture,
+};
+
+mod generated_site_contract {
+    use super::*;
+
+    #[test]
+    fn renders_every_required_section() {
+        let output = build_fixture_site("green").unwrap();
+        let html = output.index_html();
+
+        for id in [
+            "build-status",
+            "play",
+            "comparison",
+            "progress",
+            "screenshots",
+            "plan",
+            "challenges",
+            "tests",
+            "commits",
+        ] {
+            assert_has_element_id(&html, id);
+        }
+    }
+
+    #[test]
+    fn reports_that_no_verified_playable_build_exists() {
+        let html = build_fixture_site("green").unwrap().index_html();
+
+        assert_text(&html, "#play", "No verified playable build yet");
+        assert!(!html.contains("<canvas"));
+        assert!(!html.contains("<iframe"));
+    }
+
+    #[test]
+    fn preserves_ascii_diagrams_as_preformatted_text() {
+        let html = build_fixture_site("green").unwrap().index_html();
+
+        assert!(html.contains("<pre><code class=\"language-text\">"));
+        assert!(html.contains("main push"));
+    }
+
+    #[test]
+    fn escapes_progress_and_commit_content() {
+        let html = build_fixture_site("hostile-content").unwrap().index_html();
+
+        assert!(!html.contains("<script>alert("));
+        assert!(html.contains("&lt;script&gt;alert("));
+    }
+
+    #[test]
+    fn renders_template_tokens_from_source_content_as_text() {
+        let html = build_fixture_site("hostile-content").unwrap().index_html();
+
+        assert!(html.contains("{{PLAY}}"));
+        assert_has_element_id(&html, "play");
+        assert_eq!(html.matches("No verified playable build yet").count(), 1);
+    }
+
+    #[test]
+    fn comparison_images_are_accessible_and_copied_locally() {
+        let site = build_fixture_site("green").unwrap();
+        let html = site.index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#comparison img").unwrap();
+        let images = document.select(&selector).collect::<Vec<_>>();
+
+        assert_eq!(images.len(), 2);
+        for image in images {
+            let alt = image.value().attr("alt").unwrap_or_default();
+            let source = image.value().attr("src").unwrap_or_default();
+            assert!(!alt.trim().is_empty());
+            assert!(!source.starts_with('/'));
+            assert!(
+                site.root().join(source).is_file(),
+                "{source} was not copied"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_tasks_link_to_rendered_plan_headings() {
+        let html = build_fixture_site("green").unwrap().index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#progress a[href^=\"#plan-\"]").unwrap();
+        let links = document.select(&selector).collect::<Vec<_>>();
+
+        assert_eq!(links.len(), 3);
+        for link in links {
+            let target = link.value().attr("href").unwrap();
+            assert_has_element_id(&html, target.trim_start_matches('#'));
+        }
+    }
+
+    #[test]
+    fn emits_only_declared_site_files() {
+        let site = build_fixture_site("green").unwrap();
+        let generated = &site.manifest().generated_files;
+
+        assert_eq!(
+            generated,
+            &[
+                Path::new("index.html").to_path_buf(),
+                Path::new("reference/cel-shift-character-sheet.png").to_path_buf(),
+                Path::new("reference/cel-shift-key-art.png").to_path_buf(),
+                Path::new("site.css").to_path_buf(),
+                Path::new("site.js").to_path_buf(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_cli_renders_the_fixture_site() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output_dir = std::env::temp_dir().join(format!(
+            "midcreek-sitegen-cli-{}-{unique}",
+            std::process::id()
+        ));
+        let output = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(root)
+            .args([
+                "build",
+                "--inputs",
+                "tests/fixtures/sitegen/green/inputs.json",
+                "--output",
+                output_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_has_element_id(&read(output_dir.join("index.html")), "build-status");
+        fs::remove_dir_all(output_dir).unwrap();
+    }
+
+    #[test]
+    fn comparison_script_clamps_pointer_and_keyboard_updates() {
+        let site = build_fixture_site("green").unwrap();
+        let script = site.root().join("site.js");
+        let harness = r#"
+const fs = require("fs");
+const listeners = {};
+const properties = {};
+const comparison = {
+  style: { setProperty: (name, value) => { properties[name] = value; } }
+};
+const control = {
+  value: "250",
+  attributes: {},
+  closest: () => comparison,
+  addEventListener: (name, callback) => { listeners[name] = callback; },
+  setAttribute: function(name, value) { this.attributes[name] = value; }
+};
+global.document = {
+  querySelectorAll: (selector) =>
+    selector === "[data-compare-control]" ? [control] : [],
+  querySelector: () => null
+};
+global.window = {};
+eval(fs.readFileSync(process.argv[1], "utf8"));
+if (properties["--comparison"] !== "100%") process.exit(10);
+if (control.attributes["aria-valuenow"] !== "100") process.exit(11);
+control.value = "-20";
+listeners.input();
+if (properties["--comparison"] !== "0%") process.exit(12);
+control.value = "40";
+listeners.change();
+if (properties["--comparison"] !== "40%") process.exit(13);
+"#;
+        let output = Command::new("node")
+            .args(["-e", harness, script.to_str().unwrap()])
+            .output()
+            .expect("Node should execute the dependency-free site script");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+mod output_validation_contract {
+    use super::*;
+
+    #[test]
+    fn rejects_more_than_one_main_element() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace("</body>", "<main id=\"extra-main\"></main></body>")
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+        assert!(
+            matches!(result, Err(SitegenError::InvalidHtml { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_element_ids() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace(
+                "<section class=\"panel section-panel\" id=\"play\">",
+                "<section class=\"panel section-panel\" id=\"build-status\">",
+            )
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+        assert!(
+            matches!(result, Err(SitegenError::InvalidHtml { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_images_without_alt_text() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace("alt=\"Approved Cel Shift key art reference\"", "alt=\"\"")
+        });
+
+        assert_eq!(
+            validate_site_output(site.root(), &fixture("green/progress.json")),
+            Err(SitegenError::MissingAltText {
+                source: Path::new("index.html").to_path_buf(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_missing_local_resources() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace("href=\"site.css\"", "href=\"missing.css\"")
+        });
+
+        assert_eq!(
+            validate_site_output(site.root(), &fixture("green/progress.json")),
+            Err(SitegenError::BrokenLocalLink {
+                source: Path::new("index.html").to_path_buf(),
+                target: Path::new("missing.css").to_path_buf(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_local_paths() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace("href=\"site.css\"", "href=\"/Users/example/site.css\"")
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+        assert!(
+            matches!(result, Err(SitegenError::InvalidHtml { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_inline_script_content() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace("</body>", "<script>alert(1)</script></body>")
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+        assert!(
+            matches!(result, Err(SitegenError::InvalidHtml { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_progress_tasks_that_do_not_link_to_their_plan_heading() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace(
+                "data-progress-task=\"pages-foundation\" href=\"#plan-pages-foundation\"",
+                "data-progress-task=\"pages-foundation\" href=\"#play\"",
+            )
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+        assert!(
+            matches!(result, Err(SitegenError::InvalidHtml { .. })),
+            "{result:?}"
+        );
+    }
+
+    fn mutate_index(site: &support::GeneratedSite, mutation: impl FnOnce(String) -> String) {
+        let path = site.root().join("index.html");
+        fs::write(&path, mutation(read(&path))).unwrap();
+    }
+}
+
+mod build_safety_contract {
+    use super::*;
+
+    #[test]
+    fn rejects_source_directories_as_site_output() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        assert_eq!(
+            validate_output_path(&repository.join("docs")),
+            Err(SitegenError::UnsafeOutputPath {
+                path: repository.join("docs"),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_reference_paths_outside_the_approved_manifest() {
+        let mut inputs = site_inputs("green");
+        inputs.reference_manifest.assets[0].public_path = "../../Cargo.toml".to_owned();
+        let output =
+            std::env::temp_dir().join(format!("midcreek-unsafe-reference-{}", std::process::id()));
+
+        let result = build_site(&inputs, &output);
+        let _ = fs::remove_dir_all(output);
+
+        assert!(matches!(result, Err(SitegenError::Reference(_))));
+    }
+}
 
 mod progress_contract {
     use super::*;
@@ -135,7 +474,7 @@ mod progress_contract {
                     "pages-foundation",
                     ProgressStatus::InProgress,
                     &["foundation-contracts"][..],
-                    "Building the canonical progress model and status-only Pages site.",
+                    "Rendered the status, plan, challenge, comparison, test, and commit sections for the status-only Pages hub.",
                     None,
                 ),
                 (

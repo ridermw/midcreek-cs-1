@@ -1,0 +1,8 @@
+{
+  "progress": "progress.json",
+  "plan": "plan.md",
+  "reference_manifest": "../../../../docs/reference/manifest.json",
+  "workflow": "workflow.json",
+  "repo": "repo.json",
+  "verification": null
+}

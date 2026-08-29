@@ -1,0 +1,16 @@
+{
+  "source_commit": "1111111111111111111111111111111111111111",
+  "run_url": "https://github.com/ridermw/midcreek-cs-1/actions/runs/456",
+  "native": "passed",
+  "web": "skipped_dependency",
+  "gates": [
+    {
+      "name": "Gate <script>alert(\"gate\")</script>",
+      "status": "passed",
+      "passed": 1,
+      "failed": 0,
+      "duration_ms": 10,
+      "artifact_url": null
+    }
+  ]
+}

@@ -6,9 +6,11 @@ use std::{
 };
 
 use midcreek_cs_1::sitegen::{
-    ProgressDocument, ProgressStatus, ReferenceManifest, RepoFacts, plan_task_ids_from_markdown,
+    ProgressDocument, ProgressStatus, ReferenceManifest, RepoFacts, SiteInputs,
+    VerificationSummary, WorkflowSummary, build_site, plan_task_ids_from_markdown,
     validate_progress, validate_reference_manifest,
 };
+use serde::Deserialize;
 
 enum Command {
     Validate {
@@ -33,9 +35,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!(
-                "usage: sitegen validate --progress <path> --plan <path> --repository <path>"
-            );
+            eprintln!("usage: sitegen <validate|build|assemble> [options]");
             return ExitCode::from(2);
         }
     };
@@ -46,14 +46,7 @@ fn main() -> ExitCode {
             plan,
             repository,
         } => validate(&progress, &plan, &repository),
-        Command::Build { inputs, output } => {
-            eprintln!(
-                "build is not available yet (inputs: {}, output: {})",
-                inputs.display(),
-                output.display()
-            );
-            ExitCode::from(2)
-        }
+        Command::Build { inputs, output } => build(&inputs, &output),
         Command::Assemble {
             previous,
             current,
@@ -168,6 +161,73 @@ fn parse_options(
         }
     }
     Ok(parsed)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SiteInputPaths {
+    progress: PathBuf,
+    plan: PathBuf,
+    reference_manifest: PathBuf,
+    workflow: PathBuf,
+    repo: PathBuf,
+    verification: Option<PathBuf>,
+}
+
+fn build(inputs_path: &Path, output: &Path) -> ExitCode {
+    let paths = match read_json::<SiteInputPaths>(inputs_path) {
+        Ok(paths) => paths,
+        Err(message) => return content_error(message),
+    };
+    let root = inputs_path.parent().unwrap_or_else(|| Path::new("."));
+    let progress_path = root.join(paths.progress);
+    let plan_path = root.join(paths.plan);
+    let reference_path = root.join(paths.reference_manifest);
+    let workflow_path = root.join(paths.workflow);
+    let repo_path = root.join(paths.repo);
+    let progress = match read_json::<ProgressDocument>(&progress_path) {
+        Ok(value) => value,
+        Err(message) => return content_error(message),
+    };
+    let plan_markdown = match fs::read_to_string(&plan_path) {
+        Ok(value) => value,
+        Err(error) => return content_error(format!("{}: {error}", plan_path.display())),
+    };
+    let reference_manifest = match read_json::<ReferenceManifest>(&reference_path) {
+        Ok(value) => value,
+        Err(message) => return content_error(message),
+    };
+    let workflow = match read_json::<WorkflowSummary>(&workflow_path) {
+        Ok(value) => value,
+        Err(message) => return content_error(message),
+    };
+    let repo = match read_json::<RepoFacts>(&repo_path) {
+        Ok(value) => value,
+        Err(message) => return content_error(message),
+    };
+    let verification = match paths.verification {
+        Some(path) => match read_json::<VerificationSummary>(&root.join(path)) {
+            Ok(value) => Some(value),
+            Err(message) => return content_error(message),
+        },
+        None => None,
+    };
+    let inputs = SiteInputs {
+        progress,
+        plan_markdown,
+        reference_manifest,
+        verification,
+        workflow,
+        repo,
+    };
+
+    match build_site(&inputs, output) {
+        Ok(manifest) => {
+            println!("{}", manifest.source_commit);
+            ExitCode::SUCCESS
+        }
+        Err(error) => content_error(error.to_string()),
+    }
 }
 
 fn validate(progress_path: &Path, plan_path: &Path, repository: &Path) -> ExitCode {

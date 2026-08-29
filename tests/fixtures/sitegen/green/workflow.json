@@ -1,0 +1,24 @@
+{
+  "source_commit": "1111111111111111111111111111111111111111",
+  "run_url": "https://github.com/ridermw/midcreek-cs-1/actions/runs/123",
+  "native": "passed",
+  "web": "skipped_dependency",
+  "gates": [
+    {
+      "name": "Rust unit tests",
+      "status": "passed",
+      "passed": 39,
+      "failed": 0,
+      "duration_ms": 1820,
+      "artifact_url": null
+    },
+    {
+      "name": "WASM compilation",
+      "status": "skipped_dependency",
+      "passed": 0,
+      "failed": 0,
+      "duration_ms": 0,
+      "artifact_url": null
+    }
+  ]
+}

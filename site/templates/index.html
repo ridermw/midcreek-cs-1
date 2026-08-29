@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Live implementation status for the Cell Shift Data Center POC.">
+  <title>{{PROJECT}} &mdash; Progress Hub</title>
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <header class="status-strip" id="build-status">
+    <a class="brand" href="#top" aria-label="Cell Shift progress hub home">
+      <span class="brand-mark">CS</span>
+      <span>Progress Hub</span>
+    </a>
+    <div class="status-grid">{{STATUS}}</div>
+  </header>
+
+  <div class="page-shell" id="top">
+    <aside class="rail">
+      <nav aria-label="Progress hub sections">
+        <a href="#play">Play</a>
+        <a href="#comparison">Compare</a>
+        <a href="#progress">Progress</a>
+        <a href="#screenshots">Screens</a>
+        <a href="#plan">Plan</a>
+        <a href="#challenges">Challenges</a>
+        <a href="#tests">Tests</a>
+        <a href="#commits">Commits</a>
+      </nav>
+    </aside>
+
+    <main>
+      <section class="hero">
+        <div>
+          <span class="eyebrow">Live build record / status-only phase</span>
+          <h1>{{PROJECT}}</h1>
+          <p>A public, source-backed view of what is done, what is being built, what is blocked, and how the game is tracking toward the approved cel-shift direction.</p>
+        </div>
+        <div class="hero-badge" aria-label="Current publication mode">
+          <span>Mode</span>
+          <strong>Status</strong>
+          <small>Game pending verification</small>
+        </div>
+      </section>
+
+      <section class="panel section-panel" id="play">
+        <div class="section-heading">
+          <div><span class="section-number">01</span><span class="eyebrow">Playable build</span></div>
+          <h2>Play</h2>
+        </div>
+        {{PLAY}}
+      </section>
+
+      <section class="panel section-panel" id="comparison">
+        <div class="section-heading">
+          <div><span class="section-number">02</span><span class="eyebrow">Visual direction</span></div>
+          <h2>Approved target vs. current proof</h2>
+        </div>
+        {{COMPARISON}}
+      </section>
+
+      <section class="section-panel" id="progress">
+        <div class="section-heading">
+          <div><span class="section-number">03</span><span class="eyebrow">Canonical task graph</span></div>
+          <h2>Progress</h2>
+        </div>
+        <div class="progress-grid">{{PROGRESS}}</div>
+      </section>
+
+      <section class="panel section-panel" id="screenshots">
+        <div class="section-heading">
+          <div><span class="section-number">04</span><span class="eyebrow">Deterministic visual history</span></div>
+          <h2>Screenshot timeline</h2>
+        </div>
+        <div class="timeline">{{SCREENSHOTS}}</div>
+      </section>
+
+      <section class="panel section-panel" id="plan">
+        <div class="section-heading">
+          <div><span class="section-number">05</span><span class="eyebrow">Reviewed implementation path</span></div>
+          <h2>Plan and diagrams</h2>
+        </div>
+        <article class="plan-document">{{PLAN}}</article>
+      </section>
+
+      <section class="section-panel" id="challenges">
+        <div class="section-heading">
+          <div><span class="section-number">06</span><span class="eyebrow">Engineering record</span></div>
+          <h2>Challenges</h2>
+        </div>
+        <div class="challenge-grid">{{CHALLENGES}}</div>
+      </section>
+
+      <section class="panel section-panel" id="tests">
+        <div class="section-heading">
+          <div><span class="section-number">07</span><span class="eyebrow">Latest gate matrix</span></div>
+          <h2>Tests</h2>
+        </div>
+        {{TESTS}}
+      </section>
+
+      <section class="panel section-panel" id="commits">
+        <div class="section-heading">
+          <div><span class="section-number">08</span><span class="eyebrow">Recent main history</span></div>
+          <h2>Commits</h2>
+        </div>
+        <div class="commit-list">{{COMMITS}}</div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
