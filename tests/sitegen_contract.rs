@@ -587,7 +587,25 @@ mod progress_contract {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             assert_eq!(
                 sha256(root.join("docs/implementation-plan.md")),
-                "06e367472db7cb960268c90fd6adf38e0b320cb4e2c8873c1a2f1b9320a8db2b"
+                "8768ec95bf6596bfd91cf4b36d53a2df849e3cc70765f75dc60e3dc9c0185e1d"
+            );
+        }
+
+        #[test]
+        fn published_plan_contains_no_absolute_local_paths() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let plan = read(root.join("docs/implementation-plan.md"));
+            let has_windows_drive_root = plan.as_bytes().windows(3).any(|window| {
+                window[0].is_ascii_alphabetic()
+                    && window[1] == b':'
+                    && matches!(window[2], b'/' | b'\\')
+            });
+
+            assert!(!plan.contains("/Users/"), "plan contains a macOS user path");
+            assert!(!plan.contains("file://"), "plan contains a file URL");
+            assert!(
+                !has_windows_drive_root,
+                "plan contains a Windows drive-root path"
             );
         }
 

@@ -18,11 +18,11 @@ Build a polished Bevy 0.19.1 proof of concept for the larger Midcreek game:
 
 ## Source of Truth
 
-- `/Users/mattheww/git/midcreek-concept/ART-BIBLE.md`
-- `/Users/mattheww/git/midcreek-concept/themes/_shared/foundation.md`
-- `/Users/mattheww/git/midcreek-concept/themes/cel-shift/theme.yaml`
-- `/Users/mattheww/git/midcreek-concept/themes/cel-shift/prompts/key-art-diamond.mock.md`
-- `/Users/mattheww/git/midcreek-concept/themes/cel-shift/prompts/animation-sheet.mock.md`
+- `../midcreek-concept/ART-BIBLE.md`
+- `../midcreek-concept/themes/_shared/foundation.md`
+- `../midcreek-concept/themes/cel-shift/theme.yaml`
+- `../midcreek-concept/themes/cel-shift/prompts/key-art-diamond.mock.md`
+- `../midcreek-concept/themes/cel-shift/prompts/animation-sheet.mock.md`
 - `docs/superpowers/specs/2026-08-29-github-pages-progress-hub-design.md`
 - `docs/superpowers/plans/2026-08-29-github-pages-progress-hub.md`
 - Key-art SHA-256: `a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75`

@@ -272,3 +272,60 @@ The fix is locally verified but has not run on GitHub-hosted Ubuntu because
 this round must not be pushed. The pre-existing macOS linker warning about the
 oversized `__eh_frame` section still appears while linking test binaries;
 strict Clippy remains warning-free.
+
+## Fix Round 3: Public Plan Path Sanitization
+
+**Date:** August 29, 2026
+**Starting commit:** `472ab15`
+**Failed workflow:** GitHub Actions run `33279744877`
+
+Verify passed, but Publish/sitegen correctly rejected the generated
+`index.html` because the published implementation plan contained five
+machine-local `/Users/mattheww/git/midcreek-concept/...` source references.
+The public HTML absolute-path rejection remains unchanged.
+
+The canonical master plan now uses repository-relative
+`../midcreek-concept/...` references for all five sources. The tracked
+`docs/implementation-plan.md` is byte-identical to that external master plan,
+with SHA-256
+`8768ec95bf6596bfd91cf4b36d53a2df849e3cc70765f75dc60e3dc9c0185e1d`.
+
+`tests/sitegen_contract.rs` now has a focused publication-input regression that
+rejects `/Users/`, `file://`, and Windows drive-root paths in the published
+plan. The existing approved-plan hash contract and generated HTML
+absolute-local-path rejection remain active.
+
+### Exact Fix Evidence
+
+RED:
+
+```text
+cargo test --test sitegen_contract \
+  progress_contract::publication_inputs::published_plan_contains_no_absolute_local_paths \
+  -- --exact
+
+test progress_contract::publication_inputs::published_plan_contains_no_absolute_local_paths ... FAILED
+plan contains a macOS user path
+```
+
+GREEN:
+
+```text
+cargo test --test sitegen_contract          # 38 passed; 0 failed
+cargo test --test pages_assembly_contract   # 12 passed; 0 failed
+cargo run --bin sitegen -- validate \
+  --progress docs/progress.json \
+  --plan docs/implementation-plan.md \
+  --repository .                            # autonomous-assets
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cmp master-plan docs/implementation-plan.md
+git diff --check
+# all completed successfully
+```
+
+### Fix Round 3 Concern
+
+The fix has not run in GitHub Actions because this round must not be pushed.
+The pre-existing macOS linker warning about the oversized `__eh_frame` section
+still appears while linking test binaries; strict Clippy remains warning-free.
