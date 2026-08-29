@@ -15,9 +15,11 @@ bevy = { version = "=0.19.1", default-features = false, features = ["3d", "ui", 
 gltf = "=1.4.1"
 gltf-json = "=1.4.1"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
+pulldown-cmark = "=0.13.4"
 rand = "=0.10.2"
 rand_chacha = "=0.10.0"
 ron = "=0.12.2"
+scraper = "=0.27.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"

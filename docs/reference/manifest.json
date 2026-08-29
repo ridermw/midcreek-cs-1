@@ -1,0 +1,20 @@
+{
+  "assets": [
+    {
+      "name": "Cel Shift key art",
+      "source_path": "../midcreek-concept/themes/cel-shift/masters/key-art/04-diamond-bright.png",
+      "public_path": "docs/reference/cel-shift-key-art.png",
+      "sha256": "a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75",
+      "width": 1536,
+      "height": 1024
+    },
+    {
+      "name": "Cel Shift character sheet",
+      "source_path": "../midcreek-concept/themes/cel-shift/masters/animation/01-model-sheet.png",
+      "public_path": "docs/reference/cel-shift-character-sheet.png",
+      "sha256": "8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25",
+      "width": 1536,
+      "height": 1024
+    }
+  ]
+}

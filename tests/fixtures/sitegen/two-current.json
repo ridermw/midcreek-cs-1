@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "project": "Cell Shift Data Center POC",
+  "tasks": [
+    {
+      "id": "foundation-contracts",
+      "title": "Establish reviewed contracts",
+      "status": "in_progress",
+      "depends_on": [],
+      "summary": "Still current.",
+      "completed_commit": null
+    },
+    {
+      "id": "pages-foundation",
+      "title": "Publish the status-only progress hub",
+      "status": "in_progress",
+      "depends_on": ["foundation-contracts"],
+      "summary": "Also current.",
+      "completed_commit": null
+    }
+  ],
+  "challenges": []
+}

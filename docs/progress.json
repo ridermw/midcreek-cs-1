@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "project": "Cell Shift Data Center POC",
+  "tasks": [
+    {
+      "id": "foundation-contracts",
+      "title": "Establish the project and reviewed contracts",
+      "status": "done",
+      "depends_on": [],
+      "summary": "Pinned the Bevy project and established reviewed contracts.",
+      "completed_commit": "df0da32ab61a6cb6901bfd4b3cdbbcaec75bccc2"
+    },
+    {
+      "id": "pages-foundation",
+      "title": "Publish the status-only progress hub",
+      "status": "in_progress",
+      "depends_on": [
+        "foundation-contracts"
+      ],
+      "summary": "Building the canonical progress model and status-only Pages site.",
+      "completed_commit": null
+    },
+    {
+      "id": "autonomous-assets",
+      "title": "Build the autonomous no-Blender asset pipeline",
+      "status": "future",
+      "depends_on": [
+        "pages-foundation"
+      ],
+      "summary": "Generate autonomous rigged and modular game assets after the status hub is live.",
+      "completed_commit": null
+    },
+    {
+      "id": "data-hall",
+      "title": "Load assets and build the data hall",
+      "status": "future",
+      "depends_on": [
+        "autonomous-assets"
+      ],
+      "summary": "Build the authored cel-shift data hall.",
+      "completed_commit": null
+    },
+    {
+      "id": "technician-movement",
+      "title": "Add the rigged technician and real keyboard movement",
+      "status": "future",
+      "depends_on": [
+        "data-hall"
+      ],
+      "summary": "Add rigged camera-relative technician movement.",
+      "completed_commit": null
+    },
+    {
+      "id": "camera-orbit",
+      "title": "Add clamped four-way camera orbit",
+      "status": "future",
+      "depends_on": [
+        "technician-movement"
+      ],
+      "summary": "Add clamped Q/E four-way camera orbit.",
+      "completed_commit": null
+    },
+    {
+      "id": "operations-loop",
+      "title": "Add recurring faults, prioritized tickets, and repair",
+      "status": "future",
+      "depends_on": [
+        "data-hall",
+        "technician-movement"
+      ],
+      "summary": "Add recurring prioritized faults, tickets, and repair.",
+      "completed_commit": null
+    },
+    {
+      "id": "operations-hud",
+      "title": "Add operations HUD and diegetic badges",
+      "status": "future",
+      "depends_on": [
+        "camera-orbit",
+        "operations-loop"
+      ],
+      "summary": "Add ticket HUD, controls, and rack badges.",
+      "completed_commit": null
+    },
+    {
+      "id": "pages-playable",
+      "title": "Publish the playable WASM game",
+      "status": "future",
+      "depends_on": [
+        "operations-hud"
+      ],
+      "summary": "Publish the playable WASM game.",
+      "completed_commit": null
+    },
+    {
+      "id": "autonomous-verification",
+      "title": "Build autonomous verification and visual hill-climb gates",
+      "status": "future",
+      "depends_on": [
+        "operations-hud"
+      ],
+      "summary": "Build deterministic gameplay and render verification.",
+      "completed_commit": null
+    },
+    {
+      "id": "pages-verification",
+      "title": "Publish comparisons, evidence, and verification",
+      "status": "future",
+      "depends_on": [
+        "pages-playable",
+        "autonomous-verification"
+      ],
+      "summary": "Publish comparisons, screenshots, challenges, and test evidence.",
+      "completed_commit": null
+    },
+    {
+      "id": "pages-status-always",
+      "title": "Publish current status while retaining last-green artifacts",
+      "status": "future",
+      "depends_on": [
+        "pages-verification"
+      ],
+      "summary": "Retain the last green game while publishing current status.",
+      "completed_commit": null
+    },
+    {
+      "id": "ci-baseline",
+      "title": "Add CI and publish the reproducible POC baseline",
+      "status": "future",
+      "depends_on": [
+        "pages-status-always"
+      ],
+      "summary": "Publish and verify the final POC baseline.",
+      "completed_commit": null
+    }
+  ],
+  "challenges": []
+}

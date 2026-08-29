@@ -1,4 +1,5 @@
 pub mod design;
+pub mod sitegen;
 
 use bevy::prelude::*;
 
