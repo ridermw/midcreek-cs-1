@@ -22,6 +22,7 @@ pub const CAMERA_ORBIT_DURATION_SECONDS: f32 = 0.30;
 
 pub const FAULT_INTERVAL_SECONDS: f32 = 4.0;
 pub const MAX_ACTIVE_TICKETS: usize = 3;
+pub const PLAYER_RADIUS: f32 = 0.35;
 pub const REPAIR_INTERACTION_RANGE: f32 = 1.5;
 pub const REPAIR_DURATION_SECONDS: f32 = 3.0;
 pub const RESOLVED_DISPLAY_SECONDS: f32 = 2.0;
@@ -435,7 +436,7 @@ impl SceneBlueprint {
             errors.push(SceneValidationError::PlayerSpawnOutsideRoom);
         } else {
             for collider in &self.colliders {
-                if point_inside_collider(self.player_spawn, collider, 0.0) {
+                if point_inside_collider(self.player_spawn, collider, PLAYER_RADIUS) {
                     errors.push(SceneValidationError::PlayerSpawnInsideCollider(
                         collider.id.clone(),
                     ));
@@ -515,7 +516,6 @@ fn point_inside_collider(point: Vec2, collider: &ColliderSpec, padding: f32) -> 
 
 fn aisle_is_traversable(aisle: AisleSpec, colliders: &[ColliderSpec]) -> bool {
     const CELL_SIZE: f32 = 0.25;
-    const PLAYER_RADIUS: f32 = 0.35;
 
     if aisle.half_width <= 0.0 || aisle.z_min >= aisle.z_max {
         return false;

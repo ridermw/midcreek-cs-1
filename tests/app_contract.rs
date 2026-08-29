@@ -9,8 +9,8 @@ use midcreek_cs_1::{
         ColliderSpec, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, FAULT_INTERVAL_SECONDS,
         FAULT_RED, FLOOR_LIGHT, FLOOR_SHADOW, HEALTHY_GREEN, HOSE_CHARCOAL,
         INITIAL_CAMERA_YAW_DEGREES, INK, KEY_ART_REFERENCE_PATH, KEY_ART_SHA256,
-        MAX_ACTIVE_TICKETS, ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, PaletteRole, PropId,
-        RACK_COOLDOWN_SECONDS, RACK_SHADOW, RACK_WHITE, REPAIR_DURATION_SECONDS,
+        MAX_ACTIVE_TICKETS, ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, PLAYER_RADIUS, PaletteRole,
+        PropId, RACK_COOLDOWN_SECONDS, RACK_SHADOW, RACK_WHITE, REPAIR_DURATION_SECONDS,
         REPAIR_INTERACTION_RANGE, RESOLVED_DISPLAY_SECONDS, ROOM_SIZE, SIGNATURE_YELLOW,
         SKY_BOUNCE_BLUE, SceneBlueprint, SceneValidationError, TEAL_ACCENT,
         VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WORKER_BOOTS,
@@ -317,6 +317,28 @@ fn design_validator_reports_player_spawn_inside_a_collider() {
         errors,
         [SceneValidationError::PlayerSpawnInsideCollider(prop(
             "rack-row-01"
+        ))]
+    );
+}
+
+#[test]
+fn design_validator_reports_player_spawn_within_player_radius_of_a_collider() {
+    let errors = validation_errors(|scene| {
+        let collider = scene
+            .colliders
+            .iter()
+            .find(|collider| collider.id == prop("utility-cart"))
+            .expect("fixture collider");
+        scene.player_spawn = Vec2::new(
+            collider.center.x + collider.half_extents.x + PLAYER_RADIUS * 0.5,
+            collider.center.y,
+        );
+    });
+
+    assert_eq!(
+        errors,
+        [SceneValidationError::PlayerSpawnInsideCollider(prop(
+            "utility-cart"
         ))]
     );
 }
