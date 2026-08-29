@@ -319,7 +319,7 @@ task graph:
 |---|---|---|---|
 | `foundation-contracts` | `done` | none | Pinned the Bevy project and established reviewed contracts. |
 | `pages-foundation` | `in_progress` | `foundation-contracts` | Building the canonical progress model and status-only Pages site. |
-| `autonomous-assets` | `future` | `foundation-contracts` | Generate autonomous rigged and modular game assets. |
+| `autonomous-assets` | `future` | `pages-foundation` | Generate autonomous rigged and modular game assets after the status hub is live. |
 | `data-hall` | `future` | `autonomous-assets` | Build the authored cel-shift data hall. |
 | `technician-movement` | `future` | `data-hall` | Add rigged camera-relative technician movement. |
 | `camera-orbit` | `future` | `technician-movement` | Add clamped Q/E four-way camera orbit. |
