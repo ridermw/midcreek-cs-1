@@ -21,6 +21,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libudev-dev \
+            libx11-dev \
+            libxi-dev \
+            libxrandr-dev
+
       - name: Test site generation
         run: |
           cargo test --test sitegen_contract
@@ -59,6 +72,19 @@ jobs:
         with:
           ref: pages-live
           path: previous-pages
+
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libudev-dev \
+            libx11-dev \
+            libxi-dev \
+            libxrandr-dev
 
       - name: Build and assemble current status
         env:

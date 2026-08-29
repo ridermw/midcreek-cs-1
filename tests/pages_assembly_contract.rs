@@ -269,6 +269,43 @@ mod workflow_contract {
         }
     }
 
+    #[test]
+    fn installs_bevy_linux_prerequisites_before_cargo_in_both_jobs() {
+        let workflow = workflow_source();
+
+        for (name, job) in [
+            ("Verify", verify_job(&workflow)),
+            ("Publish", publish_job(&workflow)),
+        ] {
+            let install = job
+                .find("apt-get install -y --no-install-recommends")
+                .unwrap_or_else(|| panic!("{name} should install native build prerequisites"));
+            let first_cargo = job
+                .find("cargo ")
+                .unwrap_or_else(|| panic!("{name} should run Cargo"));
+
+            assert!(
+                install < first_cargo,
+                "{name} should install native build prerequisites before Cargo"
+            );
+            for package in [
+                "pkg-config",
+                "libwayland-dev",
+                "libxkbcommon-dev",
+                "libxkbcommon-x11-dev",
+                "libudev-dev",
+                "libx11-dev",
+                "libxi-dev",
+                "libxrandr-dev",
+            ] {
+                assert!(
+                    job[install..first_cargo].contains(package),
+                    "{name} should install {package} before Cargo"
+                );
+            }
+        }
+    }
+
     fn workflow_source() -> String {
         fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/pages.yml"),
