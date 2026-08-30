@@ -169,6 +169,367 @@ pub struct WorkflowSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Workflow job results
+// ---------------------------------------------------------------------------
+
+/// The file name each job's result artifact carries.
+pub const RESULT_FILE: &str = "result.json";
+
+/// The published name of the job that runs the native gates.
+pub const NATIVE_JOB: &str = "verify";
+
+/// The published name of the job that packages and proves the browser game.
+pub const WEB_JOB: &str = "build-web";
+
+/// The gate a missing native job is published as.
+pub const NATIVE_JOB_GATE: &str = "Native verification";
+
+/// The gate a missing web job is published as.
+pub const WEB_JOB_GATE: &str = "Web package and browser gate";
+
+/// The file `scripts/run-gate.sh` appends one measured gate to.
+pub const GATE_RESULTS_FILE: &str = "gates.jsonl";
+
+/// One named gate, exactly as the runner measured it.
+///
+/// The runner records the gate's name, whether the command succeeded, and how
+/// long it really took. It never records the command, its output, or anything
+/// about the machine it ran on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateRecord {
+    /// The published gate name.
+    pub name: String,
+    /// Whether the gate's command succeeded.
+    pub status: GateStatus,
+    /// The measured wall-clock duration.
+    pub duration_ms: u64,
+}
+
+/// Reads every gate one job measured, in the order it ran them.
+///
+/// A record the runner could not have written is a corrupted or forged result,
+/// so the whole file is refused rather than partially published.
+pub fn read_gate_records(lines: &str) -> Result<Vec<GateSummary>, SitegenError> {
+    let mut gates = Vec::new();
+    for line in lines.lines().filter(|line| !line.trim().is_empty()) {
+        let record =
+            serde_json::from_str::<GateRecord>(line).map_err(|error| SitegenError::Json {
+                path: PathBuf::from(GATE_RESULTS_FILE),
+                message: error.to_string(),
+            })?;
+        let gate = GateSummary {
+            name: record.name,
+            status: record.status,
+            passed: u32::from(record.status == GateStatus::Passed),
+            failed: u32::from(record.status == GateStatus::Failed),
+            duration_ms: record.duration_ms,
+            artifact_url: None,
+        };
+        validate_gate(&gate)?;
+        gates.push(gate);
+    }
+    Ok(gates)
+}
+
+/// The verdict a job reaches over every gate it measured.
+///
+/// A job that measured nothing at all failed before its first gate, so it
+/// never reports success by omission.
+pub fn gate_verdict(gates: &[GateSummary]) -> GateStatus {
+    if gates.is_empty() || gates.iter().any(|gate| gate.status != GateStatus::Passed) {
+        return GateStatus::Failed;
+    }
+    GateStatus::Passed
+}
+
+/// The longest gate name the site will publish.
+const MAX_GATE_NAME: usize = 96;
+
+/// The only URL prefix a published link may carry.
+const TRUSTED_URL_PREFIX: &str = "https://github.com/";
+
+/// The strict result manifest one workflow job uploads.
+///
+/// Each job measures its own named gates and declares whether it produced a
+/// complete, publishable evidence directory. Nothing else crosses the boundary
+/// between a runner and the public site: the shape denies unknown fields, so a
+/// manifest that grew a command line, a log excerpt, or an environment map is
+/// refused instead of being merged unread.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobResult {
+    /// The job that wrote it.
+    pub job: String,
+    /// The job's own verdict over every gate it ran.
+    pub status: GateStatus,
+    /// Every named gate the job ran, in the order it ran them.
+    pub gates: Vec<GateSummary>,
+    /// The artifact-relative directory holding publishable evidence, when the
+    /// job produced a complete set.
+    pub evidence: Option<String>,
+}
+
+/// The outcome GitHub Actions reports for one job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobOutcome {
+    Success,
+    Failure,
+    Cancelled,
+    Skipped,
+}
+
+impl JobOutcome {
+    /// Parses one `needs.<job>.result` value.
+    ///
+    /// An empty value is what a job that never reported leaves behind, and an
+    /// unknown value is a GitHub outcome this repository has not reviewed.
+    /// Both are read as a failure, because publishing an unreviewed outcome as
+    /// a success is the one mistake this workflow may not make.
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "success" => Self::Success,
+            "skipped" => Self::Skipped,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Failure,
+        }
+    }
+
+    /// The published status this outcome alone justifies.
+    pub fn status(self) -> GateStatus {
+        match self {
+            Self::Success => GateStatus::Passed,
+            Self::Skipped => GateStatus::SkippedDependency,
+            Self::Failure | Self::Cancelled => GateStatus::Failed,
+        }
+    }
+
+    /// The name this outcome is published under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// One job's result artifact, as Publish found it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobReport {
+    /// What GitHub reported about the job itself.
+    pub outcome: JobOutcome,
+    /// The manifest the job uploaded, when one arrived and parsed.
+    pub result: Option<JobResult>,
+}
+
+impl JobReport {
+    /// A job whose result artifact never arrived.
+    pub fn absent(outcome: JobOutcome) -> Self {
+        Self {
+            outcome,
+            result: None,
+        }
+    }
+
+    /// The status the site publishes for this job.
+    ///
+    /// The job outcome and the manifest both have to agree on success. A job
+    /// that passed every gate and then failed to upload its artifact, and a
+    /// job whose manifest declares a failure GitHub did not see, are both
+    /// published as failures.
+    pub fn status(&self) -> GateStatus {
+        let outcome = self.outcome.status();
+        match &self.result {
+            Some(result) if result.status != GateStatus::Passed => GateStatus::Failed,
+            Some(_) => outcome,
+            None if outcome == GateStatus::SkippedDependency => GateStatus::SkippedDependency,
+            None => GateStatus::Failed,
+        }
+    }
+
+    /// The evidence directory this job declared, when the job really passed.
+    ///
+    /// A failed or skipped job publishes no evidence at all, so a partial
+    /// directory a failing run happened to leave behind can never be projected
+    /// onto the public site.
+    pub fn evidence(&self) -> Option<&str> {
+        if self.status() != GateStatus::Passed {
+            return None;
+        }
+        self.result
+            .as_ref()
+            .and_then(|result| result.evidence.as_deref())
+    }
+}
+
+/// Refuses a result manifest that carries a value the public site may not
+/// publish.
+pub fn validate_job_result(result: &JobResult) -> Result<(), SitegenError> {
+    if result.job != NATIVE_JOB && result.job != WEB_JOB {
+        return Err(SitegenError::UnsafeResultValue {
+            field: "job".to_owned(),
+            message: format!("{:?} is not a declared workflow job", result.job),
+        });
+    }
+    for gate in &result.gates {
+        validate_gate(gate)?;
+    }
+    if let Some(evidence) = &result.evidence {
+        validate_relative_directory("evidence", evidence)?;
+    }
+    Ok(())
+}
+
+/// Refuses a merged workflow summary that carries a value the public site may
+/// not publish.
+pub fn validate_workflow_summary(summary: &WorkflowSummary) -> Result<(), SitegenError> {
+    validate_commit("source_commit", &summary.source_commit)?;
+    validate_url("run_url", &summary.run_url)?;
+    for gate in &summary.gates {
+        validate_gate(gate)?;
+    }
+    Ok(())
+}
+
+fn validate_gate(gate: &GateSummary) -> Result<(), SitegenError> {
+    validate_published_text("gates[].name", &gate.name, MAX_GATE_NAME)?;
+    if let Some(url) = &gate.artifact_url {
+        validate_url("gates[].artifact_url", url)?;
+    }
+    Ok(())
+}
+
+fn validate_commit(field: &str, value: &str) -> Result<(), SitegenError> {
+    let valid = value.len() == 40 && value.chars().all(|byte| byte.is_ascii_hexdigit());
+    if valid {
+        return Ok(());
+    }
+    Err(SitegenError::UnsafeResultValue {
+        field: field.to_owned(),
+        message: format!("{value:?} is not a full commit SHA"),
+    })
+}
+
+/// Accepts only an absolute URL into this repository's own GitHub host.
+///
+/// The site links workflow runs and artifacts, and both only ever live under
+/// `github.com`. Anything else is an untrusted destination a runner should
+/// never be able to publish onto a page other people open.
+fn validate_url(field: &str, value: &str) -> Result<(), SitegenError> {
+    let trusted = value.starts_with(TRUSTED_URL_PREFIX)
+        && value.len() > TRUSTED_URL_PREFIX.len()
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|byte| byte.is_ascii_graphic() && byte != '"' && byte != '\'' && byte != '\\');
+    if trusted {
+        return Ok(());
+    }
+    Err(SitegenError::UnsafeResultValue {
+        field: field.to_owned(),
+        message: format!("{value:?} is not a {TRUSTED_URL_PREFIX} URL"),
+    })
+}
+
+/// Accepts only a short, printable, single-line label with no path in it.
+fn validate_published_text(field: &str, value: &str, limit: usize) -> Result<(), SitegenError> {
+    let trimmed = value.trim();
+    let printable = !trimmed.is_empty()
+        && trimmed.len() <= limit
+        && trimmed
+            .chars()
+            .all(|byte| byte.is_ascii_graphic() || byte == ' ');
+    let pathless = !trimmed.contains('/') && !trimmed.contains('\\') && !trimmed.contains("..");
+    if printable && pathless {
+        return Ok(());
+    }
+    Err(SitegenError::UnsafeResultValue {
+        field: field.to_owned(),
+        message: format!("{value:?} is not a publishable label"),
+    })
+}
+
+/// Accepts only a relative directory strictly inside the artifact that names
+/// it.
+fn validate_relative_directory(field: &str, value: &str) -> Result<(), SitegenError> {
+    let path = Path::new(value);
+    let contained = !value.is_empty()
+        && !value.contains('\\')
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if contained {
+        return Ok(());
+    }
+    Err(SitegenError::UnsafeResultValue {
+        field: field.to_owned(),
+        message: format!("{value:?} is not a contained relative directory"),
+    })
+}
+
+/// Combines what the two jobs reported into the one summary the site
+/// publishes.
+///
+/// Publish runs whatever the upstream jobs did, so every gap has to become a
+/// published fact rather than a missing row: a skipped job publishes a
+/// `skipped_dependency` gate, and a job that ran without leaving a result
+/// manifest publishes both a failed job gate and the missing manifest itself.
+pub fn merge_job_results(
+    source_commit: &str,
+    run_url: &str,
+    native: &JobReport,
+    web: &JobReport,
+) -> Result<WorkflowSummary, SitegenError> {
+    let mut gates = Vec::new();
+    for (report, label) in [(native, NATIVE_JOB_GATE), (web, WEB_JOB_GATE)] {
+        match &report.result {
+            Some(result) => {
+                validate_job_result(result)?;
+                gates.extend(result.gates.iter().cloned());
+                // A job may pass every gate it measured and still fail after
+                // the last one. The published matrix has to say so.
+                if report.status() == GateStatus::Failed && result.status == GateStatus::Passed {
+                    gates.push(job_gate(label, GateStatus::Failed));
+                }
+            }
+            None => {
+                gates.push(job_gate(label, report.status()));
+                if report.outcome != JobOutcome::Skipped {
+                    gates.push(job_gate(
+                        &format!("{label} result manifest"),
+                        GateStatus::Failed,
+                    ));
+                }
+            }
+        }
+    }
+
+    let summary = WorkflowSummary {
+        source_commit: source_commit.to_owned(),
+        run_url: run_url.to_owned(),
+        native: native.status(),
+        web: web.status(),
+        gates,
+    };
+    validate_workflow_summary(&summary)?;
+    Ok(summary)
+}
+
+fn job_gate(name: &str, status: GateStatus) -> GateSummary {
+    GateSummary {
+        name: name.to_owned(),
+        status,
+        passed: u32::from(status == GateStatus::Passed),
+        failed: u32::from(status == GateStatus::Failed),
+        duration_ms: 0,
+        artifact_url: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Raw publication inputs
 // ---------------------------------------------------------------------------
 
@@ -712,6 +1073,16 @@ pub enum SitegenError {
         expected: String,
         actual: String,
     },
+    /// A workflow result manifest carries a value the site may not publish.
+    UnsafeResultValue {
+        field: String,
+        message: String,
+    },
+    /// The assembled tree publishes a history manifest naming images no
+    /// previous publication supplied.
+    MissingRetainedHistory {
+        targets: Vec<String>,
+    },
 }
 
 impl fmt::Display for SitegenError {
@@ -812,6 +1183,18 @@ impl fmt::Display for SitegenError {
             } => write!(
                 formatter,
                 "report records {path} as {actual}; the approved reference is {expected}"
+            ),
+            Self::UnsafeResultValue { field, message } => {
+                write!(
+                    formatter,
+                    "workflow result field {field} is unsafe: {message}"
+                )
+            }
+            Self::MissingRetainedHistory { targets } => write!(
+                formatter,
+                "the published history names {} image(s) no previous publication supplied: {}",
+                targets.len(),
+                targets.join(", ")
             ),
         }
     }
@@ -1954,8 +2337,29 @@ pub fn assemble_site(
     copy_site_tree(current, current, output, protected)?;
 
     reconcile_last_green(output)?;
+    require_retained_history(output)?;
     validate_assembled_links(output)?;
     Ok(disposition)
+}
+
+/// Refuses an assembled tree whose history manifest outruns the images the
+/// previous publication really supplied.
+///
+/// Only `pages-live` carries the visual history, so a build inherits a gallery
+/// from its own predecessor and never from anywhere else. A first run handed a
+/// gallery that names earlier points, and a later run whose predecessor lost
+/// them, both publish a manifest whose images do not exist. The failure is
+/// named here rather than left to the link checker, because the cause is the
+/// inherited history and not the page that renders it.
+fn require_retained_history(output: &Path) -> Result<(), SitegenError> {
+    let missing = retained_history_targets(output)
+        .into_iter()
+        .filter(|target| !output.join(target).is_file())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(SitegenError::MissingRetainedHistory { targets: missing })
 }
 
 /// What the current tree publishes about verification, independent of whether
@@ -2091,7 +2495,7 @@ fn require_complete_replacement(
 }
 
 /// Every required part a packaged browser game is missing, in declared order.
-fn missing_playable_parts(package: &Path) -> Vec<String> {
+pub fn missing_playable_parts(package: &Path) -> Vec<String> {
     let mut missing = REQUIRED_PLAYABLE_FILES
         .into_iter()
         .filter(|required| !package.join(required).is_file())

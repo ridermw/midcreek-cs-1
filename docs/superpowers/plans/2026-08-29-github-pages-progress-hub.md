@@ -842,11 +842,16 @@ Set `pages-verification` to `in_progress` after autonomous game verification is
 
 - [ ] **Step 2: Write failing verification-view tests**
 
+The report-derived gate is named for what the report can prove. It vouches for
+the frames the run captured; it never re-runs `evaluate_frame`, so it cannot
+claim the reference image analyzers' verdict. That verdict reaches the site as
+a workflow gate, from the job step that really ran the render contract.
+
 ```rust
 #[test]
 fn renders_gate_counts_and_durations() {
     let site = build_fixture_site("verified-game").unwrap();
-    assert_text(&site.index_html(), "#tests", "Rendered image contracts");
+    assert_text(&site.index_html(), "#tests", "Verified frame captures");
     assert_text(&site.index_html(), "#tests", "14 passed");
 }
 

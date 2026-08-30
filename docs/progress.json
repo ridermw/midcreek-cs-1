@@ -116,17 +116,17 @@
     {
       "id": "pages-status-always",
       "title": "Publish current status while retaining last-green artifacts",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "pages-verification"
       ],
-      "summary": "Wiring the Pages workflow to publish this evidence on every push while retaining the last green game, screenshots, and history.",
-      "completed_commit": null
+      "summary": "Wired the Pages workflow to measure every named gate, upload each job's result and evidence before it concludes, and publish the current commit's status on every push while retaining the last green game, screenshots, and history.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "ci-baseline",
       "title": "Add CI and publish the reproducible POC baseline",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "pages-status-always"
       ],
@@ -232,6 +232,15 @@
       "impact": "Site generation validates that every local link resolves to a real file, which is what keeps a published page from shipping a broken image. The visual history breaks that assumption: only the newest accepted point is written by the build that renders the page, and every earlier point is a file the assembly step copies forward from the previous pages-live branch. Rendering the history therefore failed validation, and rendering it without images would have published a history nobody can look at.",
       "approach": "The alternative of passing the whole previous site into the generator was rejected: the generator would then have to trust and copy an arbitrary directory of images, which is exactly the containment the publication rules exist to prevent. Instead the generated site declares what it expects assembly to supply.",
       "resolution": "build_site publishes gallery.json beside index.html, and validate_site_output reads that manifest and accepts a screenshots/history/ link the manifest declares. A history link the manifest does not declare is still a broken link, assemble_site now carries screenshots/history/ forward through a green replacement, and a failed build renders the history without images because it publishes no manifest of its own.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "a-job-that-stops-at-its-first-failure-publishes-nothing",
+      "title": "Publishing why a build failed, from a job that stops at its first failure",
+      "status": "resolved",
+      "impact": "The hub exists to show the current commit's real status, and the gate matrix is most valuable exactly when something is red. A workflow step runs its commands under `set -e`, so the first failing gate ends the step and every later gate is never measured: a run whose formatting drifted would publish one red row and say nothing about the tests, the render contract, or the release build. Worse, the obvious fix of marking the whole step `continue-on-error` makes the job report success, and a job that never fails cannot gate the web build or the deployment.",
+      "approach": "Two rejected alternatives shaped this. Running each gate as its own workflow step with `continue-on-error` loses the measured duration and forces every result to be reassembled from step outcomes in workflow expressions, which cannot be tested anywhere. Parsing the job log for results was rejected outright: raw command output is exactly what may never reach a public page.",
+      "resolution": "scripts/run-gate.sh runs one named gate, measures its wall clock, appends a single line naming the gate, its status, and its duration, and always exits zero, so every later gate still runs. Each job then summarizes those lines into a strict result manifest, uploads the manifest with its evidence in an `if: always()` step, and only afterwards fails once in a verdict step of its own. Publish merges the two manifests, synthesizing skipped and failed rows for a job that produced none, so a job that never uploaded anything publishes the gap it left instead of a silent green.",
       "resolved_commit": "HEAD"
     }
   ]

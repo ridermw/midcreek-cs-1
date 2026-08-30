@@ -15,14 +15,28 @@ mod native {
 
     use midcreek_cs_1::{
         sitegen::{
-            BrowserGateReport, GalleryManifest, PlayableBuild, ProgressDocument, ProgressStatus,
+            BrowserGateReport, CommitSummary, GalleryManifest, GateStatus, GateSummary, JobOutcome,
+            JobReport, JobResult, PlayableBuild, ProgressDocument, ProgressStatus, RESULT_FILE,
             ReferenceManifest, RepoFacts, SiteInputs, VerificationEvidence, WorkflowSummary,
-            assemble_site, build_site, plan_task_ids_from_markdown, validate_progress,
-            validate_reference_manifest,
+            assemble_site, build_site, gate_verdict, merge_job_results, missing_playable_parts,
+            plan_task_ids_from_markdown, read_gate_records, validate_job_result, validate_progress,
+            validate_reference_manifest, validate_workflow_summary,
         },
         verification::VerificationReport,
     };
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
+
+    /// How many recent commits the published timeline carries.
+    const PUBLISHED_COMMITS: usize = 20;
+
+    /// The evidence directory a passing Verify job declares.
+    const NATIVE_EVIDENCE: &str = "verification";
+
+    /// The evidence directory a passing Build web job declares.
+    const WEB_EVIDENCE: &str = "browser";
+
+    /// The packaged game directory a passing Build web job uploads.
+    const WEB_PACKAGE: &str = "play";
 
     enum Command {
         Validate {
@@ -40,6 +54,22 @@ mod native {
             result: PathBuf,
             output: PathBuf,
         },
+        Result {
+            job: String,
+            gates: PathBuf,
+            output: PathBuf,
+        },
+        Inputs {
+            repository: PathBuf,
+            source_commit: String,
+            run_url: String,
+            native_outcome: String,
+            web_outcome: String,
+            native: Option<PathBuf>,
+            web: Option<PathBuf>,
+            previous: Option<PathBuf>,
+            output: PathBuf,
+        },
     }
 
     pub fn run() -> ExitCode {
@@ -47,7 +77,7 @@ mod native {
             Ok(command) => command,
             Err(message) => {
                 eprintln!("{message}");
-                eprintln!("usage: sitegen <validate|build|assemble> [options]");
+                eprintln!("usage: sitegen <validate|build|assemble|result|inputs> [options]");
                 return ExitCode::from(2);
             }
         };
@@ -65,6 +95,28 @@ mod native {
                 result,
                 output,
             } => assemble(previous.as_deref(), &current, &result, &output),
+            Command::Result { job, gates, output } => result(&job, &gates, &output),
+            Command::Inputs {
+                repository,
+                source_commit,
+                run_url,
+                native_outcome,
+                web_outcome,
+                native,
+                web,
+                previous,
+                output,
+            } => inputs(
+                &repository,
+                &source_commit,
+                &run_url,
+                &native_outcome,
+                &web_outcome,
+                native.as_deref(),
+                web.as_deref(),
+                previous.as_deref(),
+                &output,
+            ),
         }
     }
 
@@ -78,16 +130,16 @@ mod native {
                 let values =
                     parse_options(&remaining, &["--progress", "--plan", "--repository"], &[])?;
                 Ok(Command::Validate {
-                    progress: values.required("--progress")?,
-                    plan: values.required("--plan")?,
-                    repository: values.required("--repository")?,
+                    progress: values.required_path("--progress")?,
+                    plan: values.required_path("--plan")?,
+                    repository: values.required_path("--repository")?,
                 })
             }
             "build" => {
                 let values = parse_options(&remaining, &["--inputs", "--output"], &[])?;
                 Ok(Command::Build {
-                    inputs: values.required("--inputs")?,
-                    output: values.required("--output")?,
+                    inputs: values.required_path("--inputs")?,
+                    output: values.required_path("--output")?,
                 })
             }
             "assemble" => {
@@ -97,10 +149,43 @@ mod native {
                     &["--previous"],
                 )?;
                 Ok(Command::Assemble {
-                    previous: values.optional("--previous"),
-                    current: values.required("--current")?,
-                    result: values.required("--result")?,
-                    output: values.required("--output")?,
+                    previous: values.optional_path("--previous"),
+                    current: values.required_path("--current")?,
+                    result: values.required_path("--result")?,
+                    output: values.required_path("--output")?,
+                })
+            }
+            "result" => {
+                let values = parse_options(&remaining, &["--job", "--gates", "--output"], &[])?;
+                Ok(Command::Result {
+                    job: values.required("--job")?,
+                    gates: values.required_path("--gates")?,
+                    output: values.required_path("--output")?,
+                })
+            }
+            "inputs" => {
+                let values = parse_options(
+                    &remaining,
+                    &[
+                        "--repository",
+                        "--source-commit",
+                        "--run-url",
+                        "--native-outcome",
+                        "--web-outcome",
+                        "--output",
+                    ],
+                    &["--native", "--web", "--previous"],
+                )?;
+                Ok(Command::Inputs {
+                    repository: values.required_path("--repository")?,
+                    source_commit: values.required("--source-commit")?,
+                    run_url: values.required("--run-url")?,
+                    native_outcome: values.required("--native-outcome")?,
+                    web_outcome: values.required("--web-outcome")?,
+                    native: values.optional_path("--native"),
+                    web: values.optional_path("--web"),
+                    previous: values.optional_path("--previous"),
+                    output: values.required_path("--output")?,
                 })
             }
             _ => Err(format!("unknown command: {name}")),
@@ -108,20 +193,36 @@ mod native {
     }
 
     struct ParsedOptions {
-        values: Vec<(String, PathBuf)>,
+        values: Vec<(String, String)>,
     }
 
     impl ParsedOptions {
-        fn required(&self, name: &str) -> Result<PathBuf, String> {
+        fn required(&self, name: &str) -> Result<String, String> {
             self.optional(name)
                 .ok_or_else(|| format!("missing required option {name}"))
         }
 
-        fn optional(&self, name: &str) -> Option<PathBuf> {
+        fn optional(&self, name: &str) -> Option<String> {
             self.values
                 .iter()
                 .find(|(option, _)| option == name)
                 .map(|(_, value)| value.clone())
+        }
+
+        fn required_path(&self, name: &str) -> Result<PathBuf, String> {
+            self.required(name).map(PathBuf::from)
+        }
+
+        /// An option a caller may leave out, and may also pass empty.
+        ///
+        /// The workflow builds these arguments from step outcomes, so an
+        /// absent artifact arrives as an empty string rather than as a missing
+        /// option. Both mean the same thing and neither may become the current
+        /// directory.
+        fn optional_path(&self, name: &str) -> Option<PathBuf> {
+            self.optional(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
         }
     }
 
@@ -149,11 +250,11 @@ mod native {
             }
             if values
                 .iter()
-                .any(|(existing, _): &(String, PathBuf)| existing == option)
+                .any(|(existing, _): &(String, String)| existing == option)
             {
                 return Err(format!("duplicate option: {option}"));
             }
-            values.push((option.to_owned(), PathBuf::from(&pair[1])));
+            values.push((option.to_owned(), pair[1].clone()));
         }
 
         let parsed = ParsedOptions { values };
@@ -165,7 +266,7 @@ mod native {
         Ok(parsed)
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct SiteInputPaths {
         progress: PathBuf,
@@ -179,7 +280,7 @@ mod native {
     }
 
     /// Where the raw verification documents and their artifacts live.
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct VerificationInput {
         report: PathBuf,
@@ -188,14 +289,14 @@ mod native {
     }
 
     /// Where the raw browser gate summary and its diagnostics live.
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct BrowserInput {
         report: PathBuf,
         artifacts: PathBuf,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct PlayableInput {
         directory: PathBuf,
@@ -308,6 +409,9 @@ mod native {
             Ok(value) => value,
             Err(message) => return content_error(message),
         };
+        if let Err(error) = validate_workflow_summary(&workflow) {
+            return content_error(error.to_string());
+        }
         match assemble_site(previous, current, &workflow, output) {
             Ok(disposition) => {
                 println!("{disposition}");
@@ -315,6 +419,307 @@ mod native {
             }
             Err(error) => content_error(error.to_string()),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow result manifests
+    // -----------------------------------------------------------------------
+
+    /// Turns one job's measured gates and produced artifacts into the strict
+    /// result manifest Publish reads.
+    ///
+    /// This never fails on a failed gate: a job that failed still has to
+    /// publish what it measured, and the workflow reaches its own verdict from
+    /// the manifest afterwards.
+    fn result(job: &str, gates_path: &Path, output: &Path) -> ExitCode {
+        let lines = match fs::read_to_string(gates_path) {
+            Ok(value) => value,
+            // A job that fell over before its first gate leaves no file at
+            // all. That is a failed job with no measurements, not a crash.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return content_error(format!("{}: {error}", gates_path.display())),
+        };
+        let gates = match read_gate_records(&lines) {
+            Ok(gates) => gates,
+            Err(error) => return content_error(error.to_string()),
+        };
+        let status = gate_verdict(&gates);
+        let evidence = declared_evidence(job, output);
+        let manifest = JobResult {
+            job: job.to_owned(),
+            status,
+            gates,
+            evidence,
+        };
+        if let Err(error) = validate_job_result(&manifest) {
+            return content_error(error.to_string());
+        }
+
+        let json = match serde_json::to_string_pretty(&manifest) {
+            Ok(json) => json,
+            Err(error) => return content_error(error.to_string()),
+        };
+        if let Err(error) = fs::create_dir_all(output) {
+            return content_error(format!("{}: {error}", output.display()));
+        }
+        let path = output.join(RESULT_FILE);
+        if let Err(error) = fs::write(&path, json.as_bytes()) {
+            return content_error(format!("{}: {error}", path.display()));
+        }
+
+        println!("{}", status_name(status));
+        ExitCode::SUCCESS
+    }
+
+    /// The evidence directory a job may declare, when the directory really
+    /// holds a complete, readable set.
+    ///
+    /// Declaring evidence is a promise Publish acts on, so the promise is
+    /// checked here against the game's and the browser gate's own strict
+    /// schemas rather than against the presence of a file name.
+    fn declared_evidence(job: &str, root: &Path) -> Option<String> {
+        match job {
+            "verify" => {
+                let directory = root.join(NATIVE_EVIDENCE);
+                let report = read_json::<VerificationReport>(&directory.join("report.json"))
+                    .inspect_err(|message| eprintln!("no publishable native evidence: {message}"))
+                    .ok()?;
+                VerificationEvidence::project(&report, &directory, None)
+                    .inspect_err(|error| eprintln!("no publishable native evidence: {error}"))
+                    .ok()?;
+                Some(NATIVE_EVIDENCE.to_owned())
+            }
+            "build-web" => {
+                let directory = root.join(WEB_EVIDENCE);
+                read_json::<BrowserGateReport>(&directory.join("browser-gate.json"))
+                    .inspect_err(|message| eprintln!("no publishable browser evidence: {message}"))
+                    .ok()?;
+                Some(WEB_EVIDENCE.to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn status_name(status: GateStatus) -> &'static str {
+        match status {
+            GateStatus::Passed => "passed",
+            GateStatus::Failed => "failed",
+            GateStatus::SkippedDependency => "skipped_dependency",
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Publication inputs
+    // -----------------------------------------------------------------------
+
+    /// Decides everything Publish publishes, from what the two jobs left
+    /// behind.
+    ///
+    /// Publish always runs, so every gap has to become a published fact: a
+    /// missing result artifact, an unprojectable report, an incomplete package,
+    /// and an absent previous publication are all decided here and written into
+    /// one `inputs.json` the generator can read without knowing any of it.
+    // Every argument is one named command-line option. Grouping them into a
+    // struct would only move the same list one level away from the parser that
+    // fills it.
+    #[allow(clippy::too_many_arguments)]
+    fn inputs(
+        repository: &Path,
+        source_commit: &str,
+        run_url: &str,
+        native_outcome: &str,
+        web_outcome: &str,
+        native: Option<&Path>,
+        web: Option<&Path>,
+        previous: Option<&Path>,
+        output: &Path,
+    ) -> ExitCode {
+        if let Err(error) = fs::create_dir_all(output) {
+            return content_error(format!("{}: {error}", output.display()));
+        }
+
+        let native_report = read_job_report(native, native_outcome);
+        let web_report = read_job_report(web, web_outcome);
+        let mut extra = Vec::new();
+
+        let verification = native_evidence(native, &native_report, web, &web_report, &mut extra);
+        let playable = playable_input(web, &web_report, source_commit, run_url, &mut extra);
+
+        let mut workflow =
+            match merge_job_results(source_commit, run_url, &native_report, &web_report) {
+                Ok(workflow) => workflow,
+                Err(error) => return content_error(error.to_string()),
+            };
+        workflow.gates.extend(extra);
+        if let Err(error) = validate_workflow_summary(&workflow) {
+            return content_error(error.to_string());
+        }
+        if let Err(message) = write_json(&output.join("workflow.json"), &workflow) {
+            return content_error(message);
+        }
+
+        let repo = match read_repo_facts(repository) {
+            Ok(repo) => repo,
+            Err(message) => return content_error(message),
+        };
+        if let Err(message) = write_json(&output.join("repo.json"), &repo) {
+            return content_error(message);
+        }
+
+        let gallery = inherited_gallery(previous);
+        if let Err(message) = write_json(&output.join("gallery.json"), &gallery) {
+            return content_error(message);
+        }
+
+        let paths = SiteInputPaths {
+            progress: repository.join("docs/progress.json"),
+            plan: repository.join("docs/implementation-plan.md"),
+            reference_manifest: repository.join("docs/reference/manifest.json"),
+            workflow: PathBuf::from("workflow.json"),
+            repo: PathBuf::from("repo.json"),
+            verification,
+            gallery: Some(PathBuf::from("gallery.json")),
+            playable,
+        };
+        if let Err(message) = write_json(&output.join("inputs.json"), &paths) {
+            return content_error(message);
+        }
+
+        println!(
+            "native={} web={}",
+            status_name(workflow.native),
+            status_name(workflow.web)
+        );
+        ExitCode::SUCCESS
+    }
+
+    /// One job's result artifact, read strictly or read as absent.
+    ///
+    /// A manifest that is missing, unreadable, or carries a value the site may
+    /// not publish is treated exactly like a job that never uploaded one, so a
+    /// malformed manifest can never publish itself.
+    fn read_job_report(root: Option<&Path>, outcome: &str) -> JobReport {
+        let outcome = JobOutcome::parse(outcome);
+        let Some(root) = root else {
+            return JobReport::absent(outcome);
+        };
+        let path = root.join(RESULT_FILE);
+        match read_json::<JobResult>(&path).and_then(|result| {
+            validate_job_result(&result)
+                .map(|()| result)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => JobReport {
+                outcome,
+                result: Some(result),
+            },
+            Err(message) => {
+                eprintln!("unusable {} result manifest: {message}", outcome.name());
+                JobReport::absent(outcome)
+            }
+        }
+    }
+
+    /// The verification block Publish hands the generator, when both jobs left
+    /// evidence the generator can really project.
+    ///
+    /// A native report that no longer projects is published as a failed gate
+    /// rather than as a crash, because Publish has to publish the current
+    /// status even when the evidence behind it is unusable.
+    fn native_evidence(
+        native_root: Option<&Path>,
+        native: &JobReport,
+        web_root: Option<&Path>,
+        web: &JobReport,
+        extra: &mut Vec<GateSummary>,
+    ) -> Option<VerificationInput> {
+        let directory = native_root?.join(native.evidence()?);
+        let browser = web_root
+            .zip(web.evidence())
+            .map(|(root, evidence)| root.join(evidence))
+            .filter(|directory| directory.join("browser-gate.json").is_file())
+            .map(|directory| BrowserInput {
+                report: directory.join("browser-gate.json"),
+                artifacts: directory,
+            });
+        let input = VerificationInput {
+            report: directory.join("report.json"),
+            artifacts: directory,
+            browser,
+        };
+
+        match project_verification(Path::new("."), &input) {
+            Ok(_) => Some(input),
+            Err(message) => {
+                eprintln!("the declared verification evidence does not project: {message}");
+                extra.push(failed_gate("Published verification evidence"));
+                None
+            }
+        }
+    }
+
+    /// The packaged game Publish promotes, when the web job really proved one.
+    fn playable_input(
+        web_root: Option<&Path>,
+        web: &JobReport,
+        source_commit: &str,
+        run_url: &str,
+        extra: &mut Vec<GateSummary>,
+    ) -> Option<PlayableInput> {
+        if web.status() != GateStatus::Passed {
+            return None;
+        }
+        let directory = web_root?.join(WEB_PACKAGE);
+        let missing = missing_playable_parts(&directory);
+        if !missing.is_empty() {
+            eprintln!(
+                "the packaged game is incomplete: missing {}",
+                missing.join(", ")
+            );
+            extra.push(failed_gate("Published playable package"));
+            return None;
+        }
+        Some(PlayableInput {
+            directory,
+            source_commit: source_commit.to_owned(),
+            run_url: run_url.to_owned(),
+        })
+    }
+
+    /// The screenshot history this build inherits.
+    ///
+    /// Only a previous `pages-live` publication carries one, so a first run
+    /// starts from an explicitly empty history rather than from nothing.
+    fn inherited_gallery(previous: Option<&Path>) -> GalleryManifest {
+        let Some(path) = previous.map(|previous| previous.join("gallery.json")) else {
+            return GalleryManifest::default();
+        };
+        match read_json::<GalleryManifest>(&path) {
+            Ok(gallery) => gallery,
+            Err(message) => {
+                if path.exists() {
+                    eprintln!("the inherited history is unusable: {message}");
+                }
+                GalleryManifest::default()
+            }
+        }
+    }
+
+    fn failed_gate(name: &str) -> GateSummary {
+        GateSummary {
+            name: name.to_owned(),
+            status: GateStatus::Failed,
+            passed: 0,
+            failed: 1,
+            duration_ms: 0,
+            artifact_url: None,
+        }
+    }
+
+    fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(value)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        fs::write(path, json.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
     }
 
     fn validate(progress_path: &Path, plan_path: &Path, repository: &Path) -> ExitCode {
@@ -381,8 +786,38 @@ mod native {
         Ok(RepoFacts {
             head_sha,
             known_commits,
-            commits: Vec::new(),
+            commits: read_commit_summaries(repository)?,
         })
+    }
+
+    /// The most recent commits, newest first, with nothing but what the
+    /// timeline publishes.
+    ///
+    /// The subject is the only free text a commit contributes, and the site
+    /// escapes it; nothing else about the repository or the machine is read.
+    fn read_commit_summaries(repository: &Path) -> Result<Vec<CommitSummary>, String> {
+        let separator = '\u{1f}';
+        let log = git_output(
+            repository,
+            &[
+                "log",
+                "--max-count",
+                &PUBLISHED_COMMITS.to_string(),
+                &format!("--format=%H{separator}%cI{separator}%s"),
+            ],
+        )?;
+        Ok(log
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, separator);
+                Some(CommitSummary {
+                    sha: fields.next()?.to_owned(),
+                    committed_at: fields.next()?.to_owned(),
+                    subject: fields.next()?.to_owned(),
+                    task_id: None,
+                })
+            })
+            .collect())
     }
 
     fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {

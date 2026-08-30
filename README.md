@@ -770,7 +770,9 @@ report-derived gate is `Verified frame captures`: it reports the frames the run
 really captured and the metric bounds the run itself recorded as missed. It is
 deliberately not called a rendered image contract, because the projection never
 re-runs `evaluate_frame` and so holds no verdict from the reference image
-analyzers. Publishing that verdict needs the render-contract job's own result.
+analyzers. `Rendered image contracts` is published beside it from the workflow
+result, carrying the outcome and the measured duration of the job step that
+really ran the serialized render contract.
 
 Four containment rules apply before a single pixel is copied:
 
@@ -846,6 +848,62 @@ The site generator and its CLI are native-only. Publication reads the
 repository, decodes verified frames, and writes files, so the browser game
 carries none of it; `scripts/build-web.sh` builds only `--bin midcreek-cs-1`.
 
+## Status-always publication
+
+The hub reports the current commit on every push, whether or not that commit is
+green. Three jobs make that possible.
+
+**Verify** runs every named native gate through `scripts/run-gate.sh`: published
+progress data, formatting, Clippy, generated asset freshness, the library and
+binary tests, the asset, application, site-generation, and Pages-assembly
+contracts, the serialized rendered image contracts, and the release build. The
+runner measures one gate, appends one line naming it, its status, and its
+duration, and always exits zero, so a red gate never hides the ones after it:
+
+```text
+{"name":"Rendered image contracts","status":"failed","duration_ms":31184}
+```
+
+Verify then lifts `report.json` and the fourteen frames out of
+`target/render-contract/primary` into a workflow-owned evidence root, summarizes
+the measured lines into a strict result manifest, uploads both in an
+`if: always()` step, and only then fails once in a verdict step of its own. The
+run's captured stdout and stderr stay behind as Actions artifacts and never
+travel with the evidence.
+
+**Build web** runs only when Verify concluded success. It installs the pinned
+toolchain through `scripts/install-wasm-toolchain.sh`, packages the game, and
+runs the headless browser gate, measuring each as a named gate. Its result
+artifact carries the packaged game, `browser-gate.json`, the canvas and page
+screenshots, and the measured gates, so a failed browser gate still hands
+Publish everything Publish is allowed to publish. It concludes failure only
+after that artifact is uploaded.
+
+**Publish** runs with `if: always()` and needs both jobs. It downloads whichever
+result artifacts exist without failing on a skipped or missing one, and hands
+every upstream outcome to `sitegen inputs`, which decides in one place:
+
+- the merged gate matrix, synthesizing `skipped_dependency` and failed rows for
+  a job that produced no manifest, so a silent upload failure is visible rather
+  than absent;
+- whether the declared verification evidence really projects. A job that passed
+  and left an unprojectable report publishes a failed
+  `Published verification evidence` row and a status-only page, never a crash;
+- whether a complete playable package was earned;
+- the screenshot history, which is inherited from the previous `pages-live`
+  publication or is explicitly empty on a first run.
+
+A result manifest is the one place a command line, a captured stream, an
+environment value, a local path, or somebody else's URL could cross onto a
+public page, so its shape denies unknown fields and every value is checked:
+gate names are short plain labels with no path in them, the source commit is a
+full SHA, and every link has to be a `https://github.com/` URL. A manifest that
+fails any of it is read exactly like one that never arrived.
+
+A job and its own manifest both have to agree on success. A job that passed
+every gate and then failed while uploading, and a manifest claiming success for
+a job GitHub saw fail, are both published as failures.
+
 ## Foundation gates
 
 ```bash
@@ -884,6 +942,7 @@ cargo test --lib web
 cargo test --test sitegen_contract
 cargo test --test pages_assembly_contract
 python3 scripts/browser_gate_test.py
+./scripts/install-wasm-toolchain.sh
 ./scripts/build-web.sh target/web-preview
 ./scripts/web-smoke.sh target/web-preview
 ```
@@ -915,3 +974,22 @@ The verified preview publishes fourteen frames, the worker crop, the browser
 canvas, `gallery.json`, and one history point. The failed preview publishes
 `verification.json`, the failed stage, and the failed metrics, and writes no
 screenshots at all.
+
+Publication can also be rehearsed end to end, exactly as the workflow runs it:
+
+```bash
+sitegen result --job verify --gates "$root/native/gates.jsonl" --output "$root/native"
+sitegen inputs --repository . --source-commit "$(git rev-parse HEAD)" \
+  --run-url https://github.com/ridermw/midcreek-cs-1/actions/runs/1 \
+  --native-outcome success --web-outcome skipped \
+  --native "$root/native" --output "$root/pages"
+sitegen build --inputs "$root/pages/inputs.json" --output "$root/pages/current"
+sitegen assemble --current "$root/pages/current" \
+  --result "$root/pages/workflow.json" --output "$root/pages/output"
+```
+
+`tests/pages_assembly_contract.rs` drives that same command through every
+upstream outcome: all green, a failed native job, a failed render gate that left
+a partial report, evidence that no longer projects, a failed web job, a skipped
+web job, a job whose result artifact never arrived, a forged manifest, a first
+run, and an inherited history.

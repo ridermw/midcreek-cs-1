@@ -456,10 +456,7 @@ mod progress_contract {
                 .expect("sitegen should launch");
 
             assert_eq!(output.status.code(), Some(0));
-            assert_eq!(
-                String::from_utf8(output.stdout).unwrap(),
-                "pages-status-always\n"
-            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), "ci-baseline\n");
             assert!(output.stderr.is_empty());
         }
     }
@@ -553,14 +550,14 @@ mod progress_contract {
                 ),
                 (
                     "pages-status-always",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["pages-verification"][..],
-                    "Wiring the Pages workflow to publish this evidence on every push while retaining the last green game, screenshots, and history.",
-                    None,
+                    "Wired the Pages workflow to measure every named gate, upload each job's result and evidence before it concludes, and publish the current commit's status on every push while retaining the last green game, screenshots, and history.",
+                    Some("HEAD"),
                 ),
                 (
                     "ci-baseline",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["pages-status-always"][..],
                     "Publish and verify the final POC baseline.",
                     None,
@@ -599,6 +596,7 @@ mod progress_contract {
                     "generated-materials-rendered-far-brighter-than-the-authored-palette",
                     "the-overhead-trays-hid-the-technician-at-two-of-the-four-headings",
                     "history-images-arrive-after-the-build-that-links-them",
+                    "a-job-that-stops-at-its-first-failure-publishes-nothing",
                 ]
             );
             for challenge in &document.challenges {
@@ -1696,8 +1694,8 @@ mod verification_publication_contract {
         design::{CHARACTER_SHEET_SHA256, KEY_ART_SHA256},
         sitegen::{
             BROWSER_FRAME_FILE, CURRENT_SCREENSHOTS, GALLERY_FILE, GALLERY_FRAMES, GalleryManifest,
-            HISTORY_SCREENSHOTS, VERIFICATION_FILE, VerificationEvidence, VerificationSummary,
-            WORKER_CROP_FILE, update_gallery,
+            GateStatus, GateSummary, HISTORY_SCREENSHOTS, VERIFICATION_FILE, VerificationEvidence,
+            VerificationSummary, WORKER_CROP_FILE, update_gallery,
         },
         verification::{ARTIFACT_NAMES, FrameName, VerificationReport},
     };
@@ -2243,7 +2241,9 @@ mod verification_publication_contract {
 
     /// The projection reads the run's own report. It can vouch for the frames
     /// the run really captured, but it never re-runs `evaluate_frame`, so it
-    /// must not publish the render contract's verdict as if it had.
+    /// must not publish the render contract's verdict as if it had. The
+    /// verdict itself reaches the site as a workflow gate, from the job that
+    /// really ran the analyzers.
     #[test]
     fn the_published_gates_never_claim_the_render_image_contract_passed() {
         let site = build_fixture_site("verified-game").unwrap();
@@ -2272,6 +2272,63 @@ mod verification_publication_contract {
             "{:?}",
             summary.gates
         );
+    }
+
+    /// `Rendered image contracts` is a real verdict, so it is published only
+    /// when the workflow result carries the outcome and the duration of the
+    /// job step that really ran the serialized render contract.
+    #[test]
+    fn the_render_image_contract_verdict_is_published_from_the_workflow_result() {
+        let mut inputs = site_inputs("verified-game");
+        inputs.workflow.gates.push(GateSummary {
+            name: "Rendered image contracts".to_owned(),
+            status: GateStatus::Passed,
+            passed: 1,
+            failed: 0,
+            duration_ms: 184_000,
+            artifact_url: None,
+        });
+        let site = build_site_from_inputs("render-verdict", &inputs).unwrap();
+        let html = site.index_html();
+        let summary =
+            serde_json::from_str::<VerificationSummary>(&read(site.root().join(VERIFICATION_FILE)))
+                .unwrap();
+
+        assert_text(&html, "#tests", "Rendered image contracts");
+        assert_text(&html, "#tests", "184.00 s");
+        assert_text(&html, "#tests", "Verified frame captures");
+        assert!(
+            summary
+                .gates
+                .iter()
+                .all(|gate| gate.name != "Rendered image contracts"),
+            "the projection still holds no analyzer verdict: {:?}",
+            summary.gates
+        );
+    }
+
+    /// A failed render job publishes its own red row rather than borrowing the
+    /// report's account of the frames it captured.
+    #[test]
+    fn a_failed_render_image_contract_is_published_as_failed() {
+        let mut inputs = site_inputs("verified-game");
+        inputs.workflow.gates.push(GateSummary {
+            name: "Rendered image contracts".to_owned(),
+            status: GateStatus::Failed,
+            passed: 0,
+            failed: 1,
+            duration_ms: 12_000,
+            artifact_url: None,
+        });
+        let html = build_site_from_inputs("render-verdict-failed", &inputs)
+            .unwrap()
+            .index_html();
+
+        let row = html
+            .split("Rendered image contracts")
+            .nth(1)
+            .expect("the failed gate should render a row");
+        assert!(row.contains("gate-failed"), "{row}");
     }
 
     #[test]

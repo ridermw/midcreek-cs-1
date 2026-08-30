@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RESULT: ${{ runner.temp }}/native
+      GATES: ${{ runner.temp }}/native/gates.jsonl
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -32,19 +35,120 @@ jobs:
             libudev-dev \
             libx11-dev \
             libxi-dev \
-            libxrandr-dev
+            libxrandr-dev \
+            libgl1 \
+            libegl1 \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            xvfb
 
-      - name: Test site generation
+      # Every named gate runs and is recorded even after an earlier one fails,
+      # so one run publishes the whole matrix instead of stopping at the first
+      # red row. scripts/run-gate.sh never fails the step; the verdict below is
+      # the single place this job concludes.
+      - name: Run the native gates
+        env:
+          BEVY_ASSET_ROOT: ${{ github.workspace }}
         run: |
-          cargo test --test sitegen_contract
-          cargo test --test pages_assembly_contract
+          set -uo pipefail
 
-      - name: Validate publication inputs
+          ./scripts/run-gate.sh "$GATES" "Published progress data" -- \
+            cargo run --quiet --bin sitegen -- validate \
+              --progress docs/progress.json \
+              --plan docs/implementation-plan.md \
+              --repository .
+
+          ./scripts/run-gate.sh "$GATES" "Rust formatting" -- \
+            cargo fmt --all --check
+
+          ./scripts/run-gate.sh "$GATES" "Clippy lints" -- \
+            cargo clippy --all-targets --all-features -- -D warnings
+
+          ./scripts/run-gate.sh "$GATES" "Generated asset freshness" -- \
+            cargo run --quiet --bin assetgen -- --check
+
+          ./scripts/run-gate.sh "$GATES" "Library and binary tests" -- \
+            cargo test --lib --bins
+
+          ./scripts/run-gate.sh "$GATES" "Asset contracts" -- \
+            cargo test --test asset_contract
+
+          ./scripts/run-gate.sh "$GATES" "Application contracts" -- \
+            cargo test --test app_contract
+
+          ./scripts/run-gate.sh "$GATES" "Site generation contracts" -- \
+            cargo test --test sitegen_contract
+
+          ./scripts/run-gate.sh "$GATES" "Pages assembly contracts" -- \
+            cargo test --test pages_assembly_contract
+
+          ./scripts/run-gate.sh "$GATES" "Rendered image contracts" -- \
+            xvfb-run -a cargo test --test render_contract -- --test-threads=1
+
+          ./scripts/run-gate.sh "$GATES" "Release build" -- \
+            cargo build --release
+
+      # The rendered contract keeps its whole run under target/render-contract.
+      # Only the report and the frames are lifted into the workflow-owned
+      # evidence root; the captured stdout and stderr stay behind as run
+      # diagnostics and never reach a published page.
+      - name: Collect the verification evidence
+        if: always()
         run: |
-          cargo run --bin sitegen -- validate \
-            --progress docs/progress.json \
-            --plan docs/implementation-plan.md \
-            --repository .
+          set -uo pipefail
+          source="target/render-contract/primary"
+          destination="$RESULT/verification"
+          mkdir -p "$destination"
+          if [[ -f "$source/report.json" ]]; then
+            cp "$source/report.json" "$destination/"
+            find "$source" -maxdepth 1 -type f -name '*.png' \
+              -exec cp {} "$destination/" \;
+          fi
+          ls -1 "$destination" || true
+
+      - name: Upload the rendered run diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: render-contract-diagnostics
+          path: target/render-contract
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # This step never fails: a job that cannot summarize itself still has to
+      # upload whatever it measured, and Publish reads a missing manifest as a
+      # failed job rather than as a silent success.
+      - name: Summarize the native gates
+        id: native
+        if: always()
+        run: |
+          set -uo pipefail
+          status="$(cargo run --quiet --bin sitegen -- result \
+            --job verify \
+            --gates "$GATES" \
+            --output "$RESULT" || echo failed)"
+          echo "status=${status:-failed}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the native result
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: native-result
+          path: ${{ runner.temp }}/native
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Conclude the native verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.native.outputs.status }}
+        run: |
+          set -uo pipefail
+          if [[ "$STATUS" != "passed" ]]; then
+            echo "the native gates concluded ${STATUS:-failed}" >&2
+            echo "every measured gate is in the native-result artifact" >&2
+            exit 1
+          fi
 
   build-web:
     name: Build web
@@ -52,6 +156,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RESULT: ${{ runner.temp }}/web
+      GATES: ${{ runner.temp }}/web/gates.jsonl
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -67,8 +174,7 @@ jobs:
             libudev-dev \
             libx11-dev \
             libxi-dev \
-            libxrandr-dev \
-            jq
+            libxrandr-dev
 
       - name: Resolve the preinstalled Chrome
         run: |
@@ -81,39 +187,53 @@ jobs:
           "$chrome" --version
           echo "CHROME=$chrome" >> "$GITHUB_ENV"
 
-      - name: Install the pinned WebAssembly toolchain
+      - name: Run the web gates
         run: |
-          set -euo pipefail
-          rustup target add wasm32-unknown-unknown
-          locked="$(awk '
-            /^name = "wasm-bindgen"$/ { found = 1; next }
-            found && /^version = / { gsub(/["]/, "", $3); print $3; exit }
-          ' Cargo.lock)"
-          echo "locked wasm-bindgen: $locked"
-          cargo install wasm-bindgen-cli --version "$locked" --locked
+          set -uo pipefail
 
-      - name: Package the browser game
-        run: ./scripts/build-web.sh "$RUNNER_TEMP/web"
+          ./scripts/run-gate.sh "$GATES" "WebAssembly toolchain" -- \
+            ./scripts/install-wasm-toolchain.sh
 
-      - name: Prove the packaged game in a headless browser
-        run: ./scripts/web-smoke.sh "$RUNNER_TEMP/web" "$RUNNER_TEMP/web-smoke"
+          ./scripts/run-gate.sh "$GATES" "WebAssembly package" -- \
+            ./scripts/build-web.sh "$RESULT/play"
 
-      - name: Upload the verified web package
-        uses: actions/upload-artifact@v5
-        with:
-          name: web-package
-          path: ${{ runner.temp }}/web
-          retention-days: 7
-          if-no-files-found: error
+          ./scripts/run-gate.sh "$GATES" "Headless browser gate" -- \
+            ./scripts/web-smoke.sh "$RESULT/play" "$RESULT/browser"
 
-      - name: Upload browser gate diagnostics
+      - name: Summarize the web gates
+        id: web
+        if: always()
+        run: |
+          set -uo pipefail
+          status="$(cargo run --quiet --bin sitegen -- result \
+            --job build-web \
+            --gates "$GATES" \
+            --output "$RESULT" || echo failed)"
+          echo "status=${status:-failed}" >> "$GITHUB_OUTPUT"
+
+      # The packaged game, the browser gate summary, its canvas and page
+      # screenshots, and every measured gate travel together, so a failed run
+      # still hands Publish everything Publish is allowed to publish.
+      - name: Upload the web result
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: web-smoke-diagnostics
-          path: ${{ runner.temp }}/web-smoke
+          name: web-result
+          path: ${{ runner.temp }}/web
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn
+
+      - name: Conclude the web verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.web.outputs.status }}
+        run: |
+          set -uo pipefail
+          if [[ "$STATUS" != "passed" ]]; then
+            echo "the web gates concluded ${STATUS:-failed}" >&2
+            echo "every measured gate is in the web-result artifact" >&2
+            exit 1
+          fi
 
   publish:
     name: Publish
@@ -155,157 +275,80 @@ jobs:
             libxi-dev \
             libxrandr-dev
 
-      - name: Download the verified web package
-        id: web
-        if: needs.verify.result == 'success' && needs.build-web.result == 'success'
+      # Either upstream job may have failed, been skipped, or never uploaded
+      # anything. A missing download is a fact this run publishes, never a
+      # reason to stop publishing.
+      - name: Download the native result
+        id: native
         continue-on-error: true
         uses: actions/download-artifact@v6
         with:
-          name: web-package
+          name: native-result
+          path: ${{ runner.temp }}/native
+
+      - name: Download the web result
+        id: web
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: web-result
           path: ${{ runner.temp }}/web
 
       - name: Build and assemble current status
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
           WEB_RESULT: ${{ needs.build-web.result }}
+          NATIVE_DOWNLOAD: ${{ steps.native.outcome }}
           WEB_DOWNLOAD: ${{ steps.web.outcome }}
+          PREVIOUS_CHECKOUT: ${{ steps.previous.outcome }}
         run: |
           set -euo pipefail
 
           pages_root="$RUNNER_TEMP/pages"
           current="$pages_root/current"
           output="$pages_root/output"
-          mkdir -p "$pages_root" "$output"
+          mkdir -p "$pages_root"
 
-          if [[ "$VERIFY_RESULT" == "success" ]]; then
-            native_status="passed"
-            passed=1
-            failed=0
-          else
-            native_status="failed"
-            passed=0
-            failed=1
+          native_args=()
+          if [[ "$NATIVE_DOWNLOAD" == "success" ]]; then
+            native_args=(--native "$RUNNER_TEMP/native")
+          fi
+          web_args=()
+          if [[ "$WEB_DOWNLOAD" == "success" ]]; then
+            web_args=(--web "$RUNNER_TEMP/web")
+          fi
+          previous_args=()
+          if [[ "$PREVIOUS_CHECKOUT" == "success" ]]; then
+            previous_args=(--previous "$GITHUB_WORKSPACE/previous-pages")
           fi
 
-          case "$WEB_RESULT" in
-            success) web_status="passed" ;;
-            skipped) web_status="skipped_dependency" ;;
-            *) web_status="failed" ;;
-          esac
+          # One repository-owned command decides everything this run
+          # publishes: the merged gate matrix, the commit timeline, the
+          # inherited screenshot history, whether the verified evidence really
+          # projects, and whether a complete playable package was earned.
+          cargo run --quiet --bin sitegen -- inputs \
+            --repository "$GITHUB_WORKSPACE" \
+            --source-commit "$GITHUB_SHA" \
+            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --native-outcome "$VERIFY_RESULT" \
+            --web-outcome "$WEB_RESULT" \
+            "${native_args[@]}" \
+            "${web_args[@]}" \
+            "${previous_args[@]}" \
+            --output "$pages_root"
 
-          # A green playable build is promoted only when both gates passed and
-          # the package really arrived. Any other outcome keeps the previous
-          # verified game in place.
-          playable="false"
-          if [[ "$native_status" == "passed" && "$web_status" == "passed" \
-                && "$WEB_DOWNLOAD" == "success" \
-                && -f "$RUNNER_TEMP/web/game_bg.wasm" ]]; then
-            playable="true"
-          elif [[ "$web_status" == "passed" ]]; then
-            web_status="failed"
-          fi
-
-          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          jq -n \
-            --arg source_commit "$GITHUB_SHA" \
-            --arg run_url "$run_url" \
-            --arg native "$native_status" \
-            --arg web "$web_status" \
-            --argjson passed "$passed" \
-            --argjson failed "$failed" \
-            '{
-              source_commit: $source_commit,
-              run_url: $run_url,
-              native: $native,
-              web: $web,
-              gates: [{
-                name: "Progress and site tests",
-                status: $native,
-                passed: $passed,
-                failed: $failed,
-                duration_ms: 0,
-                artifact_url: null
-              }, {
-                name: "WASM package and browser gate",
-                status: $web,
-                passed: (if $web == "passed" then 1 else 0 end),
-                failed: (if $web == "failed" then 1 else 0 end),
-                duration_ms: 0,
-                artifact_url: null
-              }]
-            }' > "$pages_root/workflow.json"
-
-          known_commits="$(git rev-list --all | jq -R -s 'split("\n") | map(select(length > 0))')"
-          commits='[]'
-          while IFS= read -r sha; do
-            subject="$(git show -s --format=%s "$sha")"
-            committed_at="$(git show -s --format=%cI "$sha")"
-            commits="$(jq \
-              --arg sha "$sha" \
-              --arg subject "$subject" \
-              --arg committed_at "$committed_at" \
-              '. + [{
-                sha: $sha,
-                subject: $subject,
-                committed_at: $committed_at,
-                task_id: null
-              }]' <<< "$commits")"
-          done < <(git rev-list --max-count=20 HEAD)
-
-          jq -n \
-            --arg head_sha "$GITHUB_SHA" \
-            --argjson known_commits "$known_commits" \
-            --argjson commits "$commits" \
-            '{
-              head_sha: $head_sha,
-              known_commits: $known_commits,
-              commits: $commits
-            }' > "$pages_root/repo.json"
-
-          playable_json='null'
-          if [[ "$playable" == "true" ]]; then
-            playable_json="$(jq -n \
-              --arg directory "$RUNNER_TEMP/web" \
-              --arg source_commit "$GITHUB_SHA" \
-              --arg run_url "$run_url" \
-              '{
-                directory: $directory,
-                source_commit: $source_commit,
-                run_url: $run_url
-              }')"
-          fi
-
-          jq -n \
-            --arg progress "$GITHUB_WORKSPACE/docs/progress.json" \
-            --arg plan "$GITHUB_WORKSPACE/docs/implementation-plan.md" \
-            --arg reference_manifest "$GITHUB_WORKSPACE/docs/reference/manifest.json" \
-            --arg workflow "$pages_root/workflow.json" \
-            --arg repo "$pages_root/repo.json" \
-            --argjson playable "$playable_json" \
-            '{
-              progress: $progress,
-              plan: $plan,
-              reference_manifest: $reference_manifest,
-              workflow: $workflow,
-              repo: $repo,
-              verification: null,
-              playable: $playable
-            }' > "$pages_root/inputs.json"
-
-          cargo run --bin sitegen -- build \
+          cargo run --quiet --bin sitegen -- build \
             --inputs "$pages_root/inputs.json" \
             --output "$current"
 
-          previous_args=()
-          if [[ "${{ steps.previous.outcome }}" == "success" ]]; then
-            previous_args=(--previous "$GITHUB_WORKSPACE/previous-pages")
-          fi
-          cargo run --bin sitegen -- assemble \
+          cargo run --quiet --bin sitegen -- assemble \
             "${previous_args[@]}" \
             --current "$current" \
             --result "$pages_root/workflow.json" \
             --output "$output"
+
           touch "$output/.nojekyll"
+          cp .github/pages-live-README.md "$output/README.md"
 
       - name: Push generated Pages branch
         env:
