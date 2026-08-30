@@ -1109,11 +1109,15 @@ fn advance_racks(
 /// mistaken for a repair.
 ///
 /// This is deliberately *not* gated on a positive `Time::delta`. `just_pressed`
-/// is true for exactly one frame, so dropping it on a frame that advanced no
-/// simulated time would lose the press outright. Running it is safe instead:
-/// nothing simulated changes between a zero-delta frame and the next simulated
-/// one, so the press resolves against the same state and records the same tick
-/// either way.
+/// is true for exactly one frame, so gating it would drop a press outright on
+/// any frame the verification harness happened to be holding the clock at zero
+/// for. Running it is safe instead: the zero-delta guards on the systems that
+/// own time mean nothing simulated changes while the clock is held, so the
+/// press resolves against exactly the state the last simulated frame left.
+///
+/// The interaction it records is stamped with [`OperationsClock::tick`] as it
+/// stands at that moment — which, because a zero-delta frame never stamps a new
+/// tick, is the tick of the last frame that advanced time.
 #[allow(clippy::too_many_arguments)]
 fn handle_repair_input(
     keys: Res<ButtonInput<KeyCode>>,

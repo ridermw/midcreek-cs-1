@@ -2063,6 +2063,14 @@ fn player_facing(app: &mut App) -> Vec2 {
     (technician_transform(app).rotation * TECHNICIAN_MODEL_FORWARD).xz()
 }
 
+fn player_motion(app: &App) -> PlayerMotion {
+    app.world().resource::<PlayerMotion>().clone()
+}
+
+fn animation_clip(app: &App) -> PlayerClip {
+    app.world().resource::<PlayerAnimationState>().current()
+}
+
 fn place_player(app: &mut App, position: Vec2) {
     let entity = technician_entity(app);
     let mut transform = app
@@ -4740,13 +4748,20 @@ fn scheduler_facts(
 /// simulated frame left it: the tick tickets are stamped with, every rack
 /// timer, the seeded stream and the candidate it is holding, the queue, the
 /// movement lock, and the technician's position.
+///
+/// This is the broad surface sweep, and it is honestly weak on two of those
+/// units: the scheduler is frozen while it is *already* blocked at capacity,
+/// where a step would draw nothing and `note_block` is idempotent, and the
+/// technician is frozen while a repair holds the movement lock, where a step
+/// would move nobody anyway. `zero_delta_frames_never_let_an_armed_scheduler_draw_or_emit`
+/// and `zero_delta_frames_never_restate_a_walking_technicians_motion_or_pose`
+/// are the regressions that actually fail when those two guards are removed.
 #[test]
 fn zero_delta_frames_never_advance_the_operations_model() {
     let mut app = operations_hall(&repo_assets());
 
-    // A full queue and an armed scheduler holding a candidate it cannot place:
-    // the one state in which a zero-delta step could emit a ticket out of
-    // nothing, because the interval has already matured.
+    // A full queue and an armed scheduler holding a matured opportunity it
+    // cannot place.
     pump(&mut app, FAULT_FRAMES * 4);
     assert_eq!(ticket_queue(&app).len(), MAX_ACTIVE_TICKETS);
     assert!(
@@ -4831,6 +4846,188 @@ fn zero_delta_frames_never_advance_the_operations_model() {
         tick + 1,
         "the first simulated frame after the freeze must resume the tick"
     );
+}
+
+/// A frozen frame must not let an armed scheduler draw, block, or emit.
+///
+/// The guard inside [`FaultScheduler::step`] only has anything to protect when
+/// a step would really change the scheduler, and the state the scheduler arms
+/// itself in is not that state: an armed scheduler is always blocked at
+/// capacity, `note_block` refuses to recount a reason it is already holding,
+/// and a full queue is never drawn against. So this regression clears the
+/// capacity block *while the clock is frozen* — every rack reset to healthy and
+/// the queue emptied — leaving the scheduler exactly one step away from
+/// consuming two words of the seeded stream and opening a ticket out of
+/// nothing.
+///
+/// The final assertions are the proof the setup was really loaded: handing the
+/// clock back for one frame emits that ticket. Delete the `delta.is_zero()`
+/// return in `FaultScheduler::step` and the emission happens 600 frames
+/// earlier, inside the freeze.
+#[test]
+fn zero_delta_frames_never_let_an_armed_scheduler_draw_or_emit() {
+    let mut app = operations_hall(&repo_assets());
+
+    pump(&mut app, FAULT_FRAMES * 4);
+    assert!(
+        scheduler(&app).is_armed(),
+        "the fourth opportunity must have matured against the full queue"
+    );
+    assert_eq!(
+        scheduler(&app).blocked(),
+        Some(ScheduleBlock::AtCapacity {
+            active: MAX_ACTIVE_TICKETS
+        }),
+        "an armed scheduler in the running game is blocked at capacity"
+    );
+
+    freeze_time(&mut app);
+
+    // Clear the block the frozen clock is now the only thing standing between
+    // the scheduler and an emission.
+    for entry in roster(&app).all() {
+        *app.world_mut()
+            .get_mut::<RackOperations>(entry.entity)
+            .expect("every authored rack carries operational state") =
+            RackOperations::new(entry.rack, entry.id.clone());
+    }
+    app.world_mut().insert_resource(TicketQueue::default());
+
+    let tick = operations_tick(&app);
+    let facts = scheduler_facts(&app);
+    assert!(facts.2, "the frozen scheduler is still armed");
+    assert_eq!(facts.3, None, "and still holds no drawn candidate");
+
+    drive(&mut app, &[], 600);
+
+    assert_eq!(
+        scheduler_facts(&app),
+        facts,
+        "a zero-delta frame must not draw, arm, pause, or emit, even with \
+         capacity and an eligible rack waiting"
+    );
+    assert!(
+        ticket_queue(&app).is_empty(),
+        "a zero-delta frame opens no ticket against an empty queue either"
+    );
+    assert_eq!(
+        rack_states(&app),
+        vec![RackState::Healthy; roster(&app).len()],
+        "a zero-delta frame faults no rack"
+    );
+    assert_eq!(
+        operations_tick(&app),
+        tick,
+        "and stamps no new tick to create one with"
+    );
+
+    // One simulated frame proves the frozen state really was one step from
+    // changing: the same scheduler now draws and emits.
+    resume_time(&mut app);
+    app.update();
+    let resumed = scheduler_facts(&app);
+    assert_eq!(
+        resumed.0,
+        facts.0 + 2,
+        "the first simulated frame consumes exactly one rack and one severity word"
+    );
+    assert!(!resumed.2, "and disarms the opportunity it just spent");
+    assert_eq!(
+        resumed.5,
+        facts.5 + 1,
+        "and emits exactly one ticket out of the state the freeze held shut"
+    );
+    assert_eq!(ticket_queue(&app).len(), 1);
+}
+
+/// A frozen frame must not restate a walking technician's motion or pose.
+///
+/// `move_player` returning early on a zero delta is not about position — a zero
+/// delta produces a zero displacement, so the transform is safe either way. It
+/// is about `PlayerMotion`, which `update_player_animation` reads: recomputing
+/// it would publish a zero accepted displacement, the animation system would
+/// read that as "not walking", and a technician mid-stride would be stopped,
+/// restored to its rest pose, and dropped into Idle on a frame that simulated
+/// nothing — a visible change to the very pixels the readback is waiting for.
+///
+/// So the frozen technician here is genuinely walking: no repair holds the
+/// movement lock, a real arrow-key combination is held down, and the published
+/// motion is nonzero. Delete the `time.delta().is_zero()` return in
+/// `move_player` and the position assertion still passes while the motion,
+/// clip, playing animation, and rig pose assertions all fail.
+#[test]
+fn zero_delta_frames_never_restate_a_walking_technicians_motion_or_pose() {
+    let mut app = operations_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 40);
+
+    assert!(
+        !movement_lock(&app).is_locked(),
+        "the frozen technician must be unlocked, so the guard is the only \
+         thing that can stop it"
+    );
+    let motion = player_motion(&app);
+    assert!(
+        motion.is_walking(),
+        "the frozen technician must be genuinely walking, got {:?}",
+        motion.accepted()
+    );
+    assert_eq!(animation_clip(&app), PlayerClip::Walk);
+    let (_, walk, playing) = animation_player(&mut app);
+    assert_eq!(playing, vec![walk]);
+    let posed = part_transforms(&mut app);
+    assert!(
+        posed.iter().any(|(_, current, rest)| current != rest),
+        "the Walk clip must really be posing the rig before the freeze"
+    );
+
+    // The arrow keys stay held down for the whole freeze, so the request is
+    // live on every one of those frames and only the zero delta stops it.
+    freeze_time(&mut app);
+    let position = player_position(&mut app);
+    let facing = player_facing(&mut app);
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 600);
+
+    assert_eq!(
+        player_position(&mut app),
+        position,
+        "a zero-delta frame moves nobody"
+    );
+    assert_eq!(
+        player_facing(&mut app),
+        facing,
+        "a zero-delta frame turns nobody"
+    );
+    assert_eq!(
+        player_motion(&app),
+        motion,
+        "a zero-delta frame must not republish motion"
+    );
+    assert_eq!(
+        animation_clip(&app),
+        PlayerClip::Walk,
+        "a walking technician must not drop into Idle on a frame that \
+         simulated nothing"
+    );
+    assert_eq!(
+        animation_player(&mut app).2,
+        vec![walk],
+        "and the Walk clip must still be the one playing"
+    );
+    assert_eq!(
+        part_transforms(&mut app),
+        posed,
+        "a zero-delta frame must not re-pose a single rig node"
+    );
+
+    // One simulated frame proves the held keys were live the whole time.
+    resume_time(&mut app);
+    app.update();
+    assert!(
+        player_position(&mut app) != position,
+        "the first simulated frame after the freeze walks again"
+    );
+    assert_eq!(animation_clip(&app), PlayerClip::Walk);
 }
 
 #[test]
