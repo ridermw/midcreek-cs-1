@@ -1,4 +1,18 @@
 (() => {
+  // The scroll reserve below exists for the browser gate's positive control,
+  // which always loads this page as the whole document. The hub embeds the
+  // same page in a 16:9 iframe, where the reserve only makes the embedded
+  // document a full viewport taller than the frame showing it. A framed
+  // document says so, and the stylesheet drops the reserve for it alone.
+  const framed = (() => {
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  })();
+  if (framed) document.body.dataset.embedded = "true";
+
   const KEYS_THE_GAME_OWNS = new Set([
     "ArrowUp",
     "ArrowDown",

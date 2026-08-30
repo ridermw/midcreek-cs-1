@@ -105,6 +105,52 @@ mod generated_site_contract {
         }
     }
 
+    /// Task cards and challenge cards both publish commit links. They are
+    /// built in different functions, so a repository rename applied to one and
+    /// not the other publishes dead links from the other. One constant is the
+    /// only thing either may name.
+    #[test]
+    fn every_published_commit_link_is_built_from_one_repository_url() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("a[href*=\"/commit/\"]").unwrap();
+        let links = document
+            .select(&selector)
+            .map(|link| link.value().attr("href").unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        let expected = format!("{}/commit/", midcreek_cs_1::sitegen::REPOSITORY_URL);
+
+        assert_eq!(
+            links.len(),
+            3,
+            "this fixture publishes two task commits and one resolved challenge: {links:?}"
+        );
+        assert!(
+            document
+                .select(&scraper::Selector::parse("#progress a[href*=\"/commit/\"]").unwrap())
+                .count()
+                >= 1,
+            "the task cards must be one of the two link sources"
+        );
+        assert!(
+            document
+                .select(&scraper::Selector::parse("#challenges a[href*=\"/commit/\"]").unwrap())
+                .count()
+                >= 1,
+            "the challenge cards must be the other link source"
+        );
+        for href in &links {
+            assert!(
+                href.starts_with(&expected),
+                "{href} is not built from {expected}"
+            );
+        }
+        assert!(
+            midcreek_cs_1::sitegen::REPOSITORY_URL.starts_with("https://github.com/"),
+            "the repository constant must stay on the one trusted host"
+        );
+    }
+
     #[test]
     fn progress_tasks_link_to_rendered_plan_headings() {
         let html = build_fixture_site("green").unwrap().index_html();
@@ -297,6 +343,69 @@ mod output_validation_contract {
         );
     }
 
+    /// The generator runs on macOS locally and on Linux in CI, and a page may
+    /// carry a path from either. A rule that only names one platform's home
+    /// directory proves nothing about the other, so the guard is stated over
+    /// what an absolute path *is* rather than over where the last leak came
+    /// from.
+    #[test]
+    fn rejects_an_absolute_local_path_from_any_platform_in_rendered_text() {
+        for absolute in [
+            "/home/runner/work/midcreek-cs-1/checkout",
+            "/Users/example/checkout/site",
+            "/var/folders/kt/T/midcreek-render",
+        ] {
+            let site = build_fixture_site("green").unwrap();
+            mutate_index(&site, |html| {
+                html.replace(
+                    "Render the progress hub",
+                    &format!("Rendered from {absolute}"),
+                )
+            });
+
+            let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+            assert!(
+                matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                    if message.contains("absolute local path")),
+                "{absolute} survived validation: {result:?}"
+            );
+        }
+    }
+
+    /// The same rule may not fire on the relative paths the page publishes on
+    /// purpose, on the prose that merely contains a slash, or on the served
+    /// URL prefix this project's own published prose really talks about.
+    #[test]
+    fn accepts_the_relative_paths_and_prose_slashes_the_page_really_publishes() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+
+        assert!(
+            html.contains("docs/reference/cel-shift-key-art.png"),
+            "{html}"
+        );
+        assert!(html.contains("../midcreek-concept/"), "{html}");
+        assert!(html.contains("Key art / current frame"), "{html}");
+        assert_eq!(
+            validate_site_output(site.root(), &fixture("verified-game/progress.json")),
+            Ok(())
+        );
+
+        // The canonical challenge record really says this, and it names the
+        // URL prefix the game is served below rather than anything on the
+        // machine that built the page.
+        mutate_index(&site, |html| {
+            html.replace(
+                "Working on",
+                "Served below the /midcreek-cs-1/ project prefix. Working on",
+            )
+        });
+        assert_eq!(
+            validate_site_output(site.root(), &fixture("verified-game/progress.json")),
+            Ok(())
+        );
+    }
+
     #[test]
     fn rejects_inline_script_content() {
         let site = build_fixture_site("green").unwrap();
@@ -336,6 +445,7 @@ mod output_validation_contract {
 
 mod build_safety_contract {
     use super::*;
+    use midcreek_cs_1::sitegen::{trusted_playable_roots_in, validate_output_path_in};
 
     #[test]
     fn rejects_source_directories_as_site_output() {
@@ -360,6 +470,161 @@ mod build_safety_contract {
         let _ = fs::remove_dir_all(output);
 
         assert!(matches!(result, Err(SitegenError::Reference(_))));
+    }
+
+    /// A relocated `sitegen` still has to protect the repository it was told
+    /// about, and still has to accept that repository's own build root. Both
+    /// are decided from the declared root, not from the path the binary was
+    /// compiled in.
+    #[test]
+    fn a_declared_repository_protects_its_own_tree_and_allows_its_own_build_root() {
+        let declared = relocated_repository("declared-root");
+
+        assert_eq!(
+            validate_output_path_in(declared.path(), &declared.path().join("target/site")),
+            Ok(())
+        );
+        assert_eq!(
+            validate_output_path_in(declared.path(), &declared.path().join("docs")),
+            Err(SitegenError::UnsafeOutputPath {
+                path: declared.path().join("docs"),
+            }),
+            "a declared repository's own source tree is never a publication target"
+        );
+        assert!(
+            trusted_playable_roots_in(declared.path())
+                .contains(&fs::canonicalize(declared.path().join("target")).unwrap()),
+            "a declared repository's build root is where its packaged game comes from"
+        );
+    }
+
+    /// The compile-time root keeps protecting the checkout the binary was
+    /// built in, so declaring another repository can never open the real
+    /// source tree up as an output directory.
+    #[test]
+    fn a_declared_repository_never_unlocks_the_compiled_repositorys_source_tree() {
+        let declared = relocated_repository("declared-root-containment");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+
+        assert_eq!(
+            validate_output_path_in(declared.path(), &source),
+            Err(SitegenError::UnsafeOutputPath { path: source })
+        );
+    }
+
+    /// A minimal repository copy: the approved references the generator reads,
+    /// its own build root, and a source directory that must stay protected.
+    fn relocated_repository(name: &str) -> RelocatedRepository {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/relocated-repositories")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(root.join("docs/reference")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        for relative in [
+            "docs/reference/cel-shift-key-art.png",
+            "docs/reference/cel-shift-character-sheet.png",
+            "docs/reference/manifest.json",
+        ] {
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(relative),
+                root.join(relative),
+            )
+            .unwrap();
+        }
+        RelocatedRepository(root)
+    }
+
+    struct RelocatedRepository(std::path::PathBuf);
+
+    impl RelocatedRepository {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for RelocatedRepository {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `sitegen build` reads the approved references out of the repository its
+    /// own inputs declare. A copy whose references were tampered with is
+    /// refused even though the compiled-in checkout still holds the approved
+    /// ones, which is the only way to prove the declared root is what was
+    /// really read.
+    #[test]
+    fn the_build_cli_reads_the_references_of_the_repository_its_inputs_declare() {
+        let declared = relocated_repository("declared-references");
+        let workspace = relocated_repository("declared-references-inputs");
+        let inputs = workspace.path().join("inputs.json");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sitegen/green");
+        fs::write(
+            &inputs,
+            serde_json::json!({
+                "repository": declared.path(),
+                "progress": fixtures.join("progress.json"),
+                "plan": fixtures.join("plan.md"),
+                "reference_manifest": declared.path().join("docs/reference/manifest.json"),
+                "workflow": fixtures.join("workflow.json"),
+                "repo": fixtures.join("repo.json"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = declared.path().join("target/site");
+
+        let published = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(workspace.path())
+            .args([
+                "build",
+                "--inputs",
+                inputs.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        assert_eq!(
+            published.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&published.stderr)
+        );
+        assert!(output.join("reference/cel-shift-key-art.png").is_file());
+
+        fs::write(
+            declared.path().join("docs/reference/cel-shift-key-art.png"),
+            b"not the approved reference",
+        )
+        .unwrap();
+        fs::remove_dir_all(&output).unwrap();
+        let tampered = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(workspace.path())
+            .args([
+                "build",
+                "--inputs",
+                inputs.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        let stderr = String::from_utf8_lossy(&tampered.stderr).into_owned();
+
+        assert_eq!(
+            tampered.status.code(),
+            Some(1),
+            "the declared repository's tampered reference must be refused: {stderr}"
+        );
+        assert!(stderr.contains("SHA-256"), "{stderr}");
     }
 }
 
@@ -890,7 +1155,7 @@ mod progress_contract {
                 impact: "The game might not render.".to_owned(),
                 approach: "Wait for the readiness signal.".to_owned(),
                 resolution: Some(" ".to_owned()),
-                resolved_commit: Some("3333333333333333333333333333333333333333".to_owned()),
+                resolved_commit: None,
             },
         ];
 
@@ -913,6 +1178,61 @@ mod progress_contract {
                     field: "resolved_commit".to_owned(),
                 },
             ]
+        );
+    }
+
+    /// A challenge that names a commit nobody can find is a different mistake
+    /// from a challenge that names none: the first is a wrong reference to
+    /// chase, the second is a missing field to fill in. Reporting the first as
+    /// the second sends the reader looking for an empty field that is right
+    /// there in the document.
+    #[test]
+    fn a_resolved_challenge_naming_an_unknown_commit_is_reported_as_unknown_not_missing() {
+        let mut document = fixture("green-progress.json");
+        document.challenges = vec![Challenge {
+            id: "browser-readiness".to_owned(),
+            title: "Browser readiness".to_owned(),
+            status: ChallengeStatus::Resolved,
+            impact: "The game might not render.".to_owned(),
+            approach: "Wait for the readiness signal.".to_owned(),
+            resolution: Some("Waited for the readiness signal.".to_owned()),
+            resolved_commit: Some("3333333333333333333333333333333333333333".to_owned()),
+        }];
+
+        let errors = validate_progress(&document, &plan_ids(), &repo_facts()).unwrap_err();
+
+        assert_eq!(
+            errors,
+            [ProgressError::UnknownChallengeCommit {
+                challenge_id: "browser-readiness".to_owned(),
+                commit: "3333333333333333333333333333333333333333".to_owned(),
+            }]
+        );
+        assert_eq!(
+            errors[0].to_string(),
+            "challenge browser-readiness references unknown commit \
+             3333333333333333333333333333333333333333"
+        );
+    }
+
+    /// The commit a resolved challenge really names is accepted, so the new
+    /// error names a wrong reference and nothing else.
+    #[test]
+    fn a_resolved_challenge_naming_a_known_commit_is_accepted() {
+        let mut document = fixture("green-progress.json");
+        document.challenges = vec![Challenge {
+            id: "browser-readiness".to_owned(),
+            title: "Browser readiness".to_owned(),
+            status: ChallengeStatus::Resolved,
+            impact: "The game might not render.".to_owned(),
+            approach: "Wait for the readiness signal.".to_owned(),
+            resolution: Some("Waited for the readiness signal.".to_owned()),
+            resolved_commit: Some("2222222222222222222222222222222222222222".to_owned()),
+        }];
+
+        assert_eq!(
+            validate_progress(&document, &plan_ids(), &repo_facts()),
+            Ok(())
         );
     }
 }
@@ -1121,15 +1441,22 @@ mod playable_publication_contract {
     }
 
     #[test]
-    fn the_trusted_root_itself_is_not_a_package() {
+    fn no_trusted_root_is_itself_a_publishable_package() {
         let roots = trusted_playable_roots();
 
-        let result = resolve_playable_package(&roots[0], &roots);
-
         assert!(
-            matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
-            "{result:?}"
+            !roots.is_empty(),
+            "the repository build root is always trusted, so an empty list is a bug \
+             in root discovery rather than a fact about this machine"
         );
+        for root in &roots {
+            let result = resolve_playable_package(root, &roots);
+            assert!(
+                matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
+                "{}: {result:?}",
+                root.display()
+            );
+        }
     }
 
     const PACKAGE_FILES: &[(&str, &str)] = &[
@@ -1193,9 +1520,23 @@ mod playable_publication_contract {
     }
 
     /// A package outside every trusted build root.
+    ///
+    /// The system temporary directory is only outside them on a machine where
+    /// `RUNNER_TEMP` is somewhere else, which is true of a GitHub runner and
+    /// of a developer machine but is not guaranteed by anything. A run where
+    /// that stops holding must say so, rather than let a fixture that is
+    /// silently trusted decide what "untrusted" proved.
     fn untrusted_package(name: &str, files: &[(&str, &str)]) -> Package {
         let root = std::env::temp_dir().join(unique_name(name));
         write_package(&root, files);
+        let canonical = fs::canonicalize(&root).unwrap();
+        let roots = trusted_playable_roots();
+        assert!(
+            !roots.iter().any(|trusted| canonical.starts_with(trusted)),
+            "{} must sit outside every trusted build root {roots:?}; RUNNER_TEMP is {:?}",
+            canonical.display(),
+            std::env::var_os("RUNNER_TEMP")
+        );
         Package(root)
     }
 }
@@ -1308,13 +1649,7 @@ mod web_source_contract {
             "the play page must mark its deliberate scroll reserve"
         );
 
-        let rule = css
-            .split_once(".scroll-reserve {")
-            .expect("play.css must style the scroll reserve")
-            .1
-            .split_once('}')
-            .expect("the scroll reserve rule must close")
-            .0;
+        let rule = css_rule(&css, ".scroll-reserve");
         assert!(
             rule.contains("min-height"),
             "the reserve must be a floor, not a fixed height, found {rule}"
@@ -1324,7 +1659,7 @@ mod web_source_contract {
             "the reserve must outgrow whatever viewport the runner has, found {rule}"
         );
 
-        let absolute = reserve_pixels(rule);
+        let absolute = reserve_pixels(rule).unwrap_or_else(|error| panic!("{error}"));
         let demanded = gate_constant("MINIMUM_SCROLL_RESERVE_PIXELS");
         assert!(
             absolute >= demanded,
@@ -1333,21 +1668,187 @@ mod web_source_contract {
         );
     }
 
-    /// The absolute pixel term of the reserve, on top of the full viewport.
-    fn reserve_pixels(rule: &str) -> f64 {
-        let calc = rule
-            .split_once("calc(")
-            .expect("the reserve must state a viewport plus an absolute floor")
-            .1;
-        let pixels = calc
-            .split_once("px")
-            .expect("the reserve must carry an absolute pixel term")
-            .0;
-        pixels
-            .rsplit(|c: char| !c.is_ascii_digit() && c != '.')
-            .next()
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or_else(|| panic!("could not read the reserve pixels from {rule}"))
+    /// The reserve exists for the browser gate's positive control, which
+    /// always loads this page as the whole document. The hub embeds the same
+    /// page in a 16:9 iframe, where the reserve only makes the embedded
+    /// document a full viewport taller than the frame showing it. A framed
+    /// document therefore drops the reserve, and the standalone page — the one
+    /// the gate actually measures — keeps every pixel of it.
+    #[test]
+    fn a_framed_play_page_drops_the_reserve_the_standalone_page_keeps() {
+        let css = source("site/static/play.css");
+        let embedded = css_rule(&css, r#"body[data-embedded="true"] .scroll-reserve"#);
+
+        assert_eq!(
+            reserve_pixels(embedded),
+            Ok(0.0),
+            "an embedded document must reserve no scroll room at all: {embedded}"
+        );
+        assert!(
+            reserve_pixels(css_rule(&css, ".scroll-reserve"))
+                .is_ok_and(|pixels| pixels >= gate_constant("MINIMUM_SCROLL_RESERVE_PIXELS")),
+            "the standalone reserve must survive the embedded override"
+        );
+
+        for (mode, expected) in [("framed", "true"), ("standalone", "")] {
+            let harness = r#"
+const fs = require("fs");
+const body = { dataset: {} };
+global.MutationObserver = class { observe() {} };
+global.document = {
+  body,
+  activeElement: null,
+  getElementById: () => null,
+  querySelector: () => null,
+};
+const self = {};
+global.window = {
+  self,
+  top: process.argv[2] === "framed" ? {} : self,
+  location: { origin: "https://example.invalid" },
+  addEventListener: () => {},
+};
+try {
+  eval(fs.readFileSync(process.argv[1], "utf8"));
+} catch (failure) {
+  if (!String(failure).includes("game.js")) {
+    console.error(failure);
+    process.exit(20);
+  }
+}
+const marker = body.dataset.embedded ?? "";
+if (marker !== process.argv[3]) {
+  console.error(`expected ${process.argv[3] || "no marker"}, got ${marker || "no marker"}`);
+  process.exit(21);
+}
+process.exit(0);
+"#;
+            let run = Command::new("node")
+                .args([
+                    "-e",
+                    harness,
+                    repository().join("site/static/play.js").to_str().unwrap(),
+                    mode,
+                    expected,
+                ])
+                .output()
+                .expect("Node should execute the dependency-free play bootstrap");
+
+            assert_eq!(
+                run.status.code(),
+                Some(0),
+                "{mode}: stdout {} stderr {}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+    }
+
+    /// The hub embeds the play page, so the two have to agree about what
+    /// "embedded" means. The stylesheet names an attribute and the bootstrap
+    /// sets one; if they drift apart the reserve silently comes back.
+    #[test]
+    fn the_stylesheet_and_the_bootstrap_agree_on_the_embedded_marker() {
+        let css = source("site/static/play.css");
+        let js = source("site/static/play.js");
+        let selector = css
+            .lines()
+            .find(|line| line.contains("data-embedded"))
+            .expect("play.css must scope a rule to the embedded document");
+
+        assert!(
+            selector.contains(r#"body[data-embedded="true"]"#),
+            "{selector}"
+        );
+        assert!(
+            js.contains("dataset.embedded"),
+            "the bootstrap must set the attribute the stylesheet keys on: {js}"
+        );
+        assert!(
+            js.contains("window.top"),
+            "the bootstrap must decide from the frame it is in: {js}"
+        );
+    }
+
+    /// One CSS rule body, from a selector that starts its own line.
+    fn css_rule<'css>(css: &'css str, selector: &str) -> &'css str {
+        let marker = format!("\n{selector} {{");
+        let start = css
+            .find(&marker)
+            .unwrap_or_else(|| panic!("play.css must declare a {selector} rule"))
+            + marker.len();
+        let body = &css[start..];
+        &body[..body.find('}').expect("the rule must close")]
+    }
+
+    /// The absolute pixel term of one `min-height` declaration.
+    ///
+    /// The browser gate demands its scroll reserve in pixels, so a rule stated
+    /// in any other absolute unit cannot be compared with that demand at all.
+    /// Reporting which unit was found leaves an actionable failure rather than
+    /// a number read out of the wrong term.
+    fn reserve_pixels(rule: &str) -> Result<f64, String> {
+        let declaration = rule
+            .split(';')
+            .find_map(|declaration| declaration.split_once("min-height:"))
+            .map(|(_, value)| value.trim())
+            .ok_or_else(|| format!("no min-height declaration in {rule}"))?;
+        let terms = match declaration.split_once("calc(") {
+            Some((_, rest)) => {
+                rest.split_once(')')
+                    .ok_or_else(|| format!("unterminated calc() in {declaration}"))?
+                    .0
+            }
+            None => declaration,
+        };
+
+        let mut pixels = 0.0;
+        for term in terms
+            .split('+')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+        {
+            let digits = term.trim_end_matches(|value: char| value.is_ascii_alphabetic());
+            let unit = &term[digits.len()..];
+            let value = digits
+                .parse::<f64>()
+                .map_err(|_| format!("{term:?} is not a length"))?;
+            match unit {
+                "px" => pixels += value,
+                // The viewport term is deliberate: the reserve is stated on top
+                // of whatever window the runner has.
+                "vh" => {}
+                "" if value == 0.0 => {}
+                other => {
+                    return Err(format!(
+                        "the reserve is stated in {other}, which cannot be compared with \
+                         the browser gate's pixel demand: {term:?}"
+                    ));
+                }
+            }
+        }
+        Ok(pixels)
+    }
+
+    /// The parser decides whether the reserve satisfies the gate, so a unit it
+    /// cannot convert has to be reported rather than silently read as the
+    /// number in front of it.
+    #[test]
+    fn the_reserve_parser_reports_a_unit_it_cannot_compare() {
+        assert_eq!(
+            reserve_pixels("min-height: calc(100vh + 720px);"),
+            Ok(720.0)
+        );
+        assert_eq!(reserve_pixels("min-height: 0;"), Ok(0.0));
+
+        let rem = reserve_pixels("min-height: calc(100vh + 45rem);\n  border: 3px solid;")
+            .expect_err("a rem reserve cannot be compared with a pixel demand");
+        assert!(rem.contains("rem"), "{rem}");
+        assert!(
+            !rem.contains("3px"),
+            "the border must never be read as the reserve: {rem}"
+        );
+        assert!(reserve_pixels("padding: 1.25rem;").is_err());
     }
 
     /// A numeric constant declared at the top of the browser gate.
@@ -1687,15 +2188,15 @@ mod web_source_contract {
 
 mod verification_publication_contract {
     use super::support::{
-        browser_root, green_evidence, prior_gallery, raw_report, verification_root,
+        browser_root, green_evidence, prior_gallery, raw_browser, raw_report, verification_root,
     };
     use super::*;
     use midcreek_cs_1::{
         design::{CHARACTER_SHEET_SHA256, KEY_ART_SHA256},
         sitegen::{
             BROWSER_FRAME_FILE, CURRENT_SCREENSHOTS, GALLERY_FILE, GALLERY_FRAMES, GalleryManifest,
-            GateStatus, GateSummary, HISTORY_SCREENSHOTS, VERIFICATION_FILE, VerificationEvidence,
-            VerificationSummary, WORKER_CROP_FILE, update_gallery,
+            GateStatus, GateSummary, HISTORY_SCREENSHOTS, SCREENSHOTS_ROOT, VERIFICATION_FILE,
+            VerificationEvidence, VerificationSummary, WORKER_CROP_FILE, update_gallery,
         },
         verification::{ARTIFACT_NAMES, FrameName, VerificationReport},
     };
@@ -1709,11 +2210,63 @@ mod verification_publication_contract {
     fn the_public_projection_carries_only_declared_evidence() {
         let summary = green_evidence().summary;
         let json = serde_json::to_string(&summary).unwrap();
+        let value = serde_json::to_value(&summary).unwrap();
 
-        // Round-tripping through the strict public shape proves the projection
-        // emits nothing the published schema does not declare.
-        let parsed = serde_json::from_str::<VerificationSummary>(&json).unwrap();
-        assert_eq!(parsed, summary);
+        // The published schema is the whole contract: a projection that grew a
+        // field would publish it, whatever the strict shape claims, so the
+        // exact key set is asserted against a hand-written list rather than
+        // round-tripped through the same shape that produced it.
+        assert_eq!(
+            keys(&value),
+            [
+                "browser",
+                "camera",
+                "failed_stage",
+                "frames",
+                "gates",
+                "hashes",
+                "metric_failures",
+                "metrics",
+                "schema_version",
+                "semantic_visual_hash",
+                "stages",
+                "succeeded",
+            ]
+        );
+        assert_eq!(
+            keys(&value["frames"][0]),
+            [
+                "artifact",
+                "camera_settled",
+                "camera_yaw_degrees",
+                "equipment_on_screen",
+                "heading",
+                "height",
+                "hud_status",
+                "name",
+                "open_tickets",
+                "rack_states",
+                "stage",
+                "width",
+                "worker_crop",
+            ]
+        );
+        assert_eq!(
+            keys(&value["browser"]),
+            [
+                "canvas_height",
+                "canvas_width",
+                "palette_classes",
+                "ready_seconds",
+                "sampled_pixels",
+                "screenshot",
+                "unmatched_share",
+            ]
+        );
+        assert_eq!(
+            keys(&value["hashes"]),
+            ["asset_sources", "assets", "references", "sources"]
+        );
         for forbidden in [
             "command_line",
             "stdout",
@@ -1728,6 +2281,18 @@ mod verification_publication_contract {
         ] {
             assert!(!json.contains(forbidden), "{forbidden} leaked into {json}");
         }
+    }
+
+    /// Every key of one published object, in sorted order.
+    fn keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .unwrap_or_else(|| panic!("expected a published object, got {value}"))
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     #[test]
@@ -1757,14 +2322,140 @@ mod verification_publication_contract {
         assert_eq!(summary.metrics.get("browser.palette-classes"), Some(&9.0));
     }
 
+    /// The published hash has to describe the report the game wrote, not the
+    /// run that published it: the same report projected from a different
+    /// directory, and with or without the browser gate beside it, is the same
+    /// visual point, while any change to what the game actually recorded is a
+    /// different one. That is what the screenshot history deduplicates on, so
+    /// a hash that tracked anything else would either duplicate a point or
+    /// swallow a real change.
     #[test]
-    fn the_semantic_hash_is_the_games_own_canonical_report_hash() {
-        let report = raw_report("report.json");
-        let expected = midcreek_cs_1::verification::semantic_hash(
-            &midcreek_cs_1::verification::canonical_json(&report),
+    fn the_semantic_hash_describes_the_report_and_nothing_around_it() {
+        let published = green_evidence().summary.semantic_visual_hash;
+        assert_eq!(published.len(), 64, "{published}");
+        assert!(
+            published
+                .chars()
+                .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()),
+            "{published}"
         );
 
-        assert_eq!(green_evidence().summary.semantic_visual_hash, expected);
+        let relocated = scratch("semantic-hash-relocated");
+        copy_verification_fixture(relocated.path());
+        assert_eq!(
+            hash_of(&raw_report("report.json"), relocated.path()),
+            published,
+            "the same report published from another directory is the same point"
+        );
+        assert_eq!(
+            hash_of(&raw_report("report.json"), &verification_root()),
+            published,
+            "the browser gate beside it is not part of the game's own report"
+        );
+
+        // A field the projection publishes, and a field it deliberately drops,
+        // both belong to the report and both have to move the hash.
+        let mut published_field = raw_report("report.json");
+        published_field.gameplay.tickets_emitted += 1;
+        assert_ne!(hash_of(&published_field, &verification_root()), published);
+
+        let mut dropped_field = raw_report("report.json");
+        dropped_field.failure_reason = Some("the capture timed out while writing".to_owned());
+        assert_ne!(hash_of(&dropped_field, &verification_root()), published);
+        assert!(
+            !serde_json::to_string(
+                &VerificationEvidence::project(&dropped_field, &verification_root(), None)
+                    .unwrap()
+                    .summary
+            )
+            .unwrap()
+            .contains("timed out"),
+            "the dropped field still never reaches the page"
+        );
+    }
+
+    fn hash_of(report: &VerificationReport, artifacts: &Path) -> String {
+        VerificationEvidence::project(report, artifacts, None)
+            .expect("the fixture evidence projects")
+            .summary
+            .semantic_visual_hash
+    }
+
+    /// A browser gate row that is green because a report exists says nothing
+    /// about what the browser did. Readiness is published from the measured
+    /// seconds against the bound the gate itself enforces.
+    #[test]
+    fn a_browser_slower_than_the_published_readiness_bound_fails_its_own_gate() {
+        let mut gate = raw_browser();
+        gate.ready_seconds = 45.0;
+
+        let summary = project_with_browser(&gate).summary;
+
+        let readiness = named_gate(&summary, "Browser readiness");
+        assert_eq!(readiness.status, GateStatus::Failed);
+        assert_eq!((readiness.passed, readiness.failed), (0, 1));
+        assert!(
+            summary
+                .metric_failures
+                .iter()
+                .any(|failure| failure.metric == "browser.ready-seconds"),
+            "{:?}",
+            summary.metric_failures
+        );
+        assert!(!summary.succeeded);
+    }
+
+    /// The same row stays green, and keeps reporting the duration it really
+    /// measured, for a browser that was ready in time.
+    #[test]
+    fn a_browser_ready_within_the_bound_still_publishes_a_passed_readiness_gate() {
+        let summary = green_evidence().summary;
+
+        let readiness = named_gate(&summary, "Browser readiness");
+        assert_eq!(readiness.status, GateStatus::Passed);
+        assert_eq!((readiness.passed, readiness.failed), (1, 0));
+        assert_eq!(readiness.duration_ms, 4_820);
+    }
+
+    /// A palette row that failed used to publish "0 failed", so the published
+    /// matrix said a red gate found nothing wrong with it.
+    #[test]
+    fn a_canvas_missing_approved_palette_classes_publishes_the_failure_it_found() {
+        let mut gate = raw_browser();
+        gate.pixels.palette_classes = vec!["floor".to_owned(), "rack".to_owned()];
+
+        let summary = project_with_browser(&gate).summary;
+
+        let palette = named_gate(&summary, "Browser canvas palette");
+        assert_eq!(palette.status, GateStatus::Failed);
+        assert_eq!(palette.passed, 2);
+        assert_eq!(
+            palette.failed, 1,
+            "a failed gate has to report at least one failure"
+        );
+        assert!(!summary.succeeded);
+    }
+
+    fn project_with_browser(
+        gate: &midcreek_cs_1::sitegen::BrowserGateReport,
+    ) -> VerificationEvidence {
+        VerificationEvidence::project(
+            &raw_report("report.json"),
+            &verification_root(),
+            Some((gate, browser_root().as_path())),
+        )
+        .expect("the fixture evidence projects")
+    }
+
+    fn named_gate<'summary>(
+        summary: &'summary VerificationSummary,
+        name: &str,
+    ) -> &'summary GateSummary {
+        summary
+            .gates
+            .iter()
+            .find(|gate| gate.name == name)
+            .unwrap_or_else(|| panic!("expected a {name:?} gate in {:?}", summary.gates))
     }
 
     #[test]
@@ -2409,6 +3100,82 @@ mod verification_publication_contract {
         assert_text(&html, "#tests", "assets/generated/rack.glb");
         assert_text(&html, "#tests", &summary.semantic_visual_hash);
         assert!(html.contains(summary.hashes.sources["src/verification.rs"].as_str()));
+    }
+
+    /// A history point can move a dozen metrics at once, so the list has to
+    /// lead with the movement a reader is looking for rather than with
+    /// whichever metric name sorts first.
+    #[test]
+    fn the_history_lists_the_largest_metric_movement_first() {
+        let mut inputs = site_inputs("green");
+        let mut gallery = prior_gallery();
+        gallery.entries[0].metric_deltas = [
+            ("aaa.tiny", 0.25),
+            ("mmm.middling", -5.0),
+            ("zzz.largest", 42.0),
+            ("bbb.unmoved", 0.0),
+        ]
+        .into_iter()
+        .map(|(name, delta)| (name.to_owned(), delta))
+        .collect();
+        inputs.gallery = Some(gallery);
+
+        let html = build_site_from_inputs("delta-order", &inputs)
+            .unwrap()
+            .index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#screenshots .delta-list code").unwrap();
+        let order = document
+            .select(&selector)
+            .map(|code| code.text().collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            ["zzz.largest", "mmm.middling", "aaa.tiny"],
+            "the list must be ordered by how far each metric moved"
+        );
+    }
+
+    /// Every pixel a build promotes is evidence somebody has to be able to
+    /// look at. A frame copied into the published tree but linked from
+    /// nowhere is weight the site serves and nobody can see.
+    #[test]
+    fn every_promoted_pixel_is_linked_from_the_published_page() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("img[src], a[href], iframe[src]").unwrap();
+        let linked = document
+            .select(&selector)
+            .filter_map(|element| {
+                element
+                    .value()
+                    .attr("src")
+                    .or_else(|| element.value().attr("href"))
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        let mut promoted = Vec::new();
+        collect_relative(
+            &site.root().join(SCREENSHOTS_ROOT),
+            site.root(),
+            &mut promoted,
+        );
+        promoted.sort();
+
+        assert!(
+            promoted.len() > GALLERY_FRAMES.len(),
+            "this fixture promotes every captured frame: {promoted:?}"
+        );
+        for file in &promoted {
+            let target = file.to_string_lossy().into_owned();
+            assert!(
+                linked.contains(&target),
+                "{target} was promoted but the page links nothing to it"
+            );
+        }
     }
 
     #[test]

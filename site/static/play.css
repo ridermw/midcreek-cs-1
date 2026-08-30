@@ -128,6 +128,14 @@ body {
   max-width: 44rem;
 }
 
+body[data-embedded="true"] .scroll-reserve {
+  /* Inside the hub's iframe there is no positive control to serve, and the
+     reserve would only make the embedded document a whole viewport taller
+     than the frame that shows it. The standalone page the browser gate really
+     measures keeps every pixel of the reserve above. */
+  min-height: 0;
+}
+
 kbd {
   padding: 0.1rem 0.4rem;
   border: 2px solid var(--ink);

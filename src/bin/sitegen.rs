@@ -18,9 +18,10 @@ mod native {
             BrowserGateReport, CommitSummary, GalleryManifest, GateStatus, GateSummary, JobOutcome,
             JobReport, JobResult, PlayableBuild, ProgressDocument, ProgressStatus, RESULT_FILE,
             ReferenceManifest, RepoFacts, SiteInputs, VerificationEvidence, WorkflowSummary,
-            assemble_site, build_site, gate_verdict, merge_job_results, missing_playable_parts,
-            plan_task_ids_from_markdown, read_gate_records, validate_job_result, validate_progress,
-            validate_reference_manifest, validate_workflow_summary,
+            assemble_site, build_site_in, default_repository, gate_verdict, merge_job_results,
+            missing_playable_parts, plan_task_ids_from_markdown, read_gate_records,
+            validate_job_result, validate_progress, validate_reference_manifest,
+            validate_workflow_summary,
         },
         verification::VerificationReport,
     };
@@ -269,6 +270,14 @@ mod native {
     #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct SiteInputPaths {
+        /// The checkout the site is published from.
+        ///
+        /// The generator reads the approved references out of it, trusts its
+        /// build root, and refuses to publish into its source tree. Publish
+        /// declares it so a relocated `sitegen` still knows which repository
+        /// it is generating for; an inputs document that leaves it out falls
+        /// back to the checkout the binary was built in.
+        repository: Option<PathBuf>,
         progress: PathBuf,
         plan: PathBuf,
         reference_manifest: PathBuf,
@@ -310,6 +319,9 @@ mod native {
             Err(message) => return content_error(message),
         };
         let root = inputs_path.parent().unwrap_or_else(|| Path::new("."));
+        let repository = paths
+            .repository
+            .map_or_else(default_repository, |declared| root.join(declared));
         let progress_path = root.join(paths.progress);
         let plan_path = root.join(paths.plan);
         let reference_path = root.join(paths.reference_manifest);
@@ -365,7 +377,7 @@ mod native {
             playable,
         };
 
-        match build_site(&inputs, output) {
+        match build_site_in(&repository, &inputs, output) {
             Ok(manifest) => {
                 println!("{}", manifest.source_commit);
                 ExitCode::SUCCESS
@@ -558,7 +570,14 @@ mod native {
             return content_error(message);
         }
 
-        let repo = match read_repo_facts(repository) {
+        // The site resolves exactly the commits the progress document it
+        // publishes names, so that document decides which commits have to be
+        // looked up at all.
+        let published_progress =
+            read_json::<ProgressDocument>(&repository.join("docs/progress.json"))
+                .map(|progress| referenced_commits(&progress))
+                .unwrap_or_default();
+        let repo = match read_repo_facts(repository, &published_progress) {
             Ok(repo) => repo,
             Err(message) => return content_error(message),
         };
@@ -572,6 +591,7 @@ mod native {
         }
 
         let paths = SiteInputPaths {
+            repository: Some(repository.to_path_buf()),
             progress: repository.join("docs/progress.json"),
             plan: repository.join("docs/implementation-plan.md"),
             reference_manifest: repository.join("docs/reference/manifest.json"),
@@ -625,7 +645,10 @@ mod native {
     ///
     /// A native report that no longer projects is published as a failed gate
     /// rather than as a crash, because Publish has to publish the current
-    /// status even when the evidence behind it is unusable.
+    /// status even when the evidence behind it is unusable. The two halves are
+    /// judged separately: an unreadable browser canvas is the browser gate's
+    /// failure alone, and losing fourteen verified native frames over it would
+    /// throw away evidence that is still exactly as good as it was.
     fn native_evidence(
         native_root: Option<&Path>,
         native: &JobReport,
@@ -648,14 +671,25 @@ mod native {
             browser,
         };
 
-        match project_verification(Path::new("."), &input) {
-            Ok(_) => Some(input),
-            Err(message) => {
-                eprintln!("the declared verification evidence does not project: {message}");
-                extra.push(failed_gate("Published verification evidence"));
-                None
+        let message = match project_verification(Path::new("."), &input) {
+            Ok(_) => return Some(input),
+            Err(message) => message,
+        };
+        if input.browser.is_some() {
+            let native_only = VerificationInput {
+                report: input.report.clone(),
+                artifacts: input.artifacts.clone(),
+                browser: None,
+            };
+            if project_verification(Path::new("."), &native_only).is_ok() {
+                eprintln!("the declared browser evidence does not project: {message}");
+                extra.push(failed_gate("Published browser evidence"));
+                return Some(native_only);
             }
         }
+        eprintln!("the declared verification evidence does not project: {message}");
+        extra.push(failed_gate("Published verification evidence"));
+        None
     }
 
     /// The packaged game Publish promotes, when the web job really proved one.
@@ -733,7 +767,7 @@ mod native {
                 return content_error(format!("{}: {error}", plan_path.display()));
             }
         };
-        let repo = match read_repo_facts(repository) {
+        let repo = match read_repo_facts(repository, &referenced_commits(&progress)) {
             Ok(repo) => repo,
             Err(message) => return content_error(message),
         };
@@ -777,17 +811,75 @@ mod native {
         serde_json::from_str(&json).map_err(|error| format!("{}: {error}", path.display()))
     }
 
-    fn read_repo_facts(repository: &Path) -> Result<RepoFacts, String> {
+    /// The repository facts the site publishes, bounded by what they have to
+    /// resolve.
+    ///
+    /// `known_commits` exists so the published documents' commit references
+    /// resolve, and so the timeline renders. Enumerating the whole repository
+    /// grew both the published facts and the work of collecting them with
+    /// every commit anybody ever pushed, for commits nothing on the site will
+    /// ever name. What is collected is therefore the head, the published
+    /// timeline, and exactly the commits `referenced` names — each confirmed
+    /// against the checkout one at a time, so an invented reference still
+    /// fails validation.
+    fn read_repo_facts(
+        repository: &Path,
+        referenced: &BTreeSet<String>,
+    ) -> Result<RepoFacts, String> {
         let head_sha = git_output(repository, &["rev-parse", "HEAD"])?;
-        let known_commits = git_output(repository, &["rev-list", "--all"])?
-            .lines()
-            .map(str::to_owned)
-            .collect();
+        let commits = read_commit_summaries(repository)?;
+        let mut known_commits = commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect::<BTreeSet<_>>();
+        known_commits.insert(head_sha.clone());
+        for commit in referenced {
+            if commit_exists(repository, commit) {
+                known_commits.insert(commit.clone());
+            }
+        }
         Ok(RepoFacts {
             head_sha,
             known_commits,
-            commits: read_commit_summaries(repository)?,
+            commits,
         })
+    }
+
+    /// Every commit one progress document names, as a full SHA.
+    ///
+    /// Symbolic references like `HEAD` are resolved by the generator itself
+    /// and are not looked up here; anything that is not a full hexadecimal SHA
+    /// never reaches Git.
+    fn referenced_commits(progress: &ProgressDocument) -> BTreeSet<String> {
+        progress
+            .tasks
+            .iter()
+            .filter_map(|task| task.completed_commit.as_deref())
+            .chain(
+                progress
+                    .challenges
+                    .iter()
+                    .filter_map(|challenge| challenge.resolved_commit.as_deref()),
+            )
+            .filter(|commit| {
+                commit.len() == 40 && commit.chars().all(|value| value.is_ascii_hexdigit())
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether the checkout really holds one full commit SHA.
+    fn commit_exists(repository: &Path, commit: &str) -> bool {
+        git_output(
+            repository,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{commit}^{{commit}}"),
+            ],
+        )
+        .is_ok_and(|resolved| resolved == commit)
     }
 
     /// The most recent commits, newest first, with nothing but what the

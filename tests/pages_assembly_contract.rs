@@ -771,6 +771,98 @@ fn assemble_cli_reports_status_only_retention_without_failure_label() {
     assert!(command.stderr.is_empty());
 }
 
+/// A symbolic link at the top of the current tree has never been copied. A
+/// link buried three directories down reaches the same `copy_artifact` only
+/// through the recursion, so the containment rule has to be proved where it is
+/// actually easy to lose: nested, below a directory that is itself perfectly
+/// ordinary.
+#[test]
+fn a_nested_symlink_inside_the_current_tree_is_refused_rather_than_followed() {
+    let outside = fixture_site("nested-symlink-target", &[("secret.txt", "not ours")]);
+    let current = fixture_site(
+        "current-nested-symlink",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("evidence/deep/real.txt", "published"),
+        ],
+    );
+    let link = current.path().join("evidence/deep/secret.txt");
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "not ours",
+        "the link really resolves, so only the containment rule can refuse it"
+    );
+    let output = TempDirectory::new("nested-symlink-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::UnsafeOutputPath { path }) if path == &link),
+        "{result:?}"
+    );
+    assert!(
+        !output.path().join("evidence/deep/secret.txt").exists(),
+        "a refused link must never reach the published tree"
+    );
+}
+
+/// A history entry may only name images inside its own commit's directory.
+/// A path that merely starts with the history prefix can point at another
+/// entry's pixels, and every check that follows — the link checker and the
+/// retained-history rule — would be satisfied by a file that belongs to a
+/// different point in time.
+#[test]
+fn a_history_frame_that_points_into_another_entrys_directory_is_refused() {
+    let previous = fixture_site(
+        "previous-scoped-history",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("gallery.json", PRIOR_GALLERY),
+            (OLD_HISTORY, "old history"),
+        ],
+    );
+    // The second entry belongs to commit 1111..., but its frame names the
+    // image the 2222... entry published. The file is really there.
+    let crossed = PRIOR_GALLERY.replace(
+        r#"{"entries":["#,
+        &format!(
+            r#"{{"entries":[{{"semantic_visual_hash":"bbbbbbbb","source_commit":"1111111111111111111111111111111111111111","committed_at":"2026-08-30T00:00:00Z","current_task":"pages-status-always","frames":{{"center":"{OLD_HISTORY}"}},"metrics":{{}},"metric_deltas":{{}}}},"#
+        ),
+    );
+    let current = fixture_site(
+        "current-crossed-history",
+        &[
+            ("index.html", &index_linking(&[OLD_HISTORY])),
+            ("gallery.json", &crossed),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "current frame"),
+        ],
+    );
+    let output = TempDirectory::new("crossed-history-output");
+
+    let error = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .expect_err("an entry may not publish another entry's pixels as its own");
+
+    match &error {
+        SitegenError::HistoryFrameOutsideEntry { frames } => {
+            assert_eq!(frames, &vec![OLD_HISTORY.to_owned()]);
+        }
+        other => panic!("expected a misscoped-history failure, got {other}"),
+    }
+    assert!(error.to_string().contains(OLD_HISTORY), "{error}");
+}
+
 #[test]
 fn assembly_never_deletes_a_nonempty_caller_directory() {
     let current = fixture_site("status-only", &[("index.html", "CURRENT SOURCE: GREEN")]);
@@ -1303,6 +1395,26 @@ mod workflow_contract {
     fn no_job_level_env_names_the_runner_context() {
         let workflow = workflow_source();
 
+        // The checked-in workflow declares no job-level `env:` at all, so a
+        // loop over what the detector finds in it would pass by finding
+        // nothing. The detector is therefore proved able to fail first, on the
+        // exact shape this rule exists to refuse.
+        let offending = concat!(
+            "jobs:\n",
+            "  verify:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    env:\n",
+            "      RESULT: ${{ runner.temp }}/native\n",
+            "    steps:\n",
+            "      - run: echo \"$RESULT\"\n",
+        );
+        assert_eq!(
+            job_level_env_blocks(offending),
+            vec!["      RESULT: ${{ runner.temp }}/native"],
+            "the detector has to find a job-level env: before its verdict on \
+             this workflow means anything"
+        );
+
         for block in job_level_env_blocks(&workflow) {
             assert!(
                 !block.contains("runner."),
@@ -1337,10 +1449,16 @@ mod workflow_contract {
 
     /// The rule above is GitHub's, not this repository's, so it is proved with
     /// GitHub's own rules rather than with a string match: the pinned linter
-    /// has to accept the workflow as it stands and reject the shape it used to
-    /// have.
+    /// has to accept the workflow as it stands and reject the whole workflow
+    /// in exactly the shape it really had.
+    ///
+    /// The invalid file is rebuilt from the current one rather than read out
+    /// of Git history, because a shallow checkout — what CI does by default —
+    /// has no history to read and a gate that quietly stops running is worse
+    /// than one that never existed.
     #[test]
     fn the_pinned_linter_accepts_this_workflow_and_rejects_the_shape_it_replaced() {
+        let workflow = workflow_source();
         let clean = run_actionlint(&[repository()
             .join(".github/workflows/pages.yml")
             .to_string_lossy()
@@ -1352,25 +1470,15 @@ mod workflow_contract {
             String::from_utf8_lossy(&clean.stderr)
         );
 
+        let regressed = with_historical_job_level_env(&workflow);
+        assert_eq!(
+            job_level_env_blocks(&regressed).len(),
+            2,
+            "both jobs carried the defect, so both have to be rebuilt: {regressed}"
+        );
         let directory = TempDirectory::new("actionlint-regression");
         let regression = directory.path().join("regression.yml");
-        fs::write(
-            &regression,
-            concat!(
-                "name: Regression\n",
-                "on:\n",
-                "  push:\n",
-                "    branches: [main]\n",
-                "jobs:\n",
-                "  verify:\n",
-                "    runs-on: ubuntu-latest\n",
-                "    env:\n",
-                "      RESULT: ${{ runner.temp }}/native\n",
-                "    steps:\n",
-                "      - run: echo \"$RESULT\"\n",
-            ),
-        )
-        .expect("the regression workflow should be writable");
+        fs::write(&regression, &regressed).expect("the regression workflow should be writable");
 
         let dirty = run_actionlint(&[regression.to_string_lossy().into_owned()]);
         let report = format!(
@@ -1382,10 +1490,38 @@ mod workflow_contract {
             !dirty.status.success(),
             "a job-level runner context must fail the gate: {report}"
         );
-        assert!(
-            report.contains(r#"context "runner" is not allowed here"#),
-            "{report}"
+        assert_eq!(
+            report
+                .matches(r#"context "runner" is not allowed here"#)
+                .count(),
+            4,
+            "every job-level runner expression the workflow really carried has \
+             to be named: {report}"
         );
+    }
+
+    /// The Pages workflow as it stands, with the job-level `env:` each gated
+    /// job really carried before the fix put back exactly where it was: after
+    /// the job's permissions and before its steps.
+    fn with_historical_job_level_env(workflow: &str) -> String {
+        let mut regressed = workflow.to_owned();
+        for (job, root) in [("build-web", "web"), ("verify", "native")] {
+            let job_start = regressed
+                .find(&format!("\n  {job}:\n"))
+                .unwrap_or_else(|| panic!("the workflow should declare the {job} job"));
+            let steps = regressed[job_start..]
+                .find("\n    steps:\n")
+                .map(|offset| job_start + offset + 1)
+                .unwrap_or_else(|| panic!("the {job} job should declare steps"));
+            regressed.insert_str(
+                steps,
+                &format!(
+                    "    env:\n      RESULT: ${{{{ runner.temp }}}}/{root}\n      \
+                     GATES: ${{{{ runner.temp }}}}/{root}/gates.jsonl\n"
+                ),
+            );
+        }
+        regressed
     }
 
     /// A linter that changes its rules under the gate is a gate that changes
@@ -2843,6 +2979,54 @@ mod publication_inputs {
         assert!(inputs["playable"].is_null(), "{inputs}");
     }
 
+    /// Both jobs passed, but the browser gate's own canvas is unreadable. The
+    /// native run proved everything it proved regardless, so publishing
+    /// nothing at all would throw away fourteen verified frames because of one
+    /// corrupt PNG from the other job.
+    #[test]
+    fn unprojectable_browser_evidence_never_costs_the_native_evidence_beside_it() {
+        let run = Run::new("inputs-browser-unprojectable");
+        run.native(
+            GateStatus::Passed,
+            &[("Clippy lints", GateStatus::Passed)],
+            true,
+        );
+        run.web(
+            GateStatus::Passed,
+            &[("Headless browser gate", GateStatus::Passed)],
+            true,
+        );
+        fs::write(
+            run.web_root().join("browser/canvas.png"),
+            b"\x89PNG\r\n\x1a\nnot actually an image",
+        )
+        .unwrap();
+
+        let (workflow, inputs) = run.execute("success", "success");
+
+        assert!(
+            inputs["verification"]["report"].is_string(),
+            "the native evidence still projects on its own: {inputs}"
+        );
+        assert!(
+            inputs["verification"]["browser"].is_null(),
+            "the unusable browser evidence is dropped, not published: {inputs}"
+        );
+        assert_eq!(
+            gate(&workflow, "Published browser evidence").status,
+            GateStatus::Failed,
+            "the gap is published rather than hidden"
+        );
+        assert!(
+            !workflow
+                .gates
+                .iter()
+                .any(|gate| gate.name == "Published verification evidence"),
+            "the native evidence did not fail: {:?}",
+            gate_names(&workflow)
+        );
+    }
+
     /// A job that passed every gate it measured and then failed anyway is
     /// published as a failure, and the extra row says where it failed.
     #[test]
@@ -3002,6 +3186,90 @@ mod publication_inputs {
             assert!(commit["subject"].is_string());
             assert!(commit["task_id"].is_null());
         }
+    }
+
+    /// `known_commits` exists to resolve the commits the published documents
+    /// name. Enumerating the whole repository grows the published facts, and
+    /// the work of collecting them, with every commit anybody ever pushes, so
+    /// it is bounded by what is really published: the timeline, the head, and
+    /// the commits the progress document actually references.
+    #[test]
+    fn the_published_repository_facts_are_bounded_by_what_they_have_to_resolve() {
+        let run = Run::new("inputs-bounded-facts");
+        run.native(
+            GateStatus::Passed,
+            &[("Clippy lints", GateStatus::Passed)],
+            true,
+        );
+        run.execute("success", "skipped");
+
+        let repo = read_value(&run.output().join("repo.json"));
+        let known = repo["known_commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let timeline = repo["commits"].as_array().unwrap().len();
+        let referenced = referenced_commits();
+        let history = git(&["rev-list", "--all"]);
+        let history = history.lines().collect::<Vec<_>>();
+
+        assert!(
+            known.len() <= timeline + referenced.len() + 1,
+            "the published facts enumerate {} commits for a timeline of {timeline} and \
+             {} referenced commits",
+            known.len(),
+            referenced.len()
+        );
+        assert!(
+            known.contains(repo["head_sha"].as_str().unwrap()),
+            "the head always resolves: {known:?}"
+        );
+        for commit in &referenced {
+            assert!(
+                known.contains(commit),
+                "the progress document references {commit}, which must still resolve"
+            );
+        }
+
+        // Whatever else this repository's history holds is not published.
+        let recent = git(&["log", "--max-count", "20", "--format=%H"]);
+        if let Some(old) = history.iter().find(|sha| {
+            !recent.lines().any(|recent| recent == **sha) && !referenced.contains(**sha)
+        }) {
+            assert!(
+                !known.contains(*old),
+                "{old} is neither on the timeline nor referenced, so it must not be published"
+            );
+        }
+    }
+
+    /// Every commit `docs/progress.json` names, as a full SHA.
+    fn referenced_commits() -> std::collections::BTreeSet<String> {
+        let document =
+            read_value(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/progress.json"));
+        let tasks = document["tasks"].as_array().unwrap().iter();
+        let challenges = document["challenges"].as_array().unwrap().iter();
+        tasks
+            .filter_map(|task| task["completed_commit"].as_str())
+            .chain(challenges.filter_map(|challenge| challenge["resolved_commit"].as_str()))
+            .filter(|commit| {
+                commit.len() == 40 && commit.chars().all(|value| value.is_ascii_hexdigit())
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn git(args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(args)
+            .output()
+            .expect("git should run in the checkout");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).expect("git output should be UTF-8")
     }
 
     // -------------------------------------------------------------------

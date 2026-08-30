@@ -6,7 +6,7 @@ use std::{
 
 use image::ImageReader;
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
-use scraper::{Html, Selector};
+use scraper::{Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -57,6 +57,13 @@ pub const GALLERY_FRAMES: [(&str, &str); 4] = [
 
 /// The stable label of the crop published beside the character sheet.
 pub const WORKER_FRAME_LABEL: &str = "worker";
+
+/// The one repository every published commit link points into.
+///
+/// Task cards and challenge cards both link commits, from different renderers.
+/// A second copy of this URL is a second thing to rename, so there is exactly
+/// one and both read it.
+pub const REPOSITORY_URL: &str = "https://github.com/ridermw/midcreek-cs-1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -909,6 +916,11 @@ pub enum ProgressError {
         challenge_id: String,
         field: String,
     },
+    /// A resolved challenge names a commit this repository does not have.
+    UnknownChallengeCommit {
+        challenge_id: String,
+        commit: String,
+    },
     MissingChallengeResolution {
         challenge_id: String,
     },
@@ -952,6 +964,13 @@ impl fmt::Display for ProgressError {
                 challenge_id,
                 field,
             } => write!(formatter, "challenge {challenge_id} is missing {field}"),
+            Self::UnknownChallengeCommit {
+                challenge_id,
+                commit,
+            } => write!(
+                formatter,
+                "challenge {challenge_id} references unknown commit {commit}"
+            ),
             Self::MissingChallengeResolution { challenge_id } => {
                 write!(
                     formatter,
@@ -1112,6 +1131,11 @@ pub enum SitegenError {
     MissingRetainedHistory {
         targets: Vec<String>,
     },
+    /// The published history names an image outside the directory of the entry
+    /// that declared it.
+    HistoryFrameOutsideEntry {
+        frames: Vec<String>,
+    },
     /// The current tree carries promoted frames without the gallery manifest
     /// that always accompanies a real promotion.
     PartialEvidencePublication {
@@ -1230,6 +1254,12 @@ impl fmt::Display for SitegenError {
                 targets.len(),
                 targets.join(", ")
             ),
+            Self::HistoryFrameOutsideEntry { frames } => write!(
+                formatter,
+                "the published history names {} image(s) outside the entry that declared them: {}",
+                frames.len(),
+                frames.join(", ")
+            ),
             Self::PartialEvidencePublication { path } => write!(
                 formatter,
                 "{} is published without the gallery manifest that must accompany a promotion",
@@ -1347,12 +1377,21 @@ pub fn validate_progress(
             if challenge
                 .resolved_commit
                 .as_deref()
-                .and_then(|commit| resolve_commit_ref(commit, repo))
-                .is_none()
+                .is_none_or(|commit| commit.trim().is_empty())
             {
                 errors.push(ProgressError::MissingChallengeContext {
                     challenge_id: challenge.id.clone(),
                     field: "resolved_commit".to_owned(),
+                });
+            } else if let Some(commit) = challenge.resolved_commit.as_deref()
+                && resolve_commit_ref(commit, repo).is_none()
+            {
+                // A commit nobody can find is a wrong reference to chase, not
+                // an empty field to fill in, and saying "missing" sends the
+                // reader looking for a value that is right there.
+                errors.push(ProgressError::UnknownChallengeCommit {
+                    challenge_id: challenge.id.clone(),
+                    commit: commit.to_owned(),
                 });
             }
         }
@@ -1824,7 +1863,7 @@ fn collect_metrics(
 }
 
 /// The published bound each published metric has to meet.
-const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
+const METRIC_BOUNDS: [(&str, MetricBound, &str); 8] = [
     (
         "render.frames-captured",
         MetricBound::Exactly(14.0),
@@ -1847,8 +1886,13 @@ const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
     ),
     (
         "browser.palette-classes",
-        MetricBound::AtLeast(3.0),
+        MetricBound::AtLeast(MINIMUM_PALETTE_CLASSES as f64),
         "at least three approved palette classes in the canvas",
+    ),
+    (
+        "browser.ready-seconds",
+        MetricBound::AtMost(BROWSER_READY_LIMIT_SECONDS),
+        "readiness inside the browser gate's own timeout",
     ),
     (
         "browser.canvas-width",
@@ -1862,10 +1906,21 @@ const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
     ),
 ];
 
+/// How many approved palette classes a published canvas has to show.
+const MINIMUM_PALETTE_CLASSES: usize = 3;
+
+/// The longest a published browser gate may have waited for readiness.
+///
+/// This is the browser gate's own `READY_TIMEOUT_SECONDS`. A report that
+/// records a longer wait than the gate would ever have allowed did not come
+/// from a passing gate, whatever else it says about itself.
+const BROWSER_READY_LIMIT_SECONDS: f64 = 30.0;
+
 #[derive(Clone, Copy)]
 enum MetricBound {
     Exactly(f64),
     AtLeast(f64),
+    AtMost(f64),
 }
 
 impl MetricBound {
@@ -1873,6 +1928,7 @@ impl MetricBound {
         match self {
             Self::Exactly(expected) => (value - expected).abs() < f64::EPSILON,
             Self::AtLeast(minimum) => value >= minimum,
+            Self::AtMost(maximum) => value <= maximum,
         }
     }
 }
@@ -1927,19 +1983,27 @@ fn derive_gates(
         },
     ];
     if let Some(browser) = browser {
+        // Readiness is a measurement, not the existence of a report: a gate
+        // that waited longer than its own timeout allows never proved the game
+        // was ready, so the row says so instead of turning green because a
+        // document arrived.
+        let ready = MetricBound::AtMost(BROWSER_READY_LIMIT_SECONDS).holds(browser.ready_seconds);
         gates.push(GateSummary {
             name: "Browser readiness".to_owned(),
-            status: GateStatus::Passed,
-            passed: 1,
-            failed: 0,
+            status: status(ready),
+            passed: u32::from(ready),
+            failed: u32::from(!ready),
             duration_ms: (browser.ready_seconds * 1_000.0).round().max(0.0) as u64,
             artifact_url: None,
         });
+        // A failed palette row that reports zero failures says a red gate
+        // found nothing wrong. The one thing it found wrong is the canvas.
+        let palette = browser.palette_classes.len() >= MINIMUM_PALETTE_CLASSES;
         gates.push(GateSummary {
             name: "Browser canvas palette".to_owned(),
-            status: status(browser.palette_classes.len() >= 3),
+            status: status(palette),
             passed: browser.palette_classes.len() as u32,
-            failed: 0,
+            failed: u32::from(!palette),
             duration_ms: 0,
             artifact_url: None,
         });
@@ -2018,18 +2082,39 @@ pub fn update_gallery(
 }
 
 pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, SitegenError> {
+    build_site_in(&default_repository(), inputs, output)
+}
+
+/// The repository this generator publishes from when a caller declares none.
+///
+/// A binary still sitting in the checkout it was built from finds that
+/// checkout here. A relocated one does not, which is exactly why every
+/// repository-relative decision is taken from the root the caller declares and
+/// this is only the fallback.
+pub fn default_repository() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Generates the site from one declared repository.
+///
+/// The approved references, the trusted build roots, and the source tree the
+/// output may not be written into are all read from `repository`, so a
+/// relocated `sitegen` publishes from the checkout it was handed rather than
+/// from the path it happened to be compiled in.
+pub fn build_site_in(
+    repository: &Path,
+    inputs: &SiteInputs,
+    output: &Path,
+) -> Result<SiteManifest, SitegenError> {
     validate_progress(
         &inputs.progress,
         &plan_task_ids_from_markdown(&inputs.plan_markdown),
         &inputs.repo,
     )
     .map_err(SitegenError::Progress)?;
-    validate_reference_manifest(
-        &inputs.reference_manifest,
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-    )
-    .map_err(SitegenError::Reference)?;
-    prepare_output(output)?;
+    validate_reference_manifest(&inputs.reference_manifest, repository)
+        .map_err(SitegenError::Reference)?;
+    prepare_output(repository, output)?;
 
     let plan_html = render_plan_html(&inputs.plan_markdown);
     let current_task = inputs
@@ -2046,8 +2131,8 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         .find(|commit| commit.sha == source_commit)
         .or_else(|| inputs.repo.commits.first())
         .map_or("Unknown", |commit| commit.committed_at.as_str());
-    let reference_paths = copy_reference_assets(&inputs.reference_manifest, output)?;
-    let playable_files = copy_playable_build(inputs.playable.as_ref(), output)?;
+    let reference_paths = copy_reference_assets(repository, &inputs.reference_manifest, output)?;
+    let playable_files = copy_playable_build(repository, inputs.playable.as_ref(), output)?;
     let evidence = publish_verification(inputs, &source_commit, updated_at, current_task, output)?;
     // The manifest is written last, because only a completed promotion knows
     // which pixels this build actually published.
@@ -2091,7 +2176,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
             "{{CHALLENGES}}",
             render_challenges(&inputs.progress, &inputs.repo),
         ),
-        ("{{TESTS}}", render_tests(inputs, evidence.as_ref())),
+        ("{{TESTS}}", render_tests(inputs)),
         ("{{COMMITS}}", render_commits(&inputs.repo)),
     ];
     let html = render_template(include_str!("../site/templates/index.html"), &replacements);
@@ -2105,7 +2190,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         &output.join("site.js"),
         include_bytes!("../site/static/site.js"),
     )?;
-    validate_site_output(output, &inputs.progress)?;
+    validate_site_output_in(repository, output, &inputs.progress)?;
 
     let mut generated_files = vec![
         PathBuf::from("index.html"),
@@ -2417,7 +2502,11 @@ pub fn assemble_site(
 /// named here rather than left to the link checker, because the cause is the
 /// inherited history and not the page that renders it.
 fn require_retained_history(output: &Path) -> Result<(), SitegenError> {
-    let missing = retained_history_targets(output)
+    let (targets, misscoped) = history_frames(output);
+    if !misscoped.is_empty() {
+        return Err(SitegenError::HistoryFrameOutsideEntry { frames: misscoped });
+    }
+    let missing = targets
         .into_iter()
         .filter(|target| !output.join(target).is_file())
         .collect::<Vec<_>>();
@@ -2638,6 +2727,15 @@ pub fn validate_site_output(
     output: &Path,
     progress: &ProgressDocument,
 ) -> Result<(), SitegenError> {
+    validate_site_output_in(&default_repository(), output, progress)
+}
+
+/// Validates one generated page against the repository it was published from.
+pub fn validate_site_output_in(
+    repository: &Path,
+    output: &Path,
+    progress: &ProgressDocument,
+) -> Result<(), SitegenError> {
     let index_path = output.join("index.html");
     let html = fs::read_to_string(&index_path).map_err(|error| SitegenError::Io {
         path: index_path.clone(),
@@ -2692,11 +2790,11 @@ pub fn validate_site_output(
         validate_local_target(output, &ids, &retained, &index_path, target)?;
     }
 
-    if html.contains(env!("CARGO_MANIFEST_DIR"))
-        || html.contains("/Users/")
-        || html.contains("file://")
-    {
-        return Err(invalid_html(&index_path, "absolute local path is present"));
+    if let Some(found) = published_absolute_path(repository, &document, &html) {
+        return Err(invalid_html(
+            &index_path,
+            format!("absolute local path is present: {found}"),
+        ));
     }
 
     for script in document.select(&selector("script")) {
@@ -2773,8 +2871,8 @@ pub fn validate_assembled_links(output: &Path) -> Result<(), SitegenError> {
     Ok(())
 }
 
-fn prepare_output(output: &Path) -> Result<(), SitegenError> {
-    validate_output_path(output)?;
+fn prepare_output(repository: &Path, output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_in(repository, output)?;
     if let Ok(metadata) = fs::symlink_metadata(output) {
         if metadata.is_dir() {
             fs::remove_dir_all(output).map_err(|error| SitegenError::Io {
@@ -2833,8 +2931,13 @@ fn prepare_assembly_output(output: &Path) -> Result<(), SitegenError> {
 /// Nothing else is trusted, so a package path can never reach the source tree
 /// or an arbitrary location on the host.
 pub fn trusted_playable_roots() -> Vec<PathBuf> {
+    trusted_playable_roots_in(&default_repository())
+}
+
+/// The same roots, for a caller that knows which repository it is publishing
+/// from.
+pub fn trusted_playable_roots_in(repository: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Ok(target) = fs::canonicalize(repository.join("target")) {
         roots.push(target);
     }
@@ -3000,6 +3103,19 @@ fn is_protected_artifact(relative: &Path, protected: &[&str]) -> bool {
 }
 
 pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_in(&default_repository(), output)
+}
+
+/// Refuses an output directory that would publish into a repository's own
+/// source tree.
+///
+/// Two roots are protected: the repository the caller declared, which is the
+/// checkout this run is publishing from, and the one this binary was compiled
+/// in, which is where a developer's own source tree lives. Declaring a
+/// repository therefore only ever adds protection. A root that is not on this
+/// machine at all — what a relocated binary's compiled-in path is — protects
+/// nothing and is skipped rather than failing the run that no longer has it.
+pub fn validate_output_path_in(repository: &Path, output: &Path) -> Result<(), SitegenError> {
     if output.as_os_str().is_empty() || output == Path::new(".") {
         return Err(SitegenError::UnsafeOutputPath {
             path: output.to_path_buf(),
@@ -3011,17 +3127,22 @@ pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
         });
     }
 
-    let repository =
-        fs::canonicalize(env!("CARGO_MANIFEST_DIR")).map_err(|error| SitegenError::Io {
-            path: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            message: error.to_string(),
-        })?;
     let resolved = resolve_destination(output)?;
-    let target_root = repository.join("target");
-    if resolved.starts_with(&repository) && !resolved.starts_with(target_root) {
-        return Err(SitegenError::UnsafeOutputPath {
-            path: output.to_path_buf(),
-        });
+    let mut protected = Vec::new();
+    for root in [repository.to_path_buf(), default_repository()] {
+        let Ok(canonical) = fs::canonicalize(&root) else {
+            continue;
+        };
+        if !protected.contains(&canonical) {
+            protected.push(canonical);
+        }
+    }
+    for root in protected {
+        if resolved.starts_with(&root) && !resolved.starts_with(root.join("target")) {
+            return Err(SitegenError::UnsafeOutputPath {
+                path: output.to_path_buf(),
+            });
+        }
     }
     Ok(())
 }
@@ -3063,10 +3184,10 @@ fn resolve_destination(path: &Path) -> Result<PathBuf, SitegenError> {
 }
 
 fn copy_reference_assets(
+    repository: &Path,
     manifest: &ReferenceManifest,
     output: &Path,
 ) -> Result<BTreeMap<String, PathBuf>, SitegenError> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut paths = BTreeMap::new();
     for asset in &manifest.assets {
         let source = repository.join(&asset.public_path);
@@ -3131,13 +3252,15 @@ fn render_status(
 /// Copies a verified browser package into `play/` and returns the published
 /// relative paths in stable order.
 fn copy_playable_build(
+    repository: &Path,
     playable: Option<&PlayableBuild>,
     output: &Path,
 ) -> Result<Vec<PathBuf>, SitegenError> {
     let Some(playable) = playable else {
         return Ok(Vec::new());
     };
-    let package = resolve_playable_package(&playable.directory, &trusted_playable_roots())?;
+    let package =
+        resolve_playable_package(&playable.directory, &trusted_playable_roots_in(repository))?;
     if let Some(missing) = missing_playable_parts(&package).first() {
         return Err(SitegenError::MissingInput {
             path: package.join(missing),
@@ -3604,16 +3727,17 @@ fn render_task(task: &ProgressTask, repo: &RepoFacts) -> String {
         format!("After {}", task.depends_on.join(", "))
     };
     let commit = task
-                .completed_commit
-                .as_deref()
-                .and_then(|commit| resolve_commit_ref(commit, repo))
-                .map(|commit| {
-                    format!(
-                        r#"<a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/{commit}">Commit {}</a>"#,
-                        short_sha(&commit)
-                    )
-                })
-                .unwrap_or_default();
+        .completed_commit
+        .as_deref()
+        .and_then(|commit| resolve_commit_ref(commit, repo))
+        .map(|commit| {
+            format!(
+                r#"<a class="commit-link" href="{}">Commit {}</a>"#,
+                commit_url(&commit),
+                short_sha(&commit)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r##"<article class="task-card">
           <a data-progress-task="{}" href="#plan-{}"><h3>{}</h3></a>
@@ -3630,13 +3754,23 @@ fn render_task(task: &ProgressTask, repo: &RepoFacts) -> String {
 }
 
 fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
+    // A promotion copies every captured frame into the published tree, so
+    // every one of them is rendered here. A frame this build published and
+    // linked from nowhere would be weight the site serves and nobody can see.
+    let current = evidence
+        .and(inputs.verification.as_ref())
+        .map(|evidence| render_current_frames(&evidence.summary))
+        .unwrap_or_default();
     let gallery = evidence
         .map(|published| &published.gallery)
         .or(inputs.gallery.as_ref());
     let Some(gallery) = gallery.filter(|gallery| !gallery.entries.is_empty()) else {
-        return empty_state(
-            "No verified screenshots yet. The timeline starts after the first deterministic render passes.",
-        );
+        let note = if current.is_empty() {
+            "No verified screenshots yet. The timeline starts after the first deterministic render passes."
+        } else {
+            "The timeline starts at the first accepted history point."
+        };
+        return format!("{current}{}", empty_state(note));
     };
 
     // A build only ever links pixels it published itself. The images of older
@@ -3647,7 +3781,7 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
         .entries
         .last()
         .map_or("", |entry| entry.semantic_visual_hash.as_str());
-    gallery
+    let history = gallery
         .entries
         .iter()
         .rev()
@@ -3700,14 +3834,57 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
                 render_deltas(&entry.metric_deltas),
             )
         })
-        .collect()
+        .collect::<String>();
+    format!("{current}{history}")
+}
+
+/// Every frame this build promoted into `screenshots/current`.
+fn render_current_frames(summary: &VerificationSummary) -> String {
+    let figures = summary
+        .frames
+        .iter()
+        .map(|frame| {
+            format!(
+                r#"<figure><img src="{CURRENT_SCREENSHOTS}/{}" alt="Verified {} capture at the {} heading" loading="lazy"><figcaption>{}</figcaption></figure>"#,
+                escape_html(&frame.name),
+                escape_html(&frame.stage),
+                escape_html(&frame.heading),
+                escape_html(&frame.stage),
+            )
+        })
+        .collect::<String>();
+    if figures.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<article class="screenshot-entry">
+          <div class="timeline-dot"></div>
+          <div>
+            <span class="eyebrow">This build &middot; every promoted frame</span>
+            <p>The complete set of captures behind the evidence published on this page.</p>
+            <div class="screenshot-strip">{figures}</div>
+          </div>
+        </article>"#
+    )
 }
 
 /// The metric changes one history entry recorded, largest movement first.
 fn render_deltas(deltas: &BTreeMap<String, f64>) -> String {
-    let moved = deltas
+    let mut moved = deltas
         .iter()
         .filter(|(_, delta)| **delta != 0.0)
+        .collect::<Vec<_>>();
+    // A point can move a dozen metrics at once, so the list leads with the
+    // movement a reader is looking for. Equal movements keep the manifest's
+    // own stable name order, so the same history always renders the same way.
+    moved.sort_by(|(left_name, left), (right_name, right)| {
+        right
+            .abs()
+            .total_cmp(&left.abs())
+            .then_with(|| left_name.cmp(right_name))
+    });
+    let items = moved
+        .into_iter()
         .map(|(name, delta)| {
             format!(
                 r#"<li><code>{}</code> <strong>{}</strong></li>"#,
@@ -3716,10 +3893,10 @@ fn render_deltas(deltas: &BTreeMap<String, f64>) -> String {
             )
         })
         .collect::<String>();
-    if moved.is_empty() {
+    if items.is_empty() {
         return r#"<p class="history-note">No published metric moved.</p>"#.to_owned();
     }
-    format!(r#"<ul class="delta-list">{moved}</ul>"#)
+    format!(r#"<ul class="delta-list">{items}</ul>"#)
 }
 
 fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
@@ -3755,7 +3932,8 @@ fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
                         .and_then(|commit| resolve_commit_ref(commit, repo))
                         .map(|commit| {
                             format!(
-                                r#"<a href="https://github.com/ridermw/midcreek-cs-1/commit/{commit}">Resolved in {}</a>"#,
+                                r#"<a href="{}">Resolved in {}</a>"#,
+                                commit_url(&commit),
                                 short_sha(&commit)
                             )
                         })
@@ -3778,7 +3956,7 @@ fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
                 .collect()
 }
 
-fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
+fn render_tests(inputs: &SiteInputs) -> String {
     let summary = inputs.verification.as_ref().map(|value| &value.summary);
     let gates = inputs
         .workflow
@@ -3823,7 +4001,7 @@ fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> St
         .as_ref()
         .and_then(|gallery| gallery.entries.last());
     let evidence_html = summary
-        .map(|summary| render_verification_evidence(summary, baseline, evidence))
+        .map(|summary| render_verification_evidence(summary, baseline))
         .unwrap_or_default();
 
     format!(
@@ -3838,7 +4016,6 @@ fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> St
 fn render_verification_evidence(
     summary: &VerificationSummary,
     baseline: Option<&GalleryEntry>,
-    evidence: Option<&PublishedEvidence>,
 ) -> String {
     let metrics = summary
         .metrics
@@ -3888,16 +4065,13 @@ fn render_verification_evidence(
             )
         })
         .unwrap_or_default();
-    let report_link = evidence
-        .map(|_| VERIFICATION_FILE)
-        .unwrap_or(VERIFICATION_FILE);
 
     format!(
         r#"{stage}
         <div class="table-wrap"><table><caption>Published metrics</caption><thead><tr><th>Metric</th><th>Value</th><th>Change</th></tr></thead><tbody>{metrics}</tbody></table></div>
         {failures}
         {}
-        <p class="section-link"><a href="{report_link}">Open the sanitized verification report</a></p>"#,
+        <p class="section-link"><a href="{VERIFICATION_FILE}">Open the sanitized verification report</a></p>"#,
         render_run_provenance(summary),
     )
 }
@@ -4134,21 +4308,122 @@ fn validate_local_target(
     }
 }
 
+/// The first absolute local path the generated page publishes, if any.
+///
+/// A rule that names one platform's home directory only ever says something
+/// about the machine the last leak came from: the same page rendered on macOS
+/// carries `/Users/...`, on a runner `/home/runner/...`, and from a Windows
+/// checkout a drive letter. What all of them have in common is that they are
+/// absolute, so that is what is refused — across the text the page really
+/// renders and across every attribute value it emits, whatever produced the
+/// content. The repository roots are still named exactly, because a path
+/// inside one is otherwise indistinguishable from the relative paths the site
+/// publishes on purpose.
+fn published_absolute_path(repository: &Path, document: &Html, html: &str) -> Option<String> {
+    for root in [repository.to_path_buf(), default_repository()] {
+        for candidate in [Some(root.clone()), fs::canonicalize(&root).ok()]
+            .into_iter()
+            .flatten()
+        {
+            let text = candidate.to_string_lossy().into_owned();
+            if candidate.is_absolute() && text.len() > 1 && html.contains(&text) {
+                return Some(text);
+            }
+        }
+    }
+    if html.contains("file://") {
+        return Some("file://".to_owned());
+    }
+
+    for node in document.tree.nodes() {
+        match node.value() {
+            Node::Text(text) => {
+                if let Some(found) = absolute_path_token(text) {
+                    return Some(found);
+                }
+            }
+            Node::Element(element) => {
+                for (_, value) in element.attrs() {
+                    if let Some(found) = absolute_path_token(value) {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The first whitespace-delimited token of one published string that names an
+/// absolute filesystem path.
+///
+/// An absolute path names at least two components below the root: that is what
+/// separates `/home/runner/work` and `/Users/someone/checkout` from the single
+/// URL path prefix (`/midcreek-cs-1/`) this project's own prose really talks
+/// about, and from a lone separator or a prose slash. Every relative path the
+/// site publishes on purpose fails the leading-root test outright.
+fn absolute_path_token(value: &str) -> Option<String> {
+    value.split_whitespace().find_map(|token| {
+        // Only trailing punctuation is dropped: a leading `.` is part of the
+        // relative paths the site publishes on purpose, and trimming it would
+        // turn `../midcreek-concept/...` into something that looks absolute.
+        let token = token
+            .trim_start_matches(['"', '\'', '(', '[', '{', '`'])
+            .trim_end_matches(['"', '\'', ')', ']', '}', ',', ';', ':', '.', '`']);
+        let posix = token.strip_prefix('/').is_some_and(|rest| {
+            rest.starts_with(|value: char| value.is_ascii_alphanumeric())
+                && rest.split('/').filter(|part| !part.is_empty()).count() >= 2
+        });
+        let bytes = token.as_bytes();
+        let windows = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\');
+        (posix || windows).then(|| token.to_owned())
+    })
+}
+
 /// Every history frame the published gallery manifest vouches for.
 fn retained_history_targets(output: &Path) -> BTreeSet<String> {
+    history_frames(output).0
+}
+
+/// The history frames the published manifest vouches for, and the ones it
+/// declares outside the entry that owns them.
+///
+/// Every accepted point publishes into its own commit's directory, so a frame
+/// path that merely starts with the history prefix is not evidence of that
+/// point at all: it can name another entry's pixels, which exist, resolve, and
+/// would satisfy both the link checker and the retained-history rule while
+/// showing a different moment in time under this entry's commit and hash.
+fn history_frames(output: &Path) -> (BTreeSet<String>, Vec<String>) {
     let Ok(json) = fs::read_to_string(output.join(GALLERY_FILE)) else {
-        return BTreeSet::new();
+        return (BTreeSet::new(), Vec::new());
     };
-    serde_json::from_str::<GalleryManifest>(&json)
-        .map(|gallery| {
-            gallery
-                .entries
-                .into_iter()
-                .flat_map(|entry| entry.frames.into_values())
-                .filter(|path| path.starts_with(HISTORY_SCREENSHOTS))
-                .collect()
-        })
-        .unwrap_or_default()
+    let Ok(gallery) = serde_json::from_str::<GalleryManifest>(&json) else {
+        return (BTreeSet::new(), Vec::new());
+    };
+
+    let mut declared = BTreeSet::new();
+    let mut misscoped = Vec::new();
+    for entry in gallery.entries {
+        let root = format!("{HISTORY_SCREENSHOTS}/{}/", short_sha(&entry.source_commit));
+        for path in entry.frames.into_values() {
+            if !path.starts_with(HISTORY_SCREENSHOTS) {
+                continue;
+            }
+            let owned = path
+                .strip_prefix(&root)
+                .is_some_and(|file| !file.is_empty() && !file.contains('/'));
+            if owned {
+                declared.insert(path);
+            } else if !misscoped.contains(&path) {
+                misscoped.push(path);
+            }
+        }
+    }
+    (declared, misscoped)
 }
 
 fn selector(value: &str) -> Selector {
@@ -4167,6 +4442,11 @@ fn empty_state(message: &str) -> String {
         r#"<div class="empty-state"><span class="empty-mark">+</span><p>{}</p></div>"#,
         escape_html(message)
     )
+}
+
+/// The published link to one commit in this repository.
+fn commit_url(commit: &str) -> String {
+    format!("{REPOSITORY_URL}/commit/{commit}")
 }
 
 fn short_sha(sha: &str) -> String {
