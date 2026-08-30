@@ -904,6 +904,15 @@ pub struct RackRoster {
 }
 
 impl RackRoster {
+    /// A roster over exactly these entries, in the order given.
+    ///
+    /// The hall builds the real roster in stable [`PropId`] order; this exists
+    /// so the roster can also be built directly, without a world, when
+    /// something needs to reason about racks in isolation.
+    pub fn from_entries(racks: Vec<RackEntry>) -> Self {
+        Self { racks }
+    }
+
     /// Every rack, in stable order.
     pub fn all(&self) -> &[RackEntry] {
         &self.racks

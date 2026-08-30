@@ -49,11 +49,12 @@ use bevy::{
 use crate::{
     CellShiftSet,
     camera::CellShiftCamera,
-    design::{MAX_ACTIVE_TICKETS, PaletteRole},
+    design::{MAX_ACTIVE_TICKETS, PaletteRole, REPAIR_INTERACTION_RANGE},
     operations::{
-        InteractionOutcome, LastInteraction, MovementLock, RackOperations, RackRoster, RackState,
-        TicketId, TicketQueue, TicketSeverity, operations_are_ready,
+        InteractionOutcome, LastInteraction, MovementLock, RackEntry, RackOperations, RackRoster,
+        RackState, TicketId, TicketQueue, TicketSeverity, operations_are_ready, rack_distance,
     },
+    player::Technician,
 };
 
 // ---------------------------------------------------------------------------
@@ -262,22 +263,67 @@ impl HudStatus {
     /// A running repair outranks everything, because it is the only state that
     /// takes the controls away. Otherwise the most recent real rejection is
     /// shown while it is still true, and the queue itself is the fallback.
-    pub fn derive(lock: &MovementLock, last: &LastInteraction, queue: &TicketQueue) -> Self {
+    ///
+    /// "Still true" is checked against the one rack the rejection was about,
+    /// not against the queue as a whole: see [`move_closer_still_stands`].
+    pub fn derive(
+        lock: &MovementLock,
+        last: &LastInteraction,
+        queue: &TicketQueue,
+        roster: &RackRoster,
+        racks: &[RackPresentation],
+        technician: Option<Vec2>,
+    ) -> Self {
         if lock.is_locked() {
             return Self::Repairing;
         }
         match last.outcome {
-            InteractionOutcome::OutOfRange { .. } if !queue.is_empty() => Self::MoveCloser,
-            InteractionOutcome::NoOpenTickets if queue.is_empty() => Self::NoOpenTickets,
-            _ => {
-                if queue.is_empty() {
-                    Self::AllHealthy
-                } else {
-                    Self::TicketsOpen
-                }
+            InteractionOutcome::OutOfRange {
+                nearest_rack: Some(rack),
+                ..
+            } if move_closer_still_stands(rack, queue, roster.get(rack), racks, technician) => {
+                Self::MoveCloser
             }
+            InteractionOutcome::NoOpenTickets if queue.is_empty() => Self::NoOpenTickets,
+            _ if queue.is_empty() => Self::AllHealthy,
+            _ => Self::TicketsOpen,
         }
     }
+}
+
+/// Whether the last out-of-range rejection is still true right now.
+///
+/// A rejection is always about one specific rack, the `nearest_rack` the real
+/// Space press measured, so it must survive exactly as long as that rack is
+/// still unreachable and still needs a repair, and no longer. It stops holding
+/// the moment any of these becomes true:
+///
+/// - the rack's ticket left the live queue (repaired, resolved, removed);
+/// - the rack is no longer `Faulted`, so there is nothing to walk up to;
+/// - the rack is not on the roster, or the technician is not in the world;
+/// - the technician walked inside [`REPAIR_INTERACTION_RANGE`] of it.
+///
+/// Every input is read live. Nothing here is cached between frames.
+pub fn move_closer_still_stands(
+    nearest_rack: usize,
+    queue: &TicketQueue,
+    entry: Option<&RackEntry>,
+    racks: &[RackPresentation],
+    technician: Option<Vec2>,
+) -> bool {
+    if queue.for_rack(nearest_rack).is_none() {
+        return false;
+    }
+    let Some(rack) = racks.iter().find(|rack| rack.rack == nearest_rack) else {
+        return false;
+    };
+    if rack.state != RackState::Faulted {
+        return false;
+    }
+    let (Some(entry), Some(position)) = (entry, technician) else {
+        return false;
+    };
+    rack_distance(position, entry.center, entry.half_extents) > REPAIR_INTERACTION_RANGE
 }
 
 /// The typed palette role one severity is drawn in.
@@ -391,10 +437,15 @@ pub enum BadgeVisibility {
     OffScreen,
     /// The real projection refused the anchor.
     ProjectionFailed,
-    /// There is no camera to project through.
+    /// There is no usable game camera to project through.
     NoCamera,
+    /// A game camera exists but has no viewport size yet, so nothing can be
+    /// placed against it.
+    NoViewport,
     /// The rack entity lost its operational state.
     MissingRack,
+    /// The rack has no spawned badge node to write to.
+    MissingBadgeNode,
 }
 
 /// One rack's badge presentation this frame.
@@ -1081,6 +1132,29 @@ struct BadgeCamera {
     viewport: Vec2,
 }
 
+/// What the badge pass could get from the one game camera this frame.
+enum BadgeView {
+    /// A usable, unparented camera with a real viewport size.
+    ///
+    /// [`Camera`] is a large component and this enum is built every frame, so
+    /// the usable case is boxed and the two failure cases stay pointer sized.
+    Ready(Box<BadgeCamera>),
+    /// No usable game camera exists: either none is spawned, or the one that
+    /// is has been given a parent and so no longer satisfies the current-frame
+    /// projection invariant.
+    NoCamera,
+    /// A usable camera exists but has no viewport size yet.
+    NoViewport,
+}
+
+/// What the badge pass reads off the one game camera.
+type GameCamera = (&'static Camera, &'static Transform);
+
+/// The one game camera the badge pass will accept.
+///
+/// `Without<ChildOf>` is load bearing, not decoration: see [`update_hud`].
+type GameCameraFilter = (With<CellShiftCamera>, Without<ChildOf>);
+
 /// Reads the live operations model, writes only presentation components, and
 /// records everything it could not draw in [`HudReport`].
 #[allow(clippy::too_many_arguments)]
@@ -1090,7 +1164,8 @@ fn update_hud(
     lock: Res<MovementLock>,
     last: Res<LastInteraction>,
     racks: Query<&RackOperations>,
-    cameras: Query<(&Camera, &Transform, &GlobalTransform), With<CellShiftCamera>>,
+    players: Query<&Transform, With<Technician>>,
+    cameras: Query<GameCamera, GameCameraFilter>,
     mut report: ResMut<HudReport>,
     mut nodes: HudNodes,
 ) {
@@ -1099,23 +1174,26 @@ fn update_hud(
     // Reading the camera's own `Transform` rather than its propagated
     // `GlobalTransform` is deliberate: propagation runs in `PostUpdate`, so the
     // propagated value is a frame stale and badges would visibly lag the
-    // camera through every orbit tween. The camera has no parent, so the
-    // transform is the global transform.
-    let camera = match cameras.iter().next() {
-        Some((camera, transform, _)) => match camera.logical_viewport_size() {
-            Some(viewport) => Some(BadgeCamera {
+    // camera through every orbit tween. That substitution is only sound for a
+    // camera with no parent, so `Without<ChildOf>` makes it an enforced
+    // invariant rather than a comment: a parented camera is refused as
+    // unusable and every badge is hidden, instead of being projected through a
+    // local transform pretending to be a global one.
+    let view = match cameras.iter().next() {
+        Some((camera, transform)) => match camera.logical_viewport_size() {
+            Some(viewport) => BadgeView::Ready(Box::new(BadgeCamera {
                 camera: camera.clone(),
                 transform: GlobalTransform::from(*transform),
                 viewport,
-            }),
+            })),
             None => {
                 errors.push(HudError::NoViewport);
-                None
+                BadgeView::NoViewport
             }
         },
         None => {
             errors.push(HudError::NoCamera);
-            None
+            BadgeView::NoCamera
         }
     };
 
@@ -1142,9 +1220,14 @@ fn update_hud(
         })
         .collect::<Vec<_>>();
 
+    let technician = players
+        .iter()
+        .next()
+        .map(|transform| Vec2::new(transform.translation.x, transform.translation.z));
+
     let (rows, row_errors) = queue_rows(&queue, &presentations);
     errors.extend(row_errors);
-    let status = HudStatus::derive(&lock, &last, &queue);
+    let status = HudStatus::derive(&lock, &last, &queue, &roster, &presentations, technician);
 
     errors.extend(nodes.write_queue(&rows, status, queue.len()));
     nodes.write_controls(lock.is_locked());
@@ -1170,36 +1253,44 @@ fn update_hud(
         if missing_state.contains(&rack) {
             badge.visibility = BadgeVisibility::MissingRack;
         } else if let Some(kind) = kind {
-            match &camera {
-                None => badge.visibility = BadgeVisibility::NoCamera,
-                Some(view) => match view.camera.world_to_viewport(&view.transform, anchor_world) {
-                    Err(error) => {
-                        badge.visibility = BadgeVisibility::ProjectionFailed;
-                        errors.push(HudError::ProjectionFailed {
-                            rack,
-                            reason: error.into(),
-                        });
-                    }
-                    Ok(anchor) => {
-                        badge.anchor = Some(anchor);
-                        match place_badge(anchor, view.viewport) {
-                            None => badge.visibility = BadgeVisibility::OffScreen,
-                            Some(placement) => {
-                                badge.visibility = BadgeVisibility::Shown;
-                                badge.center = Some(placement.center);
-                                if let Some(error) = nodes.write_badge(rack, kind, &placement) {
-                                    errors.push(error);
-                                    badge.visibility = BadgeVisibility::MissingRack;
-                                    badge.center = None;
+            match &view {
+                BadgeView::NoCamera => badge.visibility = BadgeVisibility::NoCamera,
+                BadgeView::NoViewport => badge.visibility = BadgeVisibility::NoViewport,
+                BadgeView::Ready(view) => {
+                    match view.camera.world_to_viewport(&view.transform, anchor_world) {
+                        Err(error) => {
+                            badge.visibility = BadgeVisibility::ProjectionFailed;
+                            errors.push(HudError::ProjectionFailed {
+                                rack,
+                                reason: error.into(),
+                            });
+                        }
+                        Ok(anchor) => {
+                            badge.anchor = Some(anchor);
+                            match place_badge(anchor, view.viewport) {
+                                None => badge.visibility = BadgeVisibility::OffScreen,
+                                Some(placement) => {
+                                    badge.visibility = BadgeVisibility::Shown;
+                                    badge.center = Some(placement.center);
+                                    if let Some(error) = nodes.write_badge(rack, kind, &placement) {
+                                        errors.push(error);
+                                        badge.visibility = BadgeVisibility::MissingBadgeNode;
+                                        badge.center = None;
+                                    }
                                 }
                             }
                         }
                     }
-                },
+                }
             }
         }
-        if badge.visibility != BadgeVisibility::Shown
-            && let Some(error) = nodes.hide_badge(rack)
+        // A rack whose badge node is missing was already reported once by
+        // `write_badge`, which also hid its leader line. Running the hide path
+        // as well would record the same failure a second time.
+        if !matches!(
+            badge.visibility,
+            BadgeVisibility::Shown | BadgeVisibility::MissingBadgeNode
+        ) && let Some(error) = nodes.hide_badge(rack)
         {
             errors.push(error);
         }
@@ -1207,7 +1298,10 @@ fn update_hud(
     }
 
     let updated = HudReport {
-        viewport: camera.map(|view| view.viewport).unwrap_or(Vec2::ZERO),
+        viewport: match &view {
+            BadgeView::Ready(view) => view.viewport,
+            BadgeView::NoCamera | BadgeView::NoViewport => Vec2::ZERO,
+        },
         rows,
         badges,
         status,
@@ -1484,6 +1578,10 @@ impl HudNodes<'_, '_> {
 
     /// Places one badge and its leader line, returning an error when the rack
     /// has no spawned badge node.
+    ///
+    /// A rack with no badge node still gets its leader line hidden here, so
+    /// the caller never has to run the hide path, and never reports the same
+    /// missing node twice.
     fn write_badge(
         &mut self,
         rack: usize,
@@ -1491,6 +1589,9 @@ impl HudNodes<'_, '_> {
         placement: &BadgePlacement,
     ) -> Option<HudError> {
         let Some(entity) = self.badge_entity(rack) else {
+            if let Some(leader) = self.leader_entity(rack) {
+                self.set_display(leader, Display::None);
+            }
             return Some(HudError::MissingBadgeNode { rack });
         };
         self.set_display(entity, Display::Flex);
@@ -1548,6 +1649,42 @@ mod tests {
             rack_id: PropId::new(format!("rack-row-{:02}", rack + 1)),
             severity,
             created_tick,
+        }
+    }
+
+    /// One roster entry whose collider is a metre wide and centred six metres
+    /// apart from its neighbours, so a technician's distance to it is easy to
+    /// place either side of [`REPAIR_INTERACTION_RANGE`].
+    fn entry(rack: usize) -> RackEntry {
+        RackEntry {
+            rack,
+            id: PropId::new(format!("rack-row-{:02}", rack + 1)),
+            entity: Entity::PLACEHOLDER,
+            center: Vec2::new(rack as f32 * 6.0, 0.0),
+            half_extents: Vec2::new(0.5, 8.0),
+        }
+    }
+
+    fn roster_of(racks: usize) -> RackRoster {
+        RackRoster::from_entries((0..racks).map(entry).collect())
+    }
+
+    /// A technician standing `distance` metres clear of one rack's collider.
+    fn standing(rack: usize, distance: f32) -> Option<Vec2> {
+        let entry = entry(rack);
+        Some(Vec2::new(
+            entry.center.x + entry.half_extents.x + distance,
+            0.0,
+        ))
+    }
+
+    fn rejected(rack: Option<usize>) -> LastInteraction {
+        LastInteraction {
+            outcome: InteractionOutcome::OutOfRange {
+                nearest_rack: rack,
+                nearest_distance: 2.2,
+            },
+            ..LastInteraction::default()
         }
     }
 
@@ -1748,32 +1885,48 @@ mod tests {
     fn hud_status_prefers_the_running_repair_then_the_real_rejection() {
         let idle = LastInteraction::default();
         let empty = TicketQueue::default();
-        let busy = queue_of(vec![ticket(1, 0, TicketSeverity::Critical, 10)]);
+        let busy = queue_of(vec![ticket(1, 1, TicketSeverity::Critical, 10)]);
+        let roster = roster_of(4);
+        let faulted = [
+            presentation(0, RackState::Healthy),
+            presentation(1, RackState::Faulted),
+            presentation(2, RackState::Healthy),
+            presentation(3, RackState::Healthy),
+        ];
+        let far = standing(1, 3.0);
 
         assert_eq!(
-            HudStatus::derive(&MovementLock::default(), &idle, &empty),
+            HudStatus::derive(
+                &MovementLock::default(),
+                &idle,
+                &empty,
+                &roster,
+                &faulted,
+                far
+            ),
             HudStatus::AllHealthy
         );
         assert_eq!(
-            HudStatus::derive(&MovementLock::default(), &idle, &busy),
+            HudStatus::derive(
+                &MovementLock::default(),
+                &idle,
+                &busy,
+                &roster,
+                &faulted,
+                far
+            ),
             HudStatus::TicketsOpen
         );
-
-        let out_of_range = LastInteraction {
-            outcome: InteractionOutcome::OutOfRange {
-                nearest_rack: Some(1),
-                nearest_distance: 2.2,
-            },
-            ..LastInteraction::default()
-        };
         assert_eq!(
-            HudStatus::derive(&MovementLock::default(), &out_of_range, &busy),
+            HudStatus::derive(
+                &MovementLock::default(),
+                &rejected(Some(1)),
+                &busy,
+                &roster,
+                &faulted,
+                far
+            ),
             HudStatus::MoveCloser
-        );
-        assert_eq!(
-            HudStatus::derive(&MovementLock::default(), &out_of_range, &empty),
-            HudStatus::AllHealthy,
-            "a stale rejection never outlives the ticket it was about"
         );
 
         let nothing_open = LastInteraction {
@@ -1781,7 +1934,14 @@ mod tests {
             ..LastInteraction::default()
         };
         assert_eq!(
-            HudStatus::derive(&MovementLock::default(), &nothing_open, &empty),
+            HudStatus::derive(
+                &MovementLock::default(),
+                &nothing_open,
+                &empty,
+                &roster,
+                &faulted,
+                far
+            ),
             HudStatus::NoOpenTickets
         );
 
@@ -1789,6 +1949,158 @@ mod tests {
             assert!(PaletteRole::ALL.contains(&status.role()));
             assert!(!status.label().is_empty());
         }
+    }
+
+    #[test]
+    fn hud_move_closer_holds_only_while_that_one_rack_is_open_and_unreachable() {
+        let roster = roster_of(4);
+        let faulted = [
+            presentation(0, RackState::Faulted),
+            presentation(1, RackState::Faulted),
+            presentation(2, RackState::Healthy),
+            presentation(3, RackState::Healthy),
+        ];
+        let busy = queue_of(vec![
+            ticket(1, 0, TicketSeverity::Critical, 10),
+            ticket(2, 1, TicketSeverity::Critical, 20),
+        ]);
+
+        assert!(
+            move_closer_still_stands(1, &busy, roster.get(1), &faulted, standing(1, 3.0)),
+            "an open fault the technician is still too far from keeps the rejection true"
+        );
+        assert!(
+            !move_closer_still_stands(
+                1,
+                &busy,
+                roster.get(1),
+                &faulted,
+                standing(1, REPAIR_INTERACTION_RANGE - 0.01)
+            ),
+            "walking into range clears the rejection, even with the ticket still open"
+        );
+        assert!(
+            move_closer_still_stands(
+                1,
+                &busy,
+                roster.get(1),
+                &faulted,
+                standing(1, REPAIR_INTERACTION_RANGE + 0.01)
+            ),
+            "the boundary is the real repair range, not the queue"
+        );
+        assert!(
+            !move_closer_still_stands(1, &busy, roster.get(1), &faulted, None),
+            "no technician in the world means no standing rejection"
+        );
+        assert!(
+            !move_closer_still_stands(1, &busy, None, &faulted, standing(1, 3.0)),
+            "a rack that is not on the roster cannot be walked up to"
+        );
+
+        // The rack the rejection was about resolves, while another rack's
+        // ticket is still open. The old code kept saying "move closer".
+        for state in [
+            RackState::Repairing,
+            RackState::Resolved,
+            RackState::Cooldown,
+            RackState::Healthy,
+        ] {
+            let moved_on = [
+                presentation(0, RackState::Faulted),
+                presentation(1, state),
+                presentation(2, RackState::Healthy),
+                presentation(3, RackState::Healthy),
+            ];
+            assert!(
+                !move_closer_still_stands(1, &busy, roster.get(1), &moved_on, standing(1, 3.0)),
+                "a {state:?} rack is not something to move closer to"
+            );
+        }
+
+        // The rack's ticket leaves the queue while rack 0's ticket stays.
+        let only_other = queue_of(vec![ticket(1, 0, TicketSeverity::Critical, 10)]);
+        assert!(
+            !move_closer_still_stands(1, &only_other, roster.get(1), &faulted, standing(1, 3.0)),
+            "another rack's ticket must never keep a stale rejection alive"
+        );
+    }
+
+    #[test]
+    fn hud_status_clears_a_stale_rejection_through_every_transition() {
+        let roster = roster_of(4);
+        let unlocked = MovementLock::default();
+        let far = standing(1, 3.0);
+        let faulted = [
+            presentation(0, RackState::Faulted),
+            presentation(1, RackState::Faulted),
+            presentation(2, RackState::Healthy),
+            presentation(3, RackState::Healthy),
+        ];
+        let two_open = queue_of(vec![
+            ticket(1, 0, TicketSeverity::Critical, 10),
+            ticket(2, 1, TicketSeverity::Critical, 20),
+        ]);
+        let derive = |queue: &TicketQueue, racks: &[RackPresentation], at: Option<Vec2>| {
+            HudStatus::derive(&unlocked, &rejected(Some(1)), queue, &roster, racks, at)
+        };
+
+        assert_eq!(derive(&two_open, &faulted, far), HudStatus::MoveCloser);
+
+        // Rack 1 starts repairing: the rejection is over, and rack 0's ticket
+        // is what the queue now reports.
+        let repairing = [
+            presentation(0, RackState::Faulted),
+            presentation(1, RackState::Repairing),
+            presentation(2, RackState::Healthy),
+            presentation(3, RackState::Healthy),
+        ];
+        assert_eq!(derive(&two_open, &repairing, far), HudStatus::TicketsOpen);
+
+        // Rack 1's ticket is removed but rack 0's is still open. The status
+        // must not fall back to a rejection that is no longer about anything.
+        let only_rack_zero = queue_of(vec![ticket(1, 0, TicketSeverity::Critical, 10)]);
+        assert_eq!(
+            derive(&only_rack_zero, &faulted, far),
+            HudStatus::TicketsOpen,
+            "a surviving unrelated ticket must not resurrect the rejection"
+        );
+
+        // Every ticket is gone.
+        assert_eq!(
+            derive(
+                &TicketQueue::default(),
+                &[
+                    presentation(0, RackState::Cooldown),
+                    presentation(1, RackState::Cooldown),
+                    presentation(2, RackState::Healthy),
+                    presentation(3, RackState::Healthy),
+                ],
+                far
+            ),
+            HudStatus::AllHealthy,
+            "a stale rejection never outlives the ticket it was about"
+        );
+
+        // The technician walks in without pressing anything.
+        assert_eq!(
+            derive(&two_open, &faulted, standing(1, 0.5)),
+            HudStatus::TicketsOpen,
+            "walking into range clears the prompt that told you to"
+        );
+
+        // A rejection that never named a rack cannot stand at all.
+        assert_eq!(
+            HudStatus::derive(
+                &unlocked,
+                &rejected(None),
+                &two_open,
+                &roster,
+                &faulted,
+                far
+            ),
+            HudStatus::TicketsOpen
+        );
     }
 
     #[test]

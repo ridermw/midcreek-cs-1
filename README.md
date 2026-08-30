@@ -383,15 +383,26 @@ plus one observable `HudReport`. There is no second ticket model to drift.
   square and a warning chip is a circle; the fault badge is sharp cornered, the
   repair badge is rounded, and the resolved badge is a full pill.
 - The status line below the rows is derived from live state only: a running
-  repair outranks everything, then a real out-of-range rejection while the
-  ticket it was about is still open, then the queue itself.
+  repair outranks everything, then a real out-of-range rejection while that
+  rejection is still true, then the queue itself. "Still true" is checked
+  against the one rack the rejection named, never against the queue as a whole:
+  `move_closer_still_stands` re-reads the live `TicketQueue`, that rack's live
+  `RackOperations`, its `RackRoster` collider, and the technician's live
+  position every frame, and the prompt falls through the moment that rack's
+  ticket leaves the queue, that rack stops being `Faulted`, or the technician
+  walks inside `REPAIR_INTERACTION_RANGE` of it. Another rack's open ticket can
+  never keep a stale "move closer" alive.
 - Badges are fixed-size screen-space UI nodes, never world-space sprites, so
   they never rotate, shear, or resize with the camera. Each is anchored every
   frame from a stable rack world point 2.4 m above the rack's collider centre,
   projected through the real `Camera::world_to_viewport`. The pass reads the
   camera's own `Transform` rather than its propagated `GlobalTransform`, because
   propagation runs in `PostUpdate` and a stale transform would make badges lag
-  the camera through every orbit tween.
+  the camera through every orbit tween. That substitution is only sound for an
+  unparented camera, so the query carries `Without<ChildOf>` and the invariant
+  is enforced rather than commented: a parented `CellShiftCamera` is refused as
+  unusable, reported as `HudError::NoCamera`, and every badge is hidden, rather
+  than being projected through a local transform pretending to be a global one.
 - A visible anchor always has a fully visible badge: the badge box is clamped
   inside the viewport and its thin leader line is rotated to end exactly on the
   projected anchor, whatever the heading. An anchor that projects off screen
@@ -410,7 +421,12 @@ plus one observable `HudReport`. There is no second ticket model to drift.
 rack's badge with the reason it is or is not drawn, the status, the movement
 lock, the viewport, and a list of typed `HudError`s. A rack that lost its
 `RackOperations`, a queue ticket whose rack is unknown, a missing badge or row
-node, and a missing game camera are all reported rather than quietly ignored.
+node, an unusable game camera, and a camera with no viewport are all reported
+rather than quietly ignored. Every failure has its own `BadgeVisibility`
+variant, so a report never explains one failure with another's name:
+`NoCamera` and `NoViewport` are distinct, `MissingRack` and `MissingBadgeNode`
+are distinct, and a missing badge node is recorded exactly once per frame
+rather than once on the write path and again on the hide path.
 
 HUD gates:
 
@@ -439,10 +455,28 @@ suite uses and query the real laid-out `ComputedNode` and `UiGlobalTransform`:
 - `operations_hud_draws_only_typed_palette_colors` walks every HUD node and
   rejects any background, border, or text colour that is not a `PaletteRole`,
   and requires every visible label to have produced real glyphs.
-- `operations_hud_reports_a_rack_that_lost_its_operational_state` and
-  `operations_hud_reports_a_missing_camera_instead_of_drawing_stale_badges`
-  fault-inject both failures into a running app and require the named typed
-  error, the hidden badge, and an otherwise intact queue stack.
+- `operations_hud_reports_a_rack_that_lost_its_operational_state`,
+  `operations_hud_reports_a_missing_camera_instead_of_drawing_stale_badges`,
+  `operations_hud_reports_a_camera_with_no_viewport_instead_of_guessing_one`,
+  and `operations_hud_reports_a_rack_with_no_badge_node_exactly_once`
+  fault-inject each failure into a running app and require the exact typed
+  error, the exact `BadgeVisibility`, the hidden badge and leader, and an
+  otherwise intact queue stack.
+- `operations_hud_refuses_a_parented_camera_instead_of_projecting_a_local_transform`
+  gives the real game camera a displaced parent, proves the propagated
+  `GlobalTransform` really has moved away from the local `Transform`, and
+  requires the HUD to report `NoCamera` and hide every badge instead of
+  projecting through the local transform -- then unparents it and requires the
+  whole badge pass to come back.
+- `operations_hud_shapes_the_severity_chip_by_severity_at_the_node_level` and
+  `operations_hud_draws_every_badge_shape_and_glyph_at_the_node_level` read the
+  real `Node::border_radius`, the real `RackBadgeLabel` glyph text, and the real
+  progress-bar `Node::width` off the laid-out nodes, so shape, glyph, and
+  progress are node-level contracts rather than assertions about the report.
+- `operations_hud_clears_the_move_closer_prompt_when_that_rack_changes_or_you_walk_in`
+  walks the technician in and out of range of the exact rack a real rejection
+  named, repairs that rack, and requires the prompt to clear on every
+  transition while other racks' tickets stay open.
 
 ## Foundation gates
 
