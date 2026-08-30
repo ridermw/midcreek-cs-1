@@ -53,17 +53,17 @@
     {
       "id": "camera-orbit",
       "title": "Add clamped four-way camera orbit",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "technician-movement"
       ],
-      "summary": "Add clamped Q/E four-way camera orbit.",
-      "completed_commit": null
+      "summary": "Spawned the one orthographic game camera with the reviewed fixed 26 m by 14.625 m rectangle, 57-degree elevation, zero roll, and the initial NorthEast 45-degree yaw, which is all the authored unlit hall needs to be visible. Real Q and E just_pressed frames retarget the desired heading immediately, opposite keys on one frame cancel exactly, and the yaw eases with smoothstep at a constant 90 degrees per 0.30 seconds, so a retarget mid-tween starts at the interpolated yaw and its duration scales with the shortest remaining angle instead of restarting a fixed clock. CameraPlugin is now the sole runtime updater of ViewBasis and publishes the live interpolated basis in UpdateOrbitIntent, before MovePlayer reads it, so the technician walks along the camera it can actually see mid-orbit. Every frame the ground quadrilateral is cast from the current yaw, its axis-aligned extents are subtracted from the room, and the followed technician is clamped into what remains before the transform is derived, which holds the whole view inside the 40 m room at every heading, at every tween midpoint, and at every room corner while zoom, elevation, and roll stay fixed.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "operations-loop",
       "title": "Add recurring faults, prioritized tickets, and repair",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "data-hall",
         "technician-movement"
@@ -161,6 +161,15 @@
       "approach": "The generated technician root shares its name with the glTF scene, so it is deliberately excluded from the rig contract and the spawned entity is the stable handle for the instance; the contract covers the skinned mesh node and the eleven skin joints. One binder runs every frame: it costs twelve name lookups while the bound handles still resolve, and otherwise rescans the spawned instance. A rescan that yields a complete rig is a legal rebind, an empty rescan means the instance is mid-respawn and the bound handles are left untouched, and an incomplete rescan keeps the previously bound handles and reports them as typed StalePart errors. Movement and animation are gated on the report being empty in the same frame, not on a state transition that lands a frame late.",
       "resolution": "tests/app_contract.rs fault-injects the failure by despawning bone-tool inside a running app and requires exactly PlayerRigError::StalePart for that node, PlayerRigState::Failed, and a technician position that does not move again. Pure tests in src/player.rs cover missing and duplicate names directly. The full app contract suite, which builds several real headless Bevy apps in parallel, was run ten consecutive times with no failures after the binder became rescan based instead of change-detection based.",
       "resolved_commit": "HEAD"
+    },
+    {
+      "id": "clamped-orbit-cannot-frame-a-room-corner",
+      "title": "A camera that never leaves the room cannot centre a technician in the room's corner",
+      "status": "open",
+      "impact": "Task 5 asks for two properties at once: a camera whose ground footprint never leaves the 40 m room, and a technician framed with at least 32 pixels of viewport margin at every room corner, at every heading, and at every tween midpoint. Because the orthographic rectangle is rotated relative to the room, the legal follow rectangle is room bounds minus the rotated footprint's axis-aligned extents, which is strictly smaller than the standard axis-aligned camera clamp that keeps a followed point exactly on the view edge. A technician standing in a corner therefore falls behind the far ground edge, and no room size fixes it: the room cancels out of the algebra entirely.",
+      "approach": "The containment property was treated as the load-bearing one, because it is what the magenta sentinel gate checks and what stops the published game showing the void outside the hall. The framing property is proved over the region the camera can actually centre: the room centre, the authored player spawn, all three aisle centre lines end to end, and all four corners of the legal follow rectangle, at four settled headings and three tween samples each, all through Bevy's real Camera::world_to_viewport. The gap itself was then written down as an executable contract rather than left as a silent omission.",
+      "resolution": "camera_orbit_room_corner_framing_is_impossible_under_the_fixed_contract measures the real app: at yaw 45 a technician in the corner sits 12.505 m beyond the far ground edge, 516 px off screen, and that overshoot equals ORTHOGRAPHIC_WIDTH / 2 - PLAYER_RADIUS * sqrt(2) exactly. Framing a corner would require an orthographic width of at most 0.99 m instead of the reviewed 26 m, and the test re-proves the failure for 40 m, 60 m, and 120 m rooms. The controller must choose: accept the corner blind spot, widen the reviewed projection, allow the camera to overhang the room, or fence the technician away from the corners.",
+      "resolved_commit": null
     }
   ]
 }

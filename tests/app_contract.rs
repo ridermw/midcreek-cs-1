@@ -7,7 +7,12 @@ use std::{
 
 use bevy::{
     asset::{AssetPlugin as BevyAssetPlugin, RecursiveDependencyLoadState},
+    camera::ScalingMode,
     color::palettes::css::BLACK,
+    input::{
+        ButtonState,
+        keyboard::{Key, KeyboardInput, NativeKey},
+    },
     prelude::*,
     render::{
         RenderPlugin,
@@ -21,6 +26,10 @@ use midcreek_cs_1::{
     assets::{
         AssetLoadReport, AssetLoadState, GENERATED_ASSET_DIRECTORY, GeneratedAssets, RenderAssets,
         generated_modules, module_for,
+    },
+    camera::{
+        CAMERA_DISTANCE, CameraHeading, CameraOrbit, CellShiftCamera, camera_target_bounds,
+        clamp_follow_target, ground_half_depth, ground_quadrilateral,
     },
     design::{
         AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
@@ -1769,7 +1778,14 @@ fn drive(app: &mut App, keys: &[KeyCode], frames: usize) {
     }
 }
 
+/// Settles the camera on the heading a yaw names. The camera plugin is the
+/// sole runtime updater of `ViewBasis`, so a test cannot poke the basis
+/// directly without having it overwritten on the next frame.
 fn set_heading(app: &mut App, degrees: f32) {
+    let heading = CameraHeading::from_yaw_degrees(degrees)
+        .unwrap_or_else(|| panic!("{degrees} degrees is not a settled heading"));
+    app.world_mut()
+        .insert_resource(CameraOrbit::settled(heading));
     app.world_mut()
         .resource_mut::<ViewBasis>()
         .set_yaw_degrees(degrees);
@@ -2567,4 +2583,652 @@ fn aisle_waypoint_journey_reaches_every_aisle_through_the_authored_hose_pinch() 
         app.world().resource::<PlayerAnimationState>().current(),
         PlayerClip::Idle
     );
+}
+
+// ---------------------------------------------------------------------------
+// Camera orbit and follow contracts
+// ---------------------------------------------------------------------------
+
+/// The margin, in logical pixels, the followed technician must keep from every
+/// viewport edge before the frame counts as framed.
+const FRAMING_MARGIN_PIXELS: f32 = 32.0;
+
+/// Frames of the fixed test step that make up one settled quarter turn.
+const QUARTER_TURN_FRAMES: usize = 18;
+
+fn orbit(app: &App) -> CameraOrbit {
+    *app.world().resource::<CameraOrbit>()
+}
+
+fn camera_entity(app: &mut App) -> Entity {
+    let entities = app
+        .world_mut()
+        .query_filtered::<Entity, With<CellShiftCamera>>()
+        .iter(app.world())
+        .collect::<Vec<_>>();
+    assert_eq!(entities.len(), 1, "exactly one game camera must exist");
+    entities[0]
+}
+
+fn camera_placement(app: &mut App) -> (Transform, GlobalTransform) {
+    let entity = camera_entity(app);
+    let transform = *app
+        .world()
+        .get::<Transform>(entity)
+        .expect("the camera carries a transform");
+    let global = *app
+        .world()
+        .get::<GlobalTransform>(entity)
+        .expect("the camera carries a propagated transform");
+    (transform, global)
+}
+
+/// The ground point the camera is centred on, recovered from the real camera
+/// transform rather than from the resource that produced it.
+fn camera_ground_target(app: &mut App) -> Vec2 {
+    let (transform, _) = camera_placement(app);
+    let forward = *transform.forward();
+    let travel = transform.translation.y / -forward.y;
+    let focus = transform.translation + forward * travel;
+    Vec2::new(focus.x, focus.z)
+}
+
+/// Viewport position of a ground point, through the real Bevy projection.
+fn viewport_of(app: &mut App, ground: Vec2) -> Vec2 {
+    let entity = camera_entity(app);
+    let global = *app
+        .world()
+        .get::<GlobalTransform>(entity)
+        .expect("the camera carries a propagated transform");
+    let camera = app
+        .world()
+        .get::<Camera>(entity)
+        .expect("the camera carries a Camera")
+        .clone();
+    camera
+        .world_to_viewport(&global, Vec3::new(ground.x, 0.0, ground.y))
+        .unwrap_or_else(|error| panic!("{ground:?} did not project: {error:?}"))
+}
+
+fn viewport_size(app: &mut App) -> Vec2 {
+    let entity = camera_entity(app);
+    app.world()
+        .get::<Camera>(entity)
+        .expect("the camera carries a Camera")
+        .logical_viewport_size()
+        .expect("the camera must know its viewport size")
+}
+
+/// Smallest distance from a projected ground point to any viewport edge.
+/// Negative when the point is off screen.
+fn framing_margin(app: &mut App, ground: Vec2) -> f32 {
+    let size = viewport_size(app);
+    let point = viewport_of(app, ground);
+    point
+        .x
+        .min(point.y)
+        .min(size.x - point.x)
+        .min(size.y - point.y)
+}
+
+/// Sends one real key press message, which is the only path that produces a
+/// `just_pressed` frame once `keyboard_input_system` has cleared the resource.
+fn key_message(app: &mut App, key: KeyCode, state: ButtonState) {
+    let window = app
+        .world_mut()
+        .query_filtered::<Entity, With<Window>>()
+        .iter(app.world())
+        .next()
+        .expect("the app has a primary window");
+    app.world_mut().write_message(KeyboardInput {
+        key_code: key,
+        logical_key: Key::Unidentified(NativeKey::Unidentified),
+        state,
+        text: None,
+        repeat: false,
+        window,
+    });
+}
+
+/// Presses and releases the given keys across exactly one frame.
+fn tap(app: &mut App, keys: &[KeyCode]) {
+    for key in keys {
+        key_message(app, *key, ButtonState::Pressed);
+    }
+    app.update();
+    for key in keys {
+        key_message(app, *key, ButtonState::Released);
+    }
+}
+
+/// Runs a settled quarter turn and asserts it lands exactly on the heading.
+fn settle_orbit(app: &mut App, key: KeyCode) -> CameraHeading {
+    tap(app, &[key]);
+    pump(app, QUARTER_TURN_FRAMES - 1);
+    let orbit = orbit(app);
+    assert!(
+        orbit.is_settled(),
+        "a quarter turn must settle in {QUARTER_TURN_FRAMES} frames, {} s remained",
+        orbit.remaining_seconds()
+    );
+    orbit.heading()
+}
+
+fn camera_app(assets: &Path) -> App {
+    let mut app = built_hall(assets);
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+        FIXED_STEP,
+    )));
+    app.update();
+    app
+}
+
+#[test]
+fn camera_orbit_spawns_one_orthographic_camera_with_the_reviewed_projection() {
+    let mut app = camera_app(&repo_assets());
+    let entity = camera_entity(&mut app);
+
+    assert!(
+        app.world().get::<Camera3d>(entity).is_some(),
+        "the game camera must be a real 3D camera"
+    );
+    let projection = app
+        .world()
+        .get::<Projection>(entity)
+        .expect("the camera carries a projection");
+    let Projection::Orthographic(orthographic) = projection else {
+        panic!("the reviewed camera must be orthographic, got {projection:?}");
+    };
+    assert!(
+        matches!(
+            orthographic.scaling_mode,
+            ScalingMode::Fixed { width, height }
+                if width == ORTHOGRAPHIC_WIDTH && height == ORTHOGRAPHIC_HEIGHT
+        ),
+        "the projection must stay a fixed 26 m by 14.625 m rectangle, got {:?}",
+        orthographic.scaling_mode
+    );
+    // `camera_system` recomputes `area` from the live window, so this proves
+    // the fixed rectangle survived the real 1280x720 target.
+    assert_eq!(
+        orthographic.area,
+        Rect::new(
+            -ORTHOGRAPHIC_WIDTH * 0.5,
+            -ORTHOGRAPHIC_HEIGHT * 0.5,
+            ORTHOGRAPHIC_WIDTH * 0.5,
+            ORTHOGRAPHIC_HEIGHT * 0.5,
+        )
+    );
+    assert_eq!(orthographic.scale, 1.0);
+    assert_eq!(
+        viewport_size(&mut app),
+        Vec2::new(DEFAULT_WINDOW_WIDTH as f32, DEFAULT_WINDOW_HEIGHT as f32)
+    );
+
+    // The authored hall is unlit, so the camera alone must make it visible.
+    assert_eq!(
+        app.world_mut()
+            .query::<&PointLight>()
+            .iter(app.world())
+            .count()
+            + app
+                .world_mut()
+                .query::<&DirectionalLight>()
+                .iter(app.world())
+                .count()
+            + app
+                .world_mut()
+                .query::<&SpotLight>()
+                .iter(app.world())
+                .count(),
+        0,
+        "the cel-shift hall must not need a light"
+    );
+    assert!(
+        app.world_mut()
+            .query::<&HallProp>()
+            .iter(app.world())
+            .count()
+            > 0
+    );
+}
+
+#[test]
+fn camera_orbit_projects_the_authored_metre_scale_onto_the_real_viewport() {
+    let mut app = camera_app(&repo_assets());
+    let size = viewport_size(&mut app);
+    let basis = view_basis(&app);
+    let focus = camera_ground_target(&mut app);
+
+    let centre = viewport_of(&mut app, focus);
+    assert!(
+        (centre - size * 0.5).abs().max_element() < 0.5,
+        "the followed ground point {focus:?} should project to the viewport centre, got {centre:?}"
+    );
+
+    // 26 m across the screen must be exactly 1280 logical pixels, and the
+    // fixed elevation must foreshorten the ground depth by sin(57 degrees).
+    let right_edge = viewport_of(&mut app, focus + basis.right() * ORTHOGRAPHIC_WIDTH * 0.5);
+    assert!(
+        (right_edge.x - size.x).abs() < 0.5 && (right_edge.y - size.y * 0.5).abs() < 0.5,
+        "13 m of screen right should land on the right edge, got {right_edge:?}"
+    );
+    let far_edge = viewport_of(
+        &mut app,
+        focus
+            + basis.forward() * ORTHOGRAPHIC_HEIGHT * 0.5
+                / CAMERA_ELEVATION_DEGREES.to_radians().sin(),
+    );
+    assert!(
+        (far_edge.y).abs() < 0.5 && (far_edge.x - size.x * 0.5).abs() < 0.5,
+        "the ground depth should land on the top edge, got {far_edge:?}"
+    );
+
+    // Every authored prop centre is inside the room, and the camera holds the
+    // whole ground footprint inside it.
+    for corner in ground_quadrilateral(orbit(&app).yaw_radians(), focus) {
+        assert!(
+            corner.x.abs() <= ROOM_SIZE.x * 0.5 + 1.0e-3
+                && corner.y.abs() <= ROOM_SIZE.y * 0.5 + 1.0e-3,
+            "the initial view already leaks past the room at {corner:?}"
+        );
+    }
+}
+
+#[test]
+fn camera_orbit_real_q_and_e_keys_walk_every_heading_in_both_directions() {
+    let mut app = camera_app(&repo_assets());
+    assert_eq!(orbit(&app).heading(), CameraHeading::NorthEast);
+
+    for expected in [
+        CameraHeading::SouthEast,
+        CameraHeading::SouthWest,
+        CameraHeading::NorthWest,
+        CameraHeading::NorthEast,
+    ] {
+        assert_eq!(settle_orbit(&mut app, KeyCode::KeyE), expected);
+        assert_heading(&mut app, expected);
+    }
+
+    for expected in [
+        CameraHeading::NorthWest,
+        CameraHeading::SouthWest,
+        CameraHeading::SouthEast,
+        CameraHeading::NorthEast,
+    ] {
+        assert_eq!(settle_orbit(&mut app, KeyCode::KeyQ), expected);
+        assert_heading(&mut app, expected);
+    }
+}
+
+/// Asserts the resource, the published basis, and the real camera entity all
+/// agree that the settled heading has been reached.
+fn assert_heading(app: &mut App, expected: CameraHeading) {
+    let orbit = orbit(app);
+    assert!(
+        (orbit.yaw_degrees() - expected.yaw_degrees()).abs() < 1.0e-2
+            || (orbit.yaw_degrees() - expected.yaw_degrees()).abs() > 359.99,
+        "{expected:?} should settle at {} degrees, got {}",
+        expected.yaw_degrees(),
+        orbit.yaw_degrees()
+    );
+    assert_eq!(
+        view_basis(app),
+        ViewBasis::from_yaw_radians(orbit.yaw_radians()),
+        "movement must read the settled basis"
+    );
+
+    let target = camera_ground_target(app);
+    let (transform, _) = camera_placement(app);
+    let offset = transform.translation - Vec3::new(target.x, 0.0, target.y);
+    let quadrant = match expected {
+        CameraHeading::NorthEast => Vec2::new(1.0, 1.0),
+        CameraHeading::SouthEast => Vec2::new(1.0, -1.0),
+        CameraHeading::SouthWest => Vec2::new(-1.0, -1.0),
+        CameraHeading::NorthWest => Vec2::new(-1.0, 1.0),
+    };
+    assert_eq!(
+        Vec2::new(offset.x.signum(), offset.z.signum()),
+        quadrant,
+        "{expected:?} must put the real camera in its own compass quadrant, offset {offset:?}"
+    );
+    assert!(
+        (offset.length() - CAMERA_DISTANCE).abs() < 1.0e-2,
+        "the zoom must not change with the heading"
+    );
+    let elevation = (-transform.forward().y).asin().to_degrees();
+    assert!(
+        (elevation - CAMERA_ELEVATION_DEGREES).abs() < 1.0e-2,
+        "{expected:?} elevation drifted to {elevation}"
+    );
+    assert!(
+        transform.right().y.abs() < 1.0e-5,
+        "{expected:?} introduced roll"
+    );
+}
+
+#[test]
+fn camera_orbit_cancels_opposing_keys_and_retargets_mid_tween_in_the_real_app() {
+    let mut app = camera_app(&repo_assets());
+
+    // Half a quarter turn in, both keys on one frame must change nothing.
+    tap(&mut app, &[KeyCode::KeyE]);
+    pump(&mut app, QUARTER_TURN_FRAMES / 2 - 1);
+    let midpoint = orbit(&app);
+    assert!(
+        (midpoint.yaw_degrees() - 90.0).abs() < 1.0e-2,
+        "the tween midpoint should be 90 degrees, got {}",
+        midpoint.yaw_degrees()
+    );
+    tap(&mut app, &[KeyCode::KeyQ, KeyCode::KeyE]);
+    let after = orbit(&app);
+    assert_eq!(
+        after.heading(),
+        CameraHeading::SouthEast,
+        "opposing keys on one frame must not retarget"
+    );
+    assert!(
+        (after.duration_seconds() - CAMERA_ORBIT_DURATION_SECONDS).abs() < 1.0e-6,
+        "opposing keys on one frame must not re-time the turn, got {}",
+        after.duration_seconds()
+    );
+    pump(&mut app, QUARTER_TURN_FRAMES / 2 - 1);
+    assert_heading(&mut app, CameraHeading::SouthEast);
+
+    // A reversal mid-tween starts at the interpolated yaw and keeps the rate,
+    // so it needs exactly the frames the remaining angle costs.
+    tap(&mut app, &[KeyCode::KeyE]);
+    pump(&mut app, QUARTER_TURN_FRAMES / 2 - 1);
+    tap(&mut app, &[KeyCode::KeyQ]);
+    let reversed = orbit(&app);
+    assert_eq!(reversed.heading(), CameraHeading::SouthEast);
+    assert!(
+        (reversed.duration_seconds() - CAMERA_ORBIT_DURATION_SECONDS * 0.5).abs() < 1.0e-6,
+        "a 45 degree reversal must take 0.15 s, got {}",
+        reversed.duration_seconds()
+    );
+    pump(&mut app, QUARTER_TURN_FRAMES / 2 - 1);
+    assert_heading(&mut app, CameraHeading::SouthEast);
+
+    // A second turn queued mid-tween takes the longer, still constant-rate path.
+    tap(&mut app, &[KeyCode::KeyE]);
+    pump(&mut app, QUARTER_TURN_FRAMES / 2 - 1);
+    tap(&mut app, &[KeyCode::KeyE]);
+    let queued = orbit(&app);
+    assert_eq!(queued.heading(), CameraHeading::NorthWest);
+    assert!(
+        (queued.duration_seconds() - CAMERA_ORBIT_DURATION_SECONDS * 1.5).abs() < 1.0e-6,
+        "a 135 degree retarget must take 0.45 s, got {}",
+        queued.duration_seconds()
+    );
+    pump(&mut app, QUARTER_TURN_FRAMES * 3 / 2 - 1);
+    assert_heading(&mut app, CameraHeading::NorthWest);
+}
+
+/// Records the basis every consumer set saw, in the frame it saw it.
+#[derive(Resource, Default)]
+struct BasisTrace(Vec<(f32, f32, f32)>);
+
+fn trace_basis_before_movement(
+    orbit: Res<CameraOrbit>,
+    basis: Res<ViewBasis>,
+    mut trace: ResMut<BasisTrace>,
+) {
+    trace
+        .0
+        .push((orbit.yaw_degrees(), basis.yaw_degrees(), basis.forward().x));
+}
+
+#[test]
+fn camera_orbit_publishes_the_interpolated_basis_before_movement_every_frame() {
+    let mut app = camera_app(&repo_assets());
+    app.init_resource::<BasisTrace>().add_systems(
+        Update,
+        trace_basis_before_movement.in_set(CellShiftSet::MovePlayer),
+    );
+
+    tap(&mut app, &[KeyCode::KeyE]);
+    pump(&mut app, QUARTER_TURN_FRAMES - 1);
+
+    let trace = app.world().resource::<BasisTrace>().0.clone();
+    assert_eq!(
+        trace.len(),
+        QUARTER_TURN_FRAMES,
+        "the probe must see every frame of the turn"
+    );
+    for (index, (orbit_yaw, basis_yaw, forward_x)) in trace.iter().enumerate() {
+        assert!(
+            (orbit_yaw - basis_yaw).abs() < 1.0e-4,
+            "frame {index} let movement read a stale basis: orbit {orbit_yaw}, basis {basis_yaw}"
+        );
+        assert!(
+            (forward_x + basis_yaw.to_radians().sin()).abs() < 1.0e-4,
+            "frame {index} basis forward disagrees with its own yaw"
+        );
+    }
+    let yaws = trace.iter().map(|entry| entry.1).collect::<Vec<_>>();
+    assert!(
+        yaws[0] > 45.0 && yaws[0] < 46.0,
+        "the first frame of the turn should have barely moved, got {}",
+        yaws[0]
+    );
+    assert!(
+        yaws.windows(2).all(|pair| pair[1] > pair[0]),
+        "the basis must advance every single frame, got {yaws:?}"
+    );
+    assert!(
+        (yaws[QUARTER_TURN_FRAMES - 1] - 135.0).abs() < 1.0e-2,
+        "the last frame should be settled, got {}",
+        yaws[QUARTER_TURN_FRAMES - 1]
+    );
+}
+
+#[test]
+fn camera_orbit_moves_the_technician_along_the_live_mid_tween_basis() {
+    let mut app = walking_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+
+    tap(&mut app, &[KeyCode::KeyE]);
+    hold(&mut app, &[KeyCode::ArrowUp]);
+
+    for frame in 0..(QUARTER_TURN_FRAMES - 1) {
+        let before = player_position(&mut app);
+        app.update();
+        let basis = view_basis(&app);
+        let accepted = player_position(&mut app) - before;
+        assert!(
+            accepted.length() > 1.0e-4,
+            "frame {frame} of the orbit stopped the technician"
+        );
+        assert!(
+            (accepted.normalize() - basis.forward()).abs().max_element() < 1.0e-3,
+            "frame {frame} moved along {:?} instead of the live basis {:?}",
+            accepted.normalize(),
+            basis.forward()
+        );
+    }
+    assert_eq!(orbit(&app).heading(), CameraHeading::SouthEast);
+}
+
+/// Ground positions the camera must frame: the room centre, the authored
+/// player spawn, every aisle end, and the corners of the legal rectangle.
+fn framing_samples(yaw_radians: f32) -> Vec<Vec2> {
+    let mut samples = vec![Vec2::ZERO, SceneBlueprint::v0().player_spawn];
+    for center_x in AISLE_CENTER_X {
+        samples.push(Vec2::new(center_x, AISLE_Z_MIN));
+        samples.push(Vec2::new(center_x, AISLE_Z_MAX));
+        samples.push(Vec2::new(center_x, 0.0));
+    }
+    let (min, max) = camera_target_bounds(ROOM_SIZE, yaw_radians)
+        .expect("the authored room must always have a legal rectangle");
+    samples.extend([min, max, Vec2::new(min.x, max.y), Vec2::new(max.x, min.y)]);
+    samples
+}
+
+/// Drives the camera to `yaw` by settling the nearest heading and then running
+/// a real turn for the requested number of frames.
+fn orbit_to(app: &mut App, heading: CameraHeading, frames: usize) {
+    app.world_mut()
+        .insert_resource(CameraOrbit::settled(heading));
+    if frames > 0 {
+        tap(app, &[KeyCode::KeyE]);
+        pump(app, frames - 1);
+    }
+    app.update();
+}
+
+#[test]
+fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
+    let mut app = walking_hall(&repo_assets());
+    let half = ROOM_SIZE * 0.5;
+
+    for heading in CameraHeading::ALL {
+        // A settled heading, then the exact midpoint of the turn that leaves it.
+        for frames in [0, QUARTER_TURN_FRAMES / 2, QUARTER_TURN_FRAMES / 4] {
+            orbit_to(&mut app, heading, frames);
+            let yaw = orbit(&app).yaw_radians();
+            let bounds = camera_target_bounds(ROOM_SIZE, yaw);
+            let (min, max) = bounds.unwrap_or_else(|| {
+                panic!("yaw {} has no legal target rectangle", yaw.to_degrees())
+            });
+            assert!(
+                max.min_element() > 0.0,
+                "yaw {} collapsed the legal rectangle to {min:?}..{max:?}",
+                yaw.to_degrees()
+            );
+
+            for sample in framing_samples(yaw) {
+                place_player(&mut app, sample);
+                app.update();
+                let yaw = orbit(&app).yaw_radians();
+                let target = camera_ground_target(&mut app);
+                let expected = clamp_follow_target(sample, ROOM_SIZE, yaw);
+                assert!(
+                    (target - expected).abs().max_element() < 1.0e-3,
+                    "yaw {} following {sample:?} settled on {target:?}, expected {expected:?}",
+                    yaw.to_degrees()
+                );
+
+                for corner in ground_quadrilateral(yaw, target) {
+                    assert!(
+                        corner.x.abs() <= half.x + 1.0e-3 && corner.y.abs() <= half.y + 1.0e-3,
+                        "yaw {} following {sample:?} pushed a ground corner to {corner:?}",
+                        yaw.to_degrees()
+                    );
+                }
+
+                let margin = framing_margin(&mut app, sample);
+                assert!(
+                    margin >= FRAMING_MARGIN_PIXELS,
+                    "yaw {} framed {sample:?} with only {margin} px of margin",
+                    yaw.to_degrees()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn camera_orbit_holds_the_room_edge_instead_of_leaking_past_it() {
+    let mut app = walking_hall(&repo_assets());
+    let reachable = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
+    let half = ROOM_SIZE * 0.5;
+
+    // Every room corner, at every heading and at the tween midpoints between
+    // them. The clamp is a hard containment guarantee: the camera stops at the
+    // room edge rather than following the technician out of it.
+    for heading in CameraHeading::ALL {
+        for frames in [0, QUARTER_TURN_FRAMES / 2] {
+            orbit_to(&mut app, heading, frames);
+            for corner in [
+                reachable,
+                -reachable,
+                Vec2::new(reachable.x, -reachable.y),
+                Vec2::new(-reachable.x, reachable.y),
+            ] {
+                place_player(&mut app, corner);
+                app.update();
+                let yaw = orbit(&app).yaw_radians();
+                let (_, max) = camera_target_bounds(ROOM_SIZE, yaw).expect("legal rectangle");
+                let target = camera_ground_target(&mut app);
+
+                assert!(
+                    (target.abs() - max).abs().max_element() < 1.0e-3,
+                    "yaw {} at corner {corner:?} should sit on the legal edge {max:?}, got {target:?}",
+                    yaw.to_degrees()
+                );
+                for ground in ground_quadrilateral(yaw, target) {
+                    assert!(
+                        ground.x.abs() <= half.x + 1.0e-3 && ground.y.abs() <= half.y + 1.0e-3,
+                        "yaw {} at corner {corner:?} leaked to {ground:?}",
+                        yaw.to_degrees()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn camera_orbit_room_corner_framing_is_impossible_under_the_fixed_contract() {
+    // Recorded plan defect. Task 5 asks for both a camera that never shows
+    // anything outside the room and a technician framed at every room corner.
+    // At a diagonal heading the two cannot hold together for any room size.
+    //
+    // At yaw 45 the whole diagonal footprint separates the legal target from
+    // the corner, so the technician sits
+    // `ORTHOGRAPHIC_WIDTH / 2 - PLAYER_RADIUS * sqrt(2)` metres beyond the far
+    // ground edge. The room size cancels out of that expression: framing a
+    // corner would need `ORTHOGRAPHIC_WIDTH <= 2 * PLAYER_RADIUS * sqrt(2)`,
+    // which is 0.99 m rather than the reviewed 26 m.
+    let mut app = walking_hall(&repo_assets());
+    let corner = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
+    orbit_to(&mut app, CameraHeading::NorthEast, 0);
+    place_player(&mut app, corner);
+    app.update();
+
+    let yaw = orbit(&app).yaw_radians();
+    let basis = ViewBasis::from_yaw_radians(yaw);
+    let target = camera_ground_target(&mut app);
+    let behind = (corner - target).dot(basis.forward());
+    let half_depth = ground_half_depth();
+    let overshoot = -behind - half_depth;
+
+    let closed_form = ORTHOGRAPHIC_WIDTH * 0.5 - PLAYER_RADIUS * std::f32::consts::SQRT_2;
+    assert!(
+        (overshoot - closed_form).abs() < 1.0e-3 && (overshoot - 12.505).abs() < 1.0e-2,
+        "the corner technician should fall 12.505 m past the far edge, got {overshoot}"
+    );
+    let off_screen_pixels = overshoot * CAMERA_ELEVATION_DEGREES.to_radians().sin()
+        / ORTHOGRAPHIC_HEIGHT
+        * DEFAULT_WINDOW_HEIGHT as f32;
+    assert!(
+        (off_screen_pixels - 516.3).abs() < 1.0,
+        "the corner technician should be 516 px off screen, got {off_screen_pixels}"
+    );
+    assert!(
+        framing_margin(&mut app, corner) < 0.0,
+        "the recorded defect requires the corner technician to be off screen"
+    );
+
+    // The algebra, not the authored room, is what makes this unreachable.
+    let widest_framable_view = 2.0 * PLAYER_RADIUS * std::f32::consts::SQRT_2;
+    assert!(
+        (widest_framable_view - 0.9899).abs() < 1.0e-3,
+        "the widest corner-framing view should be 0.99 m, got {widest_framable_view}"
+    );
+    assert!(
+        ORTHOGRAPHIC_WIDTH > widest_framable_view,
+        "the reviewed 26 m view is far wider than any corner-framing view"
+    );
+    for room in [40.0_f32, 60.0, 120.0] {
+        let size = Vec2::splat(room);
+        let reachable = size * 0.5 - Vec2::splat(PLAYER_RADIUS);
+        let target = clamp_follow_target(reachable, size, yaw);
+        let behind = -(reachable - target).dot(basis.forward());
+        assert!(
+            behind > half_depth,
+            "a {room} m room still cannot frame its corner: {behind} m of {half_depth} m"
+        );
+    }
 }

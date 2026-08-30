@@ -165,6 +165,64 @@ running app to prove movement stops while it is unavailable, recovers on its
 own when a complete rig returns, and names the specific missing or duplicated
 node when the replacement is incomplete.
 
+## Clamped four-way camera orbit
+
+`src/camera.rs` owns the one game camera and is the sole runtime updater of
+`ViewBasis`. Movement still never reads a camera entity.
+
+- One orthographic `Camera3d` renders a fixed 26 m by 14.625 m rectangle at 57
+  degrees of elevation with zero roll, so zoom and pitch never change with the
+  heading or the window. The authored hall is unlit, so the camera alone makes
+  it visible and the app spawns no light at all.
+- `CameraHeading` names the compass quadrant the camera itself occupies, on a
+  map whose north is `+Z` and whose east is `+X`. `NorthEast` is the reviewed
+  initial 45-degree view, and the declared order `NE -> SE -> SW -> NW` is the
+  clockwise one `E` walks.
+- Real `Q`/`E` `just_pressed` frames retarget the desired heading immediately;
+  holding a key never spins the camera, and both keys on one frame cancel
+  exactly, leaving the running turn untouched rather than restarting it.
+- The yaw eases with smoothstep at a constant 90 degrees per 0.30 seconds. A
+  settled quarter turn therefore takes exactly 0.30 s, and a turn retargeted
+  mid-tween starts at the interpolated yaw and takes only what the shortest
+  remaining angle costs: 0.15 s to reverse from the midpoint, 0.45 s to queue a
+  second quarter turn from it.
+- The interpolated basis is published in `UpdateOrbitIntent`, before
+  `MovePlayer` reads it, so the technician walks along the camera it can see on
+  that frame rather than the one from the frame before.
+- Every frame the ground quadrilateral is cast from the current yaw, its
+  axis-aligned extents are subtracted from the room, and the followed
+  technician is clamped into what is left before the transform is derived. The
+  footprint is widest between headings, not at one, so the tightest legal
+  rectangle of a whole orbit -- 4.3468 m, at yaw 33.851 degrees -- is a state
+  only a mid-tween frame reaches. The blueprint validator now checks those two
+  extremal yaws as well as the eight sampled ones.
+
+Camera gates:
+
+```bash
+cargo test camera
+cargo test --test app_contract camera_orbit
+```
+
+The orbit contracts drive real `KeyboardInput` messages through the same
+headless app the hall and movement contracts use, then measure the spawned
+camera entity: its heading quadrant, fixed distance, elevation, and roll, its
+recovered ground target, and its projected framing through Bevy's real
+`Camera::world_to_viewport`. Framing is asserted at the room centre, the
+authored player spawn, all three aisle centre lines end to end, and all four
+corners of the legal follow rectangle, at four settled headings and three tween
+samples each.
+
+**Known gap.** A camera whose footprint never leaves the room cannot also
+centre a technician standing in the room's corner. Because the view rectangle
+is rotated relative to the room, a cornered technician ends up
+`ORTHOGRAPHIC_WIDTH / 2 - PLAYER_RADIUS * sqrt(2)` = 12.505 m beyond the far
+ground edge, 516 px off screen, and the room size cancels out of that
+expression entirely. Containment is treated as the load-bearing property and
+the blind spot is recorded as an executable contract,
+`camera_orbit_room_corner_framing_is_impossible_under_the_fixed_contract`,
+rather than left silent. See the published challenge for the four ways out.
+
 ## Foundation gates
 
 ```bash

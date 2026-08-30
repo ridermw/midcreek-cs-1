@@ -780,9 +780,11 @@ impl SceneBlueprint {
             }
         }
 
-        for yaw_degrees in [45_u16, 90, 135, 180, 225, 270, 315, 0] {
-            if camera_target_interval(self.room, yaw_degrees as f32).is_none() {
-                errors.push(SceneValidationError::EmptyCameraTargetInterval { yaw_degrees });
+        for yaw in camera_validation_yaws() {
+            if camera_target_interval(self.room, yaw).is_none() {
+                errors.push(SceneValidationError::EmptyCameraTargetInterval {
+                    yaw_degrees: (yaw.round() as i64).rem_euclid(360) as u16,
+                });
             }
         }
 
@@ -996,16 +998,19 @@ fn grid_neighbors(
     neighbors.into_iter().take(count)
 }
 
-fn camera_target_interval(room: RoomSpec, yaw_degrees: f32) -> Option<(Vec2, Vec2)> {
-    let yaw = yaw_degrees.to_radians();
-    let half_view_width = ORTHOGRAPHIC_WIDTH * 0.5;
-    let half_ground_depth = ORTHOGRAPHIC_HEIGHT * 0.5 / CAMERA_ELEVATION_DEGREES.to_radians().sin();
-    let footprint = Vec2::new(
-        yaw.cos().abs() * half_view_width + yaw.sin().abs() * half_ground_depth,
-        yaw.sin().abs() * half_view_width + yaw.cos().abs() * half_ground_depth,
-    );
-    let half_room = room.size * 0.5;
-    let remaining = half_room - footprint;
+/// Every yaw the room must be able to frame: the four settled headings, the
+/// four half-way yaws a tween passes through, and the two yaws at which the
+/// ground footprint is widest. The widest yaws lie between headings, so a
+/// sampled-headings-only check would accept a room the camera cannot hold
+/// halfway through a real orbit.
+fn camera_validation_yaws() -> Vec<f32> {
+    let mut yaws = vec![45.0_f32, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0, 0.0];
+    for peak in crate::camera::widest_footprint_yaws() {
+        yaws.push(peak.to_degrees());
+    }
+    yaws
+}
 
-    (remaining.min_element() >= 0.0).then(|| (-remaining, remaining))
+fn camera_target_interval(room: RoomSpec, yaw_degrees: f32) -> Option<(Vec2, Vec2)> {
+    crate::camera::camera_target_bounds(room.size, yaw_degrees.to_radians())
 }

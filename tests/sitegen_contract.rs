@@ -456,7 +456,10 @@ mod progress_contract {
                 .expect("sitegen should launch");
 
             assert_eq!(output.status.code(), Some(0));
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), "camera-orbit\n");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "operations-loop\n"
+            );
             assert!(output.stderr.is_empty());
         }
     }
@@ -508,14 +511,14 @@ mod progress_contract {
                 ),
                 (
                     "camera-orbit",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["technician-movement"][..],
-                    "Add clamped Q/E four-way camera orbit.",
-                    None,
+                    "Spawned the one orthographic game camera with the reviewed fixed 26 m by 14.625 m rectangle, 57-degree elevation, zero roll, and the initial NorthEast 45-degree yaw, which is all the authored unlit hall needs to be visible. Real Q and E just_pressed frames retarget the desired heading immediately, opposite keys on one frame cancel exactly, and the yaw eases with smoothstep at a constant 90 degrees per 0.30 seconds, so a retarget mid-tween starts at the interpolated yaw and its duration scales with the shortest remaining angle instead of restarting a fixed clock. CameraPlugin is now the sole runtime updater of ViewBasis and publishes the live interpolated basis in UpdateOrbitIntent, before MovePlayer reads it, so the technician walks along the camera it can actually see mid-orbit. Every frame the ground quadrilateral is cast from the current yaw, its axis-aligned extents are subtracted from the room, and the followed technician is clamped into what remains before the transform is derived, which holds the whole view inside the 40 m room at every heading, at every tween midpoint, and at every room corner while zoom, elevation, and roll stay fixed.",
+                    Some("HEAD"),
                 ),
                 (
                     "operations-loop",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["data-hall", "technician-movement"][..],
                     "Add recurring prioritized faults, tickets, and repair.",
                     None,
@@ -588,21 +591,44 @@ mod progress_contract {
                     "byte-reproducible-assets-without-a-dcc",
                     "loud-asset-loading-without-a-gpu",
                     "rig-handles-that-survive-instance-respawn",
+                    "clamped-orbit-cannot-frame-a-room-corner",
                 ]
             );
             for challenge in &document.challenges {
                 assert!(!challenge.title.trim().is_empty());
                 assert!(!challenge.impact.trim().is_empty());
                 assert!(!challenge.approach.trim().is_empty());
-                assert_eq!(challenge.status, ChallengeStatus::Resolved);
                 assert!(
                     challenge
                         .resolution
                         .as_deref()
-                        .is_some_and(|resolution| !resolution.trim().is_empty())
+                        .is_some_and(|resolution| !resolution.trim().is_empty()),
+                    "{} must record what was actually done about it",
+                    challenge.id
                 );
-                assert_eq!(challenge.resolved_commit.as_deref(), Some("HEAD"));
+                // An open challenge still carries its full context, but it has
+                // no commit that closed it, because nothing has.
+                match challenge.status {
+                    ChallengeStatus::Resolved => {
+                        assert_eq!(challenge.resolved_commit.as_deref(), Some("HEAD"))
+                    }
+                    _ => assert_eq!(
+                        challenge.resolved_commit, None,
+                        "{} is not resolved, so it must not claim a resolving commit",
+                        challenge.id
+                    ),
+                }
             }
+            assert_eq!(
+                document
+                    .challenges
+                    .iter()
+                    .filter(|challenge| challenge.status != ChallengeStatus::Resolved)
+                    .map(|challenge| challenge.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["clamped-orbit-cannot-frame-a-room-corner"],
+                "the corner-framing gap is the only open challenge"
+            );
         }
 
         #[test]
