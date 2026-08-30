@@ -13,10 +13,11 @@ use bevy::{
         RenderPlugin,
         settings::{RenderCreation, WgpuSettings},
     },
+    time::TimeUpdateStrategy,
 };
 use midcreek_cs_1::{
     CellShiftPlugin, CellShiftSet,
-    assetgen::{ASSET_MODULES, ASSET_NAMES, generate_glb, load_source},
+    assetgen::{ASSET_MODULES, ASSET_NAMES, TECHNICIAN_BONES, generate_glb, load_source},
     assets::{
         AssetLoadReport, AssetLoadState, GENERATED_ASSET_DIRECTORY, GeneratedAssets, RenderAssets,
         generated_modules, module_for,
@@ -36,6 +37,11 @@ use midcreek_cs_1::{
         VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WALKABLE_CELL_SIZE,
         WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT, WORKER_HI_VIS, WORKER_SKIN,
         WORKER_SLATE, WORKER_TROUSERS,
+    },
+    player::{
+        PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip, PlayerMotion,
+        PlayerParts, PlayerRigError, PlayerRigReport, PlayerRigState, TECHNICIAN_MODEL_FORWARD,
+        Technician, ViewBasis, arrow_input, required_player_parts, update_player_animation,
     },
     world::{
         HallBlueprint, HallColliders, HallErrors, HallProp, HallRoot, HallState, PlayerSpawnPoint,
@@ -1631,4 +1637,660 @@ fn design_plugin_configures_shared_system_sets_in_reviewed_order() {
         ]
     );
     assert_ne!(app.world().resource::<ClearColor>().0, Color::Srgba(BLACK));
+}
+
+// ---------------------------------------------------------------------------
+// Technician movement contracts
+// ---------------------------------------------------------------------------
+
+/// Every arrow-key combination the movement matrix must define, including the
+/// empty press and both opposing pairs.
+const ARROW_MATRIX: [&[KeyCode]; 10] = [
+    &[],
+    &[KeyCode::ArrowLeft, KeyCode::ArrowRight],
+    &[KeyCode::ArrowUp, KeyCode::ArrowDown],
+    &[KeyCode::ArrowUp],
+    &[KeyCode::ArrowDown],
+    &[KeyCode::ArrowLeft],
+    &[KeyCode::ArrowRight],
+    &[KeyCode::ArrowUp, KeyCode::ArrowRight],
+    &[KeyCode::ArrowUp, KeyCode::ArrowLeft],
+    &[KeyCode::ArrowDown, KeyCode::ArrowRight],
+];
+
+/// The eight real key combinations the waypoint driver may choose from.
+const DRIVE_KEYS: [&[KeyCode]; 8] = [
+    &[KeyCode::ArrowUp],
+    &[KeyCode::ArrowDown],
+    &[KeyCode::ArrowLeft],
+    &[KeyCode::ArrowRight],
+    &[KeyCode::ArrowUp, KeyCode::ArrowRight],
+    &[KeyCode::ArrowUp, KeyCode::ArrowLeft],
+    &[KeyCode::ArrowDown, KeyCode::ArrowRight],
+    &[KeyCode::ArrowDown, KeyCode::ArrowLeft],
+];
+
+const HEADINGS: [f32; 4] = [45.0, 135.0, 225.0, 315.0];
+const FIXED_STEP: f64 = 1.0 / 60.0;
+
+fn rig_is_bound(app: &mut App) -> bool {
+    if !app.world().resource::<PlayerRigReport>().is_healthy() {
+        return false;
+    }
+    let Some(parts) = app.world().get_resource::<PlayerParts>().cloned() else {
+        return false;
+    };
+    parts.all().iter().all(|part| {
+        app.world().get::<Name>(part.entity).map(Name::as_str) == Some(part.name.as_str())
+    })
+}
+
+/// Boots the hall, then settles the technician.
+///
+/// Bevy respawns a glTF world instance when a sub-asset event arrives, which
+/// happens in `SpawnScene` after `Update`. Systems always rebind before they
+/// consume the rig, but a test reads between frames, so the harness waits for a
+/// run of frames in which the bound handles still resolve.
+fn walking_hall(assets: &Path) -> App {
+    let mut app = built_hall(assets);
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+        FIXED_STEP,
+    )));
+    let mut stable = 0usize;
+    for _ in 0..600 {
+        app.update();
+        let state = *app.world().resource::<State<PlayerRigState>>().get();
+        match state {
+            PlayerRigState::Failed => panic!(
+                "technician rig failed: {:?}",
+                app.world().resource::<PlayerRigReport>().errors()
+            ),
+            PlayerRigState::Ready if rig_is_bound(&mut app) => {
+                stable += 1;
+                if stable >= 30 {
+                    return app;
+                }
+            }
+            PlayerRigState::Ready | PlayerRigState::Pending => stable = 0,
+        }
+    }
+    panic!("the technician rig never settled into a stable bound state");
+}
+
+fn technician_entity(app: &mut App) -> Entity {
+    let entities = app
+        .world_mut()
+        .query_filtered::<Entity, With<Technician>>()
+        .iter(app.world())
+        .collect::<Vec<_>>();
+    assert_eq!(entities.len(), 1, "exactly one technician must exist");
+    entities[0]
+}
+
+fn technician_transform(app: &mut App) -> Transform {
+    let entity = technician_entity(app);
+    *app.world()
+        .get::<Transform>(entity)
+        .expect("the technician carries a transform")
+}
+
+fn player_position(app: &mut App) -> Vec2 {
+    let transform = technician_transform(app);
+    Vec2::new(transform.translation.x, transform.translation.z)
+}
+
+fn player_facing(app: &mut App) -> Vec2 {
+    (technician_transform(app).rotation * TECHNICIAN_MODEL_FORWARD).xz()
+}
+
+fn place_player(app: &mut App, position: Vec2) {
+    let entity = technician_entity(app);
+    let mut transform = app
+        .world_mut()
+        .get_mut::<Transform>(entity)
+        .expect("the technician carries a transform");
+    transform.translation.x = position.x;
+    transform.translation.z = position.y;
+}
+
+fn hold(app: &mut App, keys: &[KeyCode]) {
+    let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+    input.release_all();
+    for key in keys {
+        input.press(*key);
+    }
+}
+
+fn drive(app: &mut App, keys: &[KeyCode], frames: usize) {
+    hold(app, keys);
+    for _ in 0..frames {
+        app.update();
+    }
+}
+
+fn set_heading(app: &mut App, degrees: f32) {
+    app.world_mut()
+        .resource_mut::<ViewBasis>()
+        .set_yaw_degrees(degrees);
+}
+
+fn view_basis(app: &App) -> ViewBasis {
+    *app.world().resource::<ViewBasis>()
+}
+
+fn animation_player(
+    app: &mut App,
+) -> (
+    AnimationNodeIndex,
+    AnimationNodeIndex,
+    Vec<AnimationNodeIndex>,
+) {
+    let animations = app.world().resource::<PlayerAnimations>().clone();
+    let playing = app
+        .world()
+        .get::<AnimationPlayer>(animations.player)
+        .expect("the technician exposes an AnimationPlayer")
+        .playing_animations()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    (
+        animations.node(PlayerClip::Idle),
+        animations.node(PlayerClip::Walk),
+        playing,
+    )
+}
+
+fn part_transforms(app: &mut App) -> Vec<(String, Transform, Transform)> {
+    let parts = app.world().resource::<PlayerParts>().clone();
+    parts
+        .all()
+        .iter()
+        .map(|part| {
+            (
+                part.name.clone(),
+                *app.world()
+                    .get::<Transform>(part.entity)
+                    .unwrap_or_else(|| panic!("{} must still exist", part.name)),
+                part.rest,
+            )
+        })
+        .collect()
+}
+
+/// Chooses the real key combination whose world direction best matches the
+/// direction the route wants next. The journey therefore moves only through
+/// accepted `ButtonInput<KeyCode>` state, never by writing a transform.
+fn keys_towards(basis: &ViewBasis, desired: Vec2) -> &'static [KeyCode] {
+    let desired = desired.normalize_or_zero();
+    DRIVE_KEYS
+        .into_iter()
+        .max_by(|left, right| {
+            let score = |keys: &[KeyCode]| {
+                let mut input = ButtonInput::default();
+                for key in keys {
+                    input.press(*key);
+                }
+                basis.world_direction(arrow_input(&input)).dot(desired)
+            };
+            score(left)
+                .partial_cmp(&score(right))
+                .expect("world directions are finite")
+        })
+        .expect("the drive matrix is not empty")
+}
+
+#[derive(Resource, Default)]
+struct RestProbe(Vec<(String, Transform, Transform)>);
+
+fn capture_rest_probe(
+    state: Res<PlayerAnimationState>,
+    parts: Res<PlayerParts>,
+    transforms: Query<&Transform>,
+    mut probe: ResMut<RestProbe>,
+) {
+    if !state.is_changed() || state.current() != PlayerClip::Idle {
+        return;
+    }
+    probe.0 = parts
+        .all()
+        .iter()
+        .map(|part| {
+            (
+                part.name.clone(),
+                *transforms
+                    .get(part.entity)
+                    .expect("every discovered part exists"),
+                part.rest,
+            )
+        })
+        .collect();
+}
+
+#[test]
+fn player_spawns_the_rigged_technician_only_after_the_hall_is_ready() {
+    let mut app = hall_app(&repo_assets());
+    assert_eq!(
+        *app.world().resource::<State<PlayerRigState>>().get(),
+        PlayerRigState::Pending
+    );
+    assert_eq!(
+        app.world_mut()
+            .query_filtered::<Entity, With<Technician>>()
+            .iter(app.world())
+            .count(),
+        0,
+        "nothing may spawn while the generated assets are still loading"
+    );
+    assert_eq!(view_basis(&app), ViewBasis::from_yaw_degrees(45.0));
+
+    let mut app = walking_hall(&repo_assets());
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Ready
+    );
+    let spawned = player_position(&mut app);
+    assert_eq!(spawned, app.world().resource::<PlayerSpawnPoint>().0);
+    assert!(
+        app.world()
+            .resource::<HallColliders>()
+            .first_overlap(spawned, PLAYER_RADIUS)
+            .is_none()
+    );
+    assert!(app.world().resource::<PlayerRigReport>().is_healthy());
+}
+
+#[test]
+fn player_discovers_every_required_rig_node_and_animation_clip() {
+    let mut app = walking_hall(&repo_assets());
+    let parts = app.world().resource::<PlayerParts>().clone();
+
+    assert_eq!(
+        parts
+            .all()
+            .iter()
+            .map(|part| part.name.as_str())
+            .collect::<Vec<_>>(),
+        required_player_parts()
+    );
+    assert_eq!(parts.all().len(), TECHNICIAN_BONES.len() + 1);
+    for bone in TECHNICIAN_BONES {
+        let part = parts.get(bone).unwrap_or_else(|| panic!("{bone} is bound"));
+        assert!(
+            app.world().get::<Name>(part.entity).map(Name::as_str) == Some(bone),
+            "{bone} must resolve to the named rig node"
+        );
+    }
+    assert_eq!(
+        parts.get("bone-hips").map(|part| part.rest.translation),
+        Some(Vec3::new(0.0, 0.95, 0.0)),
+        "rest transforms are captured before any clip plays"
+    );
+
+    let animations = app.world().resource::<PlayerAnimations>().clone();
+    let mut nodes = PlayerClip::ALL
+        .into_iter()
+        .map(|clip| animations.node(clip))
+        .collect::<Vec<_>>();
+    nodes.sort();
+    nodes.dedup();
+    assert_eq!(nodes.len(), 3, "each clip needs its own graph node");
+    assert!(
+        app.world()
+            .resource::<Assets<AnimationGraph>>()
+            .get(&animations.graph)
+            .is_some()
+    );
+    assert_eq!(
+        app.world()
+            .get::<AnimationGraphHandle>(animations.player)
+            .map(|handle| handle.id()),
+        Some(animations.graph.id())
+    );
+
+    let (idle, _, playing) = animation_player(&mut app);
+    assert_eq!(playing, vec![idle], "a standing technician plays Idle only");
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Idle
+    );
+}
+
+#[test]
+fn keyboard_movement_matrix_covers_every_arrow_combination_at_every_heading() {
+    let mut app = walking_hall(&repo_assets());
+    let origin = Vec2::new(AISLE_CENTER_X[1], 0.0);
+    let frames = 10usize;
+    let expected_distance = PLAYER_SPEED * FIXED_STEP as f32 * frames as f32;
+
+    for heading in HEADINGS {
+        set_heading(&mut app, heading);
+        let basis = view_basis(&app);
+        for keys in ARROW_MATRIX {
+            place_player(&mut app, origin);
+            drive(&mut app, keys, frames);
+
+            let mut request = ButtonInput::default();
+            for key in keys {
+                request.press(*key);
+            }
+            let screen = arrow_input(&request);
+            let expected = basis.world_direction(screen) * expected_distance;
+            let actual = player_position(&mut app) - origin;
+
+            assert!(
+                actual.distance(expected) < 1.0e-4,
+                "heading {heading} with {keys:?} moved {actual:?}, expected {expected:?}"
+            );
+            let motion = app.world().resource::<PlayerMotion>();
+            assert_eq!(motion.requested_screen, screen, "{heading} {keys:?}");
+            assert!(!motion.resolution.was_restricted(), "{heading} {keys:?}");
+            assert_eq!(
+                motion.is_walking(),
+                screen != Vec2::ZERO,
+                "{heading} {keys:?}"
+            );
+            if screen != Vec2::ZERO {
+                assert!(
+                    player_facing(&mut app).distance(expected.normalize()) < 1.0e-4,
+                    "heading {heading} with {keys:?} must face its accepted step"
+                );
+            }
+        }
+    }
+
+    // Opposing keys cancel to exactly the same result as pressing nothing.
+    set_heading(&mut app, INITIAL_CAMERA_YAW_DEGREES);
+    for keys in [
+        [KeyCode::ArrowLeft, KeyCode::ArrowRight].as_slice(),
+        [KeyCode::ArrowUp, KeyCode::ArrowDown].as_slice(),
+        [
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+        ]
+        .as_slice(),
+    ] {
+        place_player(&mut app, origin);
+        drive(&mut app, keys, 30);
+        assert_eq!(player_position(&mut app), origin, "{keys:?} must cancel");
+    }
+}
+
+#[test]
+fn keyboard_movement_slides_along_racks_and_stops_at_the_room_boundary() {
+    let mut app = walking_hall(&repo_assets());
+    let colliders = app.world().resource::<HallColliders>().clone();
+    let rack_face = RACK_ROW_X[0] + 0.8 + PLAYER_RADIUS;
+
+    // Straight into the west rack row of the first aisle.
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[0], 0.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowLeft], 120);
+    let stopped = player_position(&mut app);
+
+    assert!(
+        stopped.x > rack_face && stopped.x <= rack_face + PLAYER_SPEED * FIXED_STEP as f32,
+        "the technician must stop against the rack face, got {stopped:?}"
+    );
+    assert_eq!(stopped.y, 0.0, "a head-on stop may not drift sideways");
+    assert_eq!(
+        app.world()
+            .resource::<PlayerMotion>()
+            .resolution
+            .blocked_x
+            .as_ref()
+            .map(PropId::as_str),
+        Some("rack-row-01")
+    );
+    assert!(!colliders.overlaps(stopped, PLAYER_RADIUS));
+
+    // Still pressed against the rack, request a diagonal: X stays clamped
+    // against the rack face and Z slides freely.
+    drive(&mut app, &[KeyCode::ArrowUp], 30);
+    let slid = player_position(&mut app);
+    assert!(
+        slid.x > rack_face && slid.x <= stopped.x,
+        "the blocked axis may only creep up to the rack face, got {slid:?}"
+    );
+    assert!(slid.y < -0.5, "the free axis must slide, got {slid:?}");
+    let motion = app.world().resource::<PlayerMotion>().clone();
+    assert!(motion.resolution.blocked_x.is_some());
+    assert_eq!(motion.resolution.blocked_z, None);
+    assert!(
+        player_facing(&mut app).distance(Vec2::new(0.0, -1.0)) < 1.0e-4,
+        "facing follows the accepted slide, not the requested diagonal"
+    );
+
+    // Into the hose drop, which is the authored pinch of every aisle.
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[0], 4.0));
+    drive(&mut app, &[KeyCode::ArrowDown, KeyCode::ArrowLeft], 120);
+    let pinched = player_position(&mut app);
+    assert!(
+        pinched.y < HOSE_DROP_Z - 0.2 - PLAYER_RADIUS,
+        "the hose drop must stop a centred approach, got {pinched:?}"
+    );
+    assert_eq!(
+        app.world()
+            .resource::<PlayerMotion>()
+            .resolution
+            .blocked_z
+            .as_ref()
+            .map(PropId::as_str),
+        Some("hose-drop-01")
+    );
+
+    // Radius-aware room bounds.
+    let limit = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 19.0));
+    drive(&mut app, &[KeyCode::ArrowDown, KeyCode::ArrowLeft], 120);
+    assert_eq!(player_position(&mut app).y, limit.y);
+    assert!(app.world().resource::<PlayerMotion>().resolution.clamped_z);
+
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], -19.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 120);
+    assert_eq!(player_position(&mut app).y, -limit.y);
+    assert!(app.world().resource::<PlayerMotion>().resolution.clamped_z);
+}
+
+#[test]
+fn keyboard_movement_drives_the_generated_walk_and_idle_clips() {
+    let mut app = walking_hall(&repo_assets());
+    app.init_resource::<RestProbe>().add_systems(
+        Update,
+        capture_rest_probe
+            .in_set(CellShiftSet::UpdateAnimation)
+            .after(update_player_animation),
+    );
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 40);
+    let (idle, walk, playing) = animation_player(&mut app);
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Walk
+    );
+    assert_eq!(playing, vec![walk], "walking stops Idle and plays Walk");
+    assert!(!playing.contains(&idle));
+
+    let moved = part_transforms(&mut app)
+        .into_iter()
+        .filter(|(_, current, rest)| current != rest)
+        .count();
+    assert!(
+        moved > 0,
+        "the Walk clip must actually pose the discovered rig nodes"
+    );
+
+    app.world_mut().resource_mut::<RestProbe>().0.clear();
+    drive(&mut app, &[], 1);
+
+    let (idle, walk, playing) = animation_player(&mut app);
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Idle
+    );
+    assert_eq!(playing, vec![idle], "stopping stops Walk and plays Idle");
+    assert!(!playing.contains(&walk));
+
+    let probe = app.world().resource::<RestProbe>();
+    assert_eq!(
+        probe.0.len(),
+        required_player_parts().len(),
+        "the idle transition must visit every discovered part"
+    );
+    for (name, restored, rest) in &probe.0 {
+        assert_eq!(restored, rest, "{name} must be restored to its rest pose");
+    }
+}
+
+#[test]
+fn keyboard_movement_stops_when_a_rig_part_goes_stale() {
+    let mut app = walking_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 5);
+    let before_injection = player_position(&mut app);
+    assert_ne!(before_injection, Vec2::new(AISLE_CENTER_X[1], 0.0));
+
+    let stale = app
+        .world()
+        .resource::<PlayerParts>()
+        .entity("bone-tool")
+        .expect("bone-tool is discovered");
+    app.world_mut().entity_mut(stale).despawn();
+
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 30);
+
+    assert_eq!(
+        app.world().resource::<PlayerRigReport>().errors(),
+        [PlayerRigError::StalePart {
+            name: "bone-tool".to_owned()
+        }]
+    );
+    assert_eq!(
+        *app.world().resource::<State<PlayerRigState>>().get(),
+        PlayerRigState::Failed
+    );
+    assert_eq!(
+        player_position(&mut app),
+        before_injection,
+        "a stale rig handle must stop movement instead of silently skipping"
+    );
+}
+
+#[test]
+fn aisle_waypoint_journey_reaches_every_aisle_through_the_authored_hose_pinch() {
+    let mut app = walking_hall(&repo_assets());
+    let colliders = app.world().resource::<HallColliders>().clone();
+    let scene = SceneBlueprint::v0();
+    let limit = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
+    let hose_half = 0.2 + PLAYER_RADIUS;
+
+    // Every aisle end to end, detouring around each authored hose drop. The
+    // detour offset is deliberately wider than the hose half-extent plus the
+    // player radius and narrower than the rack faces.
+    let detour = 1.3f32;
+    let mut route = vec![Vec2::new(AISLE_CENTER_X[0], -11.0)];
+    for (index, center_x) in AISLE_CENTER_X.into_iter().enumerate() {
+        let (entry, exit) = if index % 2 == 0 {
+            (-11.0, 11.0)
+        } else {
+            (11.0, -11.0)
+        };
+        let sign = if entry < exit { 1.0 } else { -1.0 };
+        let offset = if index == 1 { detour } else { -detour };
+        route.extend([
+            Vec2::new(center_x, entry),
+            Vec2::new(center_x, HOSE_DROP_Z - sign * 3.0),
+            Vec2::new(center_x + offset, HOSE_DROP_Z - sign * 3.0),
+            Vec2::new(center_x + offset, HOSE_DROP_Z + sign * 2.5),
+            Vec2::new(center_x, HOSE_DROP_Z + sign * 2.5),
+            Vec2::new(center_x, exit),
+        ]);
+    }
+
+    let mut trace = Vec::new();
+    let mut frames = 0usize;
+    for target in &route {
+        loop {
+            let position = player_position(&mut app);
+            trace.push(position);
+            if position.distance(*target) <= 0.1 {
+                break;
+            }
+            let keys = keys_towards(&view_basis(&app), *target - position);
+            hold(&mut app, keys);
+            app.update();
+            frames += 1;
+            assert!(
+                frames < 6_000,
+                "the waypoint journey stalled at {position:?} heading for {target:?}"
+            );
+        }
+    }
+    hold(&mut app, &[]);
+    app.update();
+
+    assert!(
+        frames > 1_000,
+        "the journey must be a real walk, got {frames}"
+    );
+    for position in &trace {
+        assert!(
+            !colliders.overlaps(*position, PLAYER_RADIUS),
+            "the journey entered a collider at {position:?}"
+        );
+        assert!(
+            position.x.abs() <= limit.x + 1.0e-4 && position.y.abs() <= limit.y + 1.0e-4,
+            "the journey left the room at {position:?}"
+        );
+    }
+
+    for (index, aisle) in scene.aisles.iter().enumerate() {
+        // The authored pinch really does close the centre line, so the only way
+        // through is the off-centre detour the driver walked.
+        assert!(
+            colliders.overlaps(Vec2::new(aisle.center_x, HOSE_DROP_Z), PLAYER_RADIUS),
+            "aisle {index} centre must be blocked at the hose drop"
+        );
+        assert!(detour > hose_half && detour < 1.85);
+
+        let band = aisle.half_width + detour;
+        let samples = trace
+            .iter()
+            .filter(|point| (point.x - aisle.center_x).abs() <= band)
+            .collect::<Vec<_>>();
+        assert!(
+            samples.iter().any(
+                |point| point.y <= AISLE_Z_MIN + 1.1 && (point.x - aisle.center_x).abs() < 0.15
+            ),
+            "aisle {index} was never entered from its north end"
+        );
+        assert!(
+            samples.iter().any(
+                |point| point.y >= AISLE_Z_MAX - 1.1 && (point.x - aisle.center_x).abs() < 0.15
+            ),
+            "aisle {index} was never left from its south end"
+        );
+
+        let crossings = samples
+            .iter()
+            .filter(|point| (point.y - HOSE_DROP_Z).abs() <= 0.05)
+            .collect::<Vec<_>>();
+        assert!(
+            !crossings.is_empty(),
+            "aisle {index} never crossed the authored hose pinch"
+        );
+        for point in crossings {
+            assert!(
+                (point.x - aisle.center_x).abs() > hose_half,
+                "aisle {index} crossed the hose at {point:?} instead of routing around it"
+            );
+        }
+    }
+
+    assert!(app.world().resource::<PlayerRigReport>().is_healthy());
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Idle
+    );
 }

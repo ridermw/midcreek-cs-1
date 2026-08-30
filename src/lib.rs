@@ -1,6 +1,7 @@
 pub mod assetgen;
 pub mod assets;
 pub mod design;
+pub mod player;
 pub mod sitegen;
 pub mod world;
 
@@ -27,7 +28,11 @@ pub struct CellShiftPlugin;
 impl Plugin for CellShiftPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(FLOOR_LIGHT.into()))
-            .add_plugins((assets::AssetPlugin, world::HallPlugin))
+            .add_plugins((
+                assets::AssetPlugin,
+                world::HallPlugin,
+                player::TechnicianPlugin,
+            ))
             .configure_sets(
                 Update,
                 (

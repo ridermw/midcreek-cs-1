@@ -43,17 +43,17 @@
     {
       "id": "technician-movement",
       "title": "Add the rigged technician and real keyboard movement",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "data-hall"
       ],
-      "summary": "Add rigged camera-relative technician movement.",
-      "completed_commit": null
+      "summary": "Spawned the generated 11-bone technician only after the assets and the hall were both ready, bound every required rig node into explicit PlayerParts with the rest transform captured before any clip played, and moved it from the real ButtonInput<KeyCode> arrow state. A public ViewBasis resource, initialised to the reviewed NorthEast 45-degree view, is the only screen-to-world interface movement reads, so the orbit task becomes its runtime updater without changing a movement rule. Opposite arrows cancel and diagonals are normalized, world X and world Z resolve separately against the cached colliders and radius-aware room bounds so the technician slides along rack faces, and facing plus the Idle and Walk clips follow the accepted displacement rather than the request. The idle transition stops Walk, explicitly restores every PlayerParts rest transform, and only then plays Idle; the Repair clip is bound for the operations task and nothing plays it yet. Missing, duplicate, and stale rig nodes are typed failures that stop movement instead of being silently skipped.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "camera-orbit",
       "title": "Add clamped four-way camera orbit",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "technician-movement"
       ],
@@ -151,6 +151,15 @@
       "impact": "The reviewed plan forbids any procedural fallback when a generated asset is missing or wrong, but a hall that silently substitutes geometry looks identical to a healthy one in a screenshot. The contract therefore had to be proved inside a real Bevy app, and the verification machine has no GPU adapter, so a normal windowed run could not be the gate.",
       "approach": "src/assets.rs loads every generated document and every declared module scene, polls recursive dependency load state, and additionally requires each loaded glTF document to expose the module scene name the pipeline declares, so a mislabelled but structurally valid file still fails. Failures are recorded in AssetLoadReport and move the app to AssetLoadState::Failed; src/world.rs only spawns on entering AssetLoadState::Ready and refuses to spawn an invalid blueprint at all. Tests drive a real App built from DefaultPlugins with WinitPlugin disabled and RenderPlugin created with no wgpu backend, which registers every asset type and runs the real glTF loader headlessly.",
       "resolution": "tests/app_contract.rs boots that headless app against the committed assets and asserts Ready, exact spawned entity, transform, cached mesh, palette material, and shared scene-handle contracts, then repeats the run against private copies of the assets with one file removed, one file truncated, and one file replaced by a different module, requiring AssetLoadState::Failed, a report naming the offending path, and zero spawned props each time.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "rig-handles-that-survive-instance-respawn",
+      "title": "Explicit rig handles that fail loudly without breaking on Bevy instance respawn",
+      "status": "resolved",
+      "impact": "The reviewed plan requires explicit named rig handles and an explicit failure when one goes missing, duplicated, or stale, because a movement system that silently skips a bone looks identical to a working one. Bevy despawns and respawns a whole glTF world instance whenever a sub-asset event arrives for the file it came from, so handles captured on the first spawn can be invalidated wholesale through no fault of the game. A binder that only ran once produced an intermittent all-parts-stale failure under parallel test load, and a binder that healed on any change would have silently swallowed the real fault the plan requires it to report.",
+      "approach": "The generated technician root shares its name with the glTF scene, so it is deliberately excluded from the rig contract and the spawned entity is the stable handle for the instance; the contract covers the skinned mesh node and the eleven skin joints. One binder runs every frame: it costs twelve name lookups while the bound handles still resolve, and otherwise rescans the spawned instance. A rescan that yields a complete rig is a legal rebind, an empty rescan means the instance is mid-respawn and the bound handles are left untouched, and an incomplete rescan keeps the previously bound handles and reports them as typed StalePart errors. Movement and animation are gated on the report being empty in the same frame, not on a state transition that lands a frame late.",
+      "resolution": "tests/app_contract.rs fault-injects the failure by despawning bone-tool inside a running app and requires exactly PlayerRigError::StalePart for that node, PlayerRigState::Failed, and a technician position that does not move again. Pure tests in src/player.rs cover missing and duplicate names directly. The full app contract suite, which builds several real headless Bevy apps in parallel, was run ten consecutive times with no failures after the binder became rescan based instead of change-detection based.",
       "resolved_commit": "HEAD"
     }
   ]

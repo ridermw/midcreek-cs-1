@@ -456,10 +456,7 @@ mod progress_contract {
                 .expect("sitegen should launch");
 
             assert_eq!(output.status.code(), Some(0));
-            assert_eq!(
-                String::from_utf8(output.stdout).unwrap(),
-                "technician-movement\n"
-            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), "camera-orbit\n");
             assert!(output.stderr.is_empty());
         }
     }
@@ -504,14 +501,14 @@ mod progress_contract {
                 ),
                 (
                     "technician-movement",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["data-hall"][..],
-                    "Add rigged camera-relative technician movement.",
-                    None,
+                    "Spawned the generated 11-bone technician only after the assets and the hall were both ready, bound every required rig node into explicit PlayerParts with the rest transform captured before any clip played, and moved it from the real ButtonInput<KeyCode> arrow state. A public ViewBasis resource, initialised to the reviewed NorthEast 45-degree view, is the only screen-to-world interface movement reads, so the orbit task becomes its runtime updater without changing a movement rule. Opposite arrows cancel and diagonals are normalized, world X and world Z resolve separately against the cached colliders and radius-aware room bounds so the technician slides along rack faces, and facing plus the Idle and Walk clips follow the accepted displacement rather than the request. The idle transition stops Walk, explicitly restores every PlayerParts rest transform, and only then plays Idle; the Repair clip is bound for the operations task and nothing plays it yet. Missing, duplicate, and stale rig nodes are typed failures that stop movement instead of being silently skipped.",
+                    Some("HEAD"),
                 ),
                 (
                     "camera-orbit",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["technician-movement"][..],
                     "Add clamped Q/E four-way camera orbit.",
                     None,
@@ -590,6 +587,7 @@ mod progress_contract {
                 vec![
                     "byte-reproducible-assets-without-a-dcc",
                     "loud-asset-loading-without-a-gpu",
+                    "rig-handles-that-survive-instance-respawn",
                 ]
             );
             for challenge in &document.challenges {

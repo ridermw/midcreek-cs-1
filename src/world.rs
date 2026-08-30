@@ -74,6 +74,12 @@ impl HallErrors {
 #[derive(Resource, Clone, Debug)]
 pub struct HallColliders(Vec<ColliderSpec>);
 
+impl From<Vec<ColliderSpec>> for HallColliders {
+    fn from(colliders: Vec<ColliderSpec>) -> Self {
+        Self(colliders)
+    }
+}
+
 impl HallColliders {
     /// Every cached collider, in blueprint order.
     pub fn all(&self) -> &[ColliderSpec] {

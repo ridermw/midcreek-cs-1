@@ -96,6 +96,55 @@ adjacent open nodes spans `(n - 1)` cells -- and the player diameter is never
 counted twice. The authored hose drops at z = 7 are the narrowest point in the
 hall at exactly 0.50 m, one grid cell above the gate.
 
+## Rigged technician and keyboard movement
+
+`src/player.rs` spawns the generated technician once the assets and the hall are
+both ready, binds its rig explicitly, and moves it from the real
+`ButtonInput<KeyCode>` arrow state.
+
+- `ViewBasis` is the one public screen-to-world interface. It is initialised to
+  the reviewed NorthEast 45-degree diamond view; movement never reads a camera
+  entity, so the orbit task can retarget the basis without touching a movement
+  rule.
+- Arrow keys produce a normalized screen request: opposite keys cancel exactly,
+  and a diagonal never outruns a cardinal. The request is mapped through
+  `ViewBasis`, so the eight key combinations become the eight compass directions
+  on the ground plane at every heading.
+- World X and world Z are resolved separately against the cached
+  `HallColliders` vector and radius-aware room bounds, which is what lets the
+  technician slide along a rack face instead of sticking to it. Every rejection
+  names the offending `PropId` in `PlayerMotion`.
+- Facing and the animation state come from the accepted displacement, never the
+  requested direction. Walking into a rack diagonally therefore turns the
+  technician along the slide.
+- `PlayerParts` holds explicit handles for the skinned mesh node and all eleven
+  bones, together with the rest transform captured before any clip played.
+  Missing, duplicated, and stale nodes are typed `PlayerRigError` values that
+  move the app into `PlayerRigState::Failed` and stop movement; nothing is ever
+  silently skipped. Bevy despawns and respawns a glTF world instance when a
+  sub-asset event arrives, so the binder rescans and rebinds on any complete
+  instance and keeps the stale handles otherwise.
+- The generated `Idle` and `Walk` clips are driven through one
+  `AnimationGraph`. The idle transition stops `Walk`, explicitly restores every
+  `PlayerParts` rest transform, and only then plays `Idle`, so a stopped
+  technician never keeps a mid-stride pose. The `Repair` clip is bound in
+  `PlayerAnimations` for the operations task and nothing plays it yet.
+
+Movement gates:
+
+```bash
+cargo test player
+cargo test --test app_contract keyboard_movement
+cargo test --test app_contract aisle_waypoint_journey
+```
+
+The keyboard matrix drives real key presses across all four headings for the
+empty press, both opposing pairs, all cardinals, and the diagonals. The waypoint
+journey walks the technician end to end through all three aisles using only
+accepted arrow input, and each aisle's authored hose drop -- which closes the
+centre line to a 0.50 m centre-space run -- is crossed off centre rather than
+teleported past.
+
 ## Foundation gates
 
 ```bash
