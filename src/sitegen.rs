@@ -2387,6 +2387,13 @@ pub fn assemble_site(
     };
     copy_site_tree(current, current, output, protected)?;
 
+    // Whether the retained manifest is trustworthy has to be judged from
+    // exactly what the previous publication declared, before
+    // `reconcile_last_green` resyncs its file lists with reality below: that
+    // resync silently repairs a manifest whose declared files disagree with
+    // its package, which would otherwise erase the very inconsistency this
+    // is meant to catch.
+    let retained_playable_trusted = retained_playable_is_consistent(output);
     reconcile_last_green(output)?;
     // `build_site` rendered the current run's own honest state before this
     // assembly ever ran, blind to whatever game the disposition above just
@@ -2394,7 +2401,7 @@ pub fn assemble_site(
     // the page it wrote still shows the pending state; bring it into
     // agreement with the retained package this build really carries forward,
     // never with the current run's own commit.
-    reconcile_playable_display(output, disposition)?;
+    reconcile_playable_display(output, current, disposition, retained_playable_trusted)?;
     require_retained_history(output)?;
     validate_assembled_links(output)?;
     Ok(disposition)
@@ -2580,6 +2587,36 @@ pub fn missing_playable_parts(package: &Path) -> Vec<String> {
         missing.push(REQUIRED_PLAYABLE_ASSETS.to_owned());
     }
     missing
+}
+
+/// Whether a retained playable manifest, exactly as it arrived from the
+/// previous publication, is safe to trust as provenance for the homepage.
+///
+/// A manifest is not "shape valid JSON" alone: `LastGreenManifest` has no
+/// validation beyond serde's, so an unsafe commit label or a declared file
+/// list that disagrees with the package it names must be caught here, before
+/// [`reconcile_last_green`] resyncs those same file lists with reality and
+/// silently erases the very inconsistency this exists to refuse. Invalid or
+/// inconsistent retained metadata is treated exactly like no retained game
+/// at all, never normalized into trusted provenance.
+fn retained_playable_is_consistent(output: &Path) -> bool {
+    let package = output.join("play");
+    if !package.is_dir() || !missing_playable_parts(&package).is_empty() {
+        return false;
+    }
+    let Ok(manifest_json) = fs::read_to_string(output.join(LAST_GREEN_FILE)) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<LastGreenManifest>(&manifest_json) else {
+        return false;
+    };
+    if validate_commit("source_commit", &manifest.source_commit).is_err() {
+        return false;
+    }
+    let Ok(actual_files) = published_files(output, "play") else {
+        return false;
+    };
+    manifest.game_files == actual_files
 }
 
 pub fn validate_site_output(
@@ -3281,14 +3318,20 @@ fn replace_marked(html: &str, name: &str, replacement: &str) -> String {
     }
 }
 
-/// Whether the current run's own verification evidence, exactly as published
-/// in the assembled tree, proved the current commit.
+/// Whether the current run's own verification evidence — read from the
+/// `current` tree the run itself produced, before assembly retains or
+/// overlays anything from a previous publication — proved the current
+/// commit.
 ///
-/// Reads the published projection rather than any input the build accepted,
-/// so this always names what the page actually stands behind, retained or
-/// not.
-fn current_evidence_succeeded(output: &Path) -> bool {
-    let Ok(json) = fs::read_to_string(output.join(VERIFICATION_FILE)) else {
+/// This deliberately never reads the assembled `output` tree: when the
+/// current run publishes no verification projection of its own, assembly
+/// retains the previous run's `verification.json` into `output` so that
+/// evidence is not lost, but that retained document describes a different
+/// run's success, not this one's. Reading `current` instead means a run that
+/// attempted no verification of its own can never be credited with a
+/// previous run's separately-recorded success.
+fn current_evidence_succeeded(current: &Path) -> bool {
+    let Ok(json) = fs::read_to_string(current.join(VERIFICATION_FILE)) else {
         return false;
     };
     serde_json::from_str::<serde_json::Value>(&json)
@@ -3307,12 +3350,18 @@ fn current_evidence_succeeded(output: &Path) -> bool {
 /// two: it never touches a page that already shows a game of its own, and it
 /// only ever attributes a retained game to the commit its own retained
 /// metadata names, never to the current run's commit. A retained package or
-/// manifest that is missing, incomplete, or unparsable is treated exactly
-/// like no retained game at all, so the page stays pending rather than
-/// inventing provenance for something that cannot be trusted.
+/// manifest that is missing, incomplete, unparsable, or internally
+/// inconsistent (judged by `retained_playable_trusted`, computed before this
+/// runs) is treated exactly like no retained game at all, so the page stays
+/// pending rather than inventing provenance for something that cannot be
+/// trusted. The play and mode markers are replaced as one atomic pair: if
+/// either is missing or malformed, neither is touched, so an incorrect badge
+/// can never survive beside a reconciled iframe.
 fn reconcile_playable_display(
     output: &Path,
+    current: &Path,
     disposition: BuildDisposition,
+    retained_playable_trusted: bool,
 ) -> Result<(), SitegenError> {
     if !matches!(
         disposition,
@@ -3327,13 +3376,18 @@ fn reconcile_playable_display(
     let Some((play_start, play_end)) = marked_span(&html, "play") else {
         return Ok(());
     };
-    // A build that already shows a game of its own is left exactly as it is.
+    // A build that already shows a game of its own is left exactly as it is,
+    // regardless of whether a retained package would otherwise be trusted.
     if html[play_start..play_end].contains("play-embed") {
         return Ok(());
     }
-
-    let package = output.join("play");
-    if !package.is_dir() || !missing_playable_parts(&package).is_empty() {
+    // The play and mode sections are replaced together or not at all: a
+    // missing or malformed mode marker must never leave a stale badge beside
+    // a freshly reconciled iframe.
+    if marked_span(&html, "mode").is_none() {
+        return Ok(());
+    }
+    if !retained_playable_trusted {
         return Ok(());
     }
     let Ok(manifest_json) = fs::read_to_string(output.join(LAST_GREEN_FILE)) else {
@@ -3342,11 +3396,8 @@ fn reconcile_playable_display(
     let Ok(manifest) = serde_json::from_str::<LastGreenManifest>(&manifest_json) else {
         return Ok(());
     };
-    if manifest.source_commit.trim().is_empty() {
-        return Ok(());
-    }
 
-    let verified = current_evidence_succeeded(output);
+    let verified = current_evidence_succeeded(current);
     let patched = replace_marked(
         &html,
         "play",

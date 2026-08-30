@@ -158,7 +158,13 @@ fn previous_retained_playable(name: &str) -> TempDirectory {
 /// A `current` tree exactly as `build_site` leaves one when the run produced
 /// no playable candidate of its own: the reconcilable `{{PLAY}}`/`{{MODE}}`
 /// sections are marked, and the pending panel carries no `play-embed` iframe.
+/// The status grid mirrors `render_status`'s own shape for a failed run at
+/// `workflow_summary`'s commit, so tests can assert it survives reconciliation
+/// untouched.
 const PENDING_CURRENT_PAGE: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<div class="status-grid"><div class="status-item"><span>Source</span><strong>CURRENT SOURCE: FAILED AT 11111111</strong></div>
+<div class="status-item"><span>Native</span><strong class="status-failed">Failed</strong></div>
+<div class="status-item"><span>Web</span><strong class="status-skipped">Not run</strong></div></div>
 <!--play--><div class="play-frame" role="img" aria-label="pending"><div class="empty-state play-empty"><h2>No verified playable build yet</h2></div></div><!--/play-->
 <!--mode--><div class="hero-badge"><strong>Status</strong><small>Game pending verification</small></div><!--/mode-->
 </main></body></html>"#;
@@ -196,11 +202,15 @@ fn a_failed_run_with_a_complete_retained_package_shows_the_playable_iframe() {
         "the pending panel must not survive a real retained package: {index}"
     );
     assert!(
-        index.contains("22222222"),
+        index.contains(r#"<dt>Playable build</dt><dd><code>22222222</code></dd>"#),
         "the retained commit must be named honestly: {index}"
     );
+    // Production only ever renders the short SHA, so the meaningful refusal
+    // is that the *current* run's own short SHA is never credited as the
+    // retained build, not merely that the full 40-char SHA is absent (it
+    // never appears anywhere, bug or not).
     assert!(
-        !index.contains("1111111111111111111111111111111111111111"),
+        !index.contains(r#"<dt>Playable build</dt><dd><code>11111111</code></dd>"#),
         "the failed current commit must never be credited with the retained game: {index}"
     );
     assert!(
@@ -208,6 +218,17 @@ fn a_failed_run_with_a_complete_retained_package_shows_the_playable_iframe() {
         "the mode badge must distinguish a retained game from a current one: {index}"
     );
     assert!(!index.contains(">Status<"), "{index}");
+    // The current run's own failing source and gate status must survive
+    // reconciliation untouched: reconciling the playable panel must never
+    // touch the status grid that reports the current run's own truth.
+    assert!(
+        index.contains("CURRENT SOURCE: FAILED AT 11111111"),
+        "the current run's own failing source must be preserved verbatim: {index}"
+    );
+    assert!(
+        index.contains(r#"<strong class="status-failed">Failed</strong>"#),
+        "the current run's own gate status must be preserved verbatim: {index}"
+    );
     // The retained iframe path really resolves against the assembled tree.
     validate_assembled_links(output.path()).unwrap();
 }
@@ -321,6 +342,153 @@ fn an_incomplete_retained_package_leaves_the_homepage_pending() {
     assert!(
         index.contains("No verified playable build yet"),
         "an incomplete retained package must never be embedded: {index}"
+    );
+}
+
+#[test]
+fn a_retained_source_commit_that_is_not_a_full_sha_leaves_the_homepage_pending() {
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"not-a-real-commit-sha","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-unsafe-commit-text", &files);
+    let current = fixture_site(
+        "current-failed-unsafe-commit-text",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("unsafe-commit-text-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "a retained commit that is not a full SHA must never be trusted as provenance: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+#[test]
+fn retained_metadata_declaring_a_file_list_inconsistent_with_its_package_leaves_the_homepage_pending()
+ {
+    // The package on disk is structurally complete (every required file and
+    // the assets directory are present), but the manifest's own declared
+    // file list disagrees with it by naming a file the package does not
+    // actually contain alongside the real ones. `missing_playable_parts`
+    // alone cannot catch this: it only checks the fixed required set, never
+    // cross-checks the manifest's own declared list against reality.
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/decoy-file-not-really-published.json","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-inconsistent-file-list", &files);
+    let current = fixture_site(
+        "current-failed-inconsistent-file-list",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("inconsistent-file-list-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "a manifest whose declared file list disagrees with its package must never be trusted: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+#[test]
+fn current_evidence_is_never_credited_from_a_run_that_attempted_no_verification_of_its_own() {
+    let previous = previous_retained_playable("previous-retained-playable-with-succeeded-evidence");
+    // The previous publication's own run succeeded. A naive read of the
+    // assembled tree's retained `verification.json` (rather than what the
+    // *current* run itself produced) would see exactly this document and
+    // wrongly credit it to the current run.
+    fs::write(previous.path().join("verification.json"), GREEN_PROJECTION).unwrap();
+    let current = fixture_site(
+        // No verification.json at all: this run attempted no verification of
+        // its own (`EvidencePublication::Absent`), distinct from a run whose
+        // own verification failed.
+        "current-failed-no-verification-attempted",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("no-verification-attempted-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains(r#"<iframe class="play-embed" src="play/index.html""#),
+        "the retained package must still be embedded: {index}"
+    );
+    assert!(
+        index.contains("current run did not verify"),
+        "a run that attempted no verification of its own must not claim success: {index}"
+    );
+    assert!(
+        !index.contains("verified separately"),
+        "the previous run's own retained success must never be credited to a current run \
+         that attempted no verification at all: {index}"
+    );
+}
+
+#[test]
+fn a_missing_mode_marker_leaves_the_play_panel_unreconciled_too() {
+    let previous = previous_retained_playable("previous-retained-playable-for-atomicity");
+    // The play marker is present and reconcilable, but the mode marker is
+    // absent entirely (a malformed or hand-edited page). Reconciliation must
+    // treat the two markers as one atomic unit: either both are replaced, or
+    // neither is, never an embedded iframe beside a badge no one updated.
+    let current = fixture_site(
+        "current-failed-missing-mode-marker",
+        &[(
+            "index.html",
+            r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play--><div class="play-frame" role="img" aria-label="pending"><div class="empty-state play-empty"><h2>No verified playable build yet</h2></div></div><!--/play-->
+<div class="hero-badge"><strong>Status</strong><small>Game pending verification</small></div>
+</main></body></html>"#,
+        )],
+    );
+    let output = TempDirectory::new("missing-mode-marker-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        !index.contains("play-embed"),
+        "the play panel must never be reconciled without its paired mode badge: {index}"
+    );
+    assert!(
+        index.contains("No verified playable build yet"),
+        "an unreconciled pair must leave the original pending panel intact: {index}"
     );
 }
 
