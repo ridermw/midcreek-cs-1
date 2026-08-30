@@ -1,6 +1,8 @@
 pub mod assetgen;
+pub mod assets;
 pub mod design;
 pub mod sitegen;
+pub mod world;
 
 use bevy::prelude::*;
 
@@ -25,6 +27,7 @@ pub struct CellShiftPlugin;
 impl Plugin for CellShiftPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(FLOOR_LIGHT.into()))
+            .add_plugins((assets::AssetPlugin, world::HallPlugin))
             .configure_sets(
                 Update,
                 (

@@ -47,6 +47,46 @@ in tests: at most 256 bones per rig, 24 000 triangles per asset, and clip names
 unique across every rigged module because glTF animation names are document
 scoped.
 
+## Authored data hall
+
+`src/assets.rs` loads the committed GLBs and publishes the shared render
+handles; `src/world.rs` spawns the hall from the validated blueprint in
+`src/design.rs`.
+
+- `AssetLoadState` is explicitly `Loading`, `Ready`, or `Failed`. A missing,
+  corrupt, or mislabelled asset records the offending path in `AssetLoadReport`
+  and stops there. There is no procedural fallback.
+- Readiness requires more than a successful read: every loaded glTF document
+  must also expose the module scene name the pipeline declares.
+- `RenderAssets` creates exactly one unit mesh per primitive shape and one
+  unlit material per `PaletteRole`. Spawning the hall creates no new mesh or
+  material assets.
+- Generated static detail stays merged inside its module, so no server slot,
+  status light, or tray rung becomes a runtime entity.
+
+The fixed 40 m square hall contains 29 authored visuals and 13 colliders:
+
+| Category | Count | Placement |
+|---|---|---|
+| Floor | 1 | 40 m x 40 m polished light concrete |
+| Low perimeter walls | 4 | flush outside the play area, 1.2 m high |
+| Rack rows | 4 | x = -9, -3, 3, 9 |
+| Aisles | 3 | x = -6, 0, 6, z = -12 to 12 |
+| Cooling units | 4 | x = +/-13, z = +/-6 |
+| Overhead trays | 3 | one per aisle at y = 4 |
+| Hose drops | 3 | hanging from each tray at z = 7 |
+| Utility cart, step stool | 1 each | (-13, -10) and (13, 10) |
+| Yellow floor markings | 8 | six aisle edges plus two cross-hall walkways |
+
+Visual and collider lists stay separate and are joined only by their stable
+`PropId`; duplicate, missing, and orphan identifiers are all reported in one
+aggregate pass before anything spawns. Colliders are extracted once into
+`HallColliders` and scanned linearly, and a room-wide flood fill over a 0.25 m
+walkability grid proves that every aisle centreline checkpoint shares one
+walkable component with the player spawn. The same report measures the
+narrowest walkable width across those checkpoints, so a hairline gap between
+two colliders cannot pass as a usable aisle.
+
 ## Foundation gates
 
 ```bash
@@ -56,3 +96,14 @@ cargo run --bin assetgen -- --write
 cargo run --bin assetgen -- --check
 cargo test
 ```
+
+Hall gates:
+
+```bash
+cargo test world
+cargo test --test app_contract hall
+```
+
+The hall contracts drive a real Bevy app built from `DefaultPlugins` with
+`WinitPlugin` disabled and `RenderPlugin` created without a wgpu backend, so the
+committed GLBs are loaded by the real glTF loader on a machine with no GPU.

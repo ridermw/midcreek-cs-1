@@ -1,20 +1,44 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
-use bevy::{color::palettes::css::BLACK, prelude::*};
+use bevy::{
+    asset::{AssetPlugin as BevyAssetPlugin, RecursiveDependencyLoadState},
+    color::palettes::css::BLACK,
+    prelude::*,
+    render::{
+        RenderPlugin,
+        settings::{RenderCreation, WgpuSettings},
+    },
+};
 use midcreek_cs_1::{
     CellShiftPlugin, CellShiftSet,
+    assetgen::{ASSET_MODULES, ASSET_NAMES},
+    assets::{
+        AssetLoadReport, AssetLoadState, GENERATED_ASSET_DIRECTORY, GeneratedAssets, RenderAssets,
+        generated_modules, module_for,
+    },
     design::{
+        AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
         AssetKind, CAMERA_ELEVATION_DEGREES, CAMERA_OFFSET_DIRECTION,
         CAMERA_ORBIT_DURATION_SECONDS, CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256,
         ColliderSpec, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, FAULT_INTERVAL_SECONDS,
-        FAULT_RED, FLOOR_LIGHT, FLOOR_SHADOW, HEALTHY_GREEN, HOSE_CHARCOAL,
-        INITIAL_CAMERA_YAW_DEGREES, INK, KEY_ART_REFERENCE_PATH, KEY_ART_SHA256,
-        MAX_ACTIVE_TICKETS, ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, PLAYER_RADIUS, PaletteRole,
-        PropId, RACK_COOLDOWN_SECONDS, RACK_SHADOW, RACK_WHITE, REPAIR_DURATION_SECONDS,
-        REPAIR_INTERACTION_RANGE, RESOLVED_DISPLAY_SECONDS, ROOM_SIZE, SIGNATURE_YELLOW,
-        SKY_BOUNCE_BLUE, SceneBlueprint, SceneValidationError, TEAL_ACCENT,
-        VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WORKER_BOOTS,
-        WORKER_HARD_HAT, WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS,
+        FAULT_RED, FLOOR_LIGHT, FLOOR_MARKING_HEIGHT, FLOOR_MARKING_WIDTH, FLOOR_SHADOW,
+        HEALTHY_GREEN, HOSE_CHARCOAL, HOSE_DROP_HEIGHT, INITIAL_CAMERA_YAW_DEGREES, INK,
+        KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, MAX_ACTIVE_TICKETS, ORTHOGRAPHIC_HEIGHT,
+        ORTHOGRAPHIC_WIDTH, OVERHEAD_TRAY_HEIGHT, PLAYER_RADIUS, PaletteRole, PrimitiveShape,
+        PropId, RACK_COOLDOWN_SECONDS, RACK_ROW_X, RACK_SHADOW, RACK_WHITE,
+        REPAIR_DURATION_SECONDS, REPAIR_INTERACTION_RANGE, RESOLVED_DISPLAY_SECONDS, ROOM_SIZE,
+        SIGNATURE_YELLOW, SKY_BOUNCE_BLUE, SceneBlueprint, SceneValidationError, TEAL_ACCENT,
+        VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WALKABLE_CELL_SIZE,
+        WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT, WORKER_HI_VIS, WORKER_SKIN,
+        WORKER_SLATE, WORKER_TROUSERS,
+    },
+    world::{
+        HallBlueprint, HallColliders, HallErrors, HallProp, HallRoot, HallState, PlayerSpawnPoint,
     },
 };
 use sha2::{Digest, Sha256};
@@ -24,10 +48,7 @@ fn prop(id: &str) -> PropId {
 }
 
 fn sha256(path: impl AsRef<Path>) -> String {
-    let mut file = File::open(path).expect("reference image should exist");
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .expect("reference image should be readable");
+    let bytes = fs::read(path.as_ref()).expect("reference image should be readable");
     let mut digest = Sha256::new();
     digest.update(bytes);
     digest
@@ -136,7 +157,7 @@ fn design_references_match_the_approved_pngs() {
         let path = root.join(relative_path);
         assert_eq!(sha256(&path), expected_hash);
         let dimensions = image::ImageReader::with_format(
-            std::io::BufReader::new(File::open(path).expect("reference should open")),
+            std::io::BufReader::new(fs::File::open(path).expect("reference should open")),
             format,
         )
         .into_dimensions()
@@ -146,32 +167,398 @@ fn design_references_match_the_approved_pngs() {
 }
 
 #[test]
-fn design_v0_blueprint_is_ordered_and_valid() {
+fn design_v0_blueprint_lists_the_authored_hall_in_reviewed_order() {
     let scene = SceneBlueprint::v0();
 
     assert_eq!(scene.room.size, ROOM_SIZE);
-    assert_eq!(scene.rack_row_count(), 4);
-    assert_eq!(scene.aisles.len(), 3);
     assert_eq!(scene.player_spawn, Vec2::new(-6.0, -11.0));
     assert_eq!(
         scene
             .visuals
             .iter()
-            .take(4)
             .map(|visual| visual.id.as_str())
             .collect::<Vec<_>>(),
-        ["rack-row-01", "rack-row-02", "rack-row-03", "rack-row-04"]
+        [
+            "floor",
+            "wall-north",
+            "wall-south",
+            "wall-west",
+            "wall-east",
+            "rack-row-01",
+            "rack-row-02",
+            "rack-row-03",
+            "rack-row-04",
+            "cooling-unit-west-north",
+            "cooling-unit-west-south",
+            "cooling-unit-east-north",
+            "cooling-unit-east-south",
+            "overhead-tray-01",
+            "overhead-tray-02",
+            "overhead-tray-03",
+            "hose-drop-01",
+            "hose-drop-02",
+            "hose-drop-03",
+            "utility-cart",
+            "step-stool",
+            "floor-marking-aisle-01-west",
+            "floor-marking-aisle-01-east",
+            "floor-marking-aisle-02-west",
+            "floor-marking-aisle-02-east",
+            "floor-marking-aisle-03-west",
+            "floor-marking-aisle-03-east",
+            "floor-marking-walkway-north",
+            "floor-marking-walkway-south",
+        ]
     );
     assert_eq!(
         scene
             .colliders
             .iter()
-            .take(4)
             .map(|collider| collider.id.as_str())
             .collect::<Vec<_>>(),
-        ["rack-row-01", "rack-row-02", "rack-row-03", "rack-row-04"]
+        [
+            "rack-row-01",
+            "rack-row-02",
+            "rack-row-03",
+            "rack-row-04",
+            "cooling-unit-west-north",
+            "cooling-unit-west-south",
+            "cooling-unit-east-north",
+            "cooling-unit-east-south",
+            "hose-drop-01",
+            "hose-drop-02",
+            "hose-drop-03",
+            "utility-cart",
+            "step-stool",
+        ]
     );
     assert_eq!(scene.validate(), Vec::<SceneValidationError>::new());
+}
+
+#[test]
+fn design_v0_blueprint_counts_every_authored_category() {
+    let scene = SceneBlueprint::v0();
+
+    assert_eq!(scene.rack_row_count(), 4);
+    assert_eq!(scene.aisles.len(), 3);
+    assert_eq!(scene.count_of(AssetKind::Floor), 1);
+    assert_eq!(scene.count_of(AssetKind::Wall), 4);
+    assert_eq!(scene.count_of(AssetKind::RackRow), 4);
+    assert_eq!(scene.count_of(AssetKind::CoolingUnit), 4);
+    assert_eq!(scene.count_of(AssetKind::OverheadTray), 3);
+    assert_eq!(scene.count_of(AssetKind::HoseDrop), 3);
+    assert_eq!(scene.count_of(AssetKind::UtilityCart), 1);
+    assert_eq!(scene.count_of(AssetKind::StepStool), 1);
+    assert_eq!(scene.count_of(AssetKind::FloorMarking), 8);
+    assert_eq!(scene.visuals.len(), 29);
+    assert_eq!(scene.colliders.len(), 13);
+}
+
+#[test]
+fn design_v0_blueprint_places_the_room_shell_and_equipment_exactly() {
+    let scene = SceneBlueprint::v0();
+    let visual = |id: &str| scene.visual(id).expect("authored visual").clone();
+
+    let floor = visual("floor");
+    assert_eq!(floor.asset, AssetKind::Floor);
+    assert_eq!(floor.transform.translation, Vec3::ZERO);
+    assert_eq!(floor.transform.scale, Vec3::new(40.0, 1.0, 40.0));
+    assert!(!floor.collision_required);
+
+    let half_room = ROOM_SIZE.x * 0.5;
+    let wall_offset = half_room + WALL_THICKNESS * 0.5;
+    let wall_span = ROOM_SIZE.x + WALL_THICKNESS * 2.0;
+    for (id, translation, scale) in [
+        (
+            "wall-north",
+            Vec3::new(0.0, WALL_HEIGHT * 0.5, -wall_offset),
+            Vec3::new(wall_span, WALL_HEIGHT, WALL_THICKNESS),
+        ),
+        (
+            "wall-south",
+            Vec3::new(0.0, WALL_HEIGHT * 0.5, wall_offset),
+            Vec3::new(wall_span, WALL_HEIGHT, WALL_THICKNESS),
+        ),
+        (
+            "wall-west",
+            Vec3::new(-wall_offset, WALL_HEIGHT * 0.5, 0.0),
+            Vec3::new(WALL_THICKNESS, WALL_HEIGHT, wall_span),
+        ),
+        (
+            "wall-east",
+            Vec3::new(wall_offset, WALL_HEIGHT * 0.5, 0.0),
+            Vec3::new(WALL_THICKNESS, WALL_HEIGHT, wall_span),
+        ),
+    ] {
+        let wall = visual(id);
+        assert_eq!(wall.asset, AssetKind::Wall);
+        assert_eq!(wall.transform.translation, translation);
+        assert_eq!(wall.transform.scale, scale);
+        assert!(!wall.collision_required);
+    }
+
+    for (index, x) in RACK_ROW_X.into_iter().enumerate() {
+        let id = format!("rack-row-{:02}", index + 1);
+        let rack = visual(&id);
+        assert_eq!(rack.asset, AssetKind::RackRow);
+        assert_eq!(rack.transform.translation, Vec3::new(x, 0.0, 0.0));
+        assert_eq!(rack.transform.scale, Vec3::ONE);
+        assert!(rack.collision_required);
+        let collider = scene.collider(&id).expect("rack collider");
+        assert_eq!(collider.center, Vec2::new(x, 0.0));
+        assert_eq!(collider.half_extents, Vec2::new(0.8, 8.05));
+    }
+
+    for (index, x) in AISLE_CENTER_X.into_iter().enumerate() {
+        let tray = visual(&format!("overhead-tray-{:02}", index + 1));
+        assert_eq!(tray.asset, AssetKind::OverheadTray);
+        assert_eq!(
+            tray.transform.translation,
+            Vec3::new(x, OVERHEAD_TRAY_HEIGHT, 0.0)
+        );
+        assert!(!tray.collision_required);
+
+        let hose_id = format!("hose-drop-{:02}", index + 1);
+        let hose = visual(&hose_id);
+        assert_eq!(hose.asset, AssetKind::HoseDrop);
+        assert_eq!(
+            hose.transform.translation,
+            Vec3::new(x, HOSE_DROP_HEIGHT, 7.0)
+        );
+        assert!(hose.collision_required);
+        assert_eq!(
+            scene
+                .collider(&hose_id)
+                .expect("hose collider")
+                .half_extents,
+            Vec2::splat(0.2)
+        );
+
+        let aisle = scene.aisles[index];
+        assert_eq!(aisle.center_x, x);
+        assert_eq!(aisle.half_width, AISLE_HALF_WIDTH);
+        assert_eq!((aisle.z_min, aisle.z_max), (AISLE_Z_MIN, AISLE_Z_MAX));
+
+        for (side, offset) in [("west", -AISLE_HALF_WIDTH), ("east", AISLE_HALF_WIDTH)] {
+            let marking = visual(&format!("floor-marking-aisle-{:02}-{side}", index + 1));
+            assert_eq!(marking.asset, AssetKind::FloorMarking);
+            assert_eq!(
+                marking.transform.translation,
+                Vec3::new(x + offset, FLOOR_MARKING_HEIGHT, 0.0)
+            );
+            assert_eq!(
+                marking.transform.scale,
+                Vec3::new(FLOOR_MARKING_WIDTH, 1.0, AISLE_Z_MAX - AISLE_Z_MIN)
+            );
+        }
+    }
+
+    for (id, center) in [
+        ("cooling-unit-west-north", Vec2::new(-13.0, -6.0)),
+        ("cooling-unit-west-south", Vec2::new(-13.0, 6.0)),
+        ("cooling-unit-east-north", Vec2::new(13.0, -6.0)),
+        ("cooling-unit-east-south", Vec2::new(13.0, 6.0)),
+    ] {
+        let unit = visual(id);
+        assert_eq!(unit.asset, AssetKind::CoolingUnit);
+        assert_eq!(
+            unit.transform.translation,
+            Vec3::new(center.x, 0.0, center.y)
+        );
+        let collider = scene.collider(id).expect("cooling collider");
+        assert_eq!(collider.center, center);
+        assert_eq!(collider.half_extents, Vec2::new(1.05, 2.05));
+    }
+
+    assert_eq!(
+        visual("utility-cart").transform.translation,
+        Vec3::new(-13.0, 0.0, -10.0)
+    );
+    assert_eq!(
+        visual("step-stool").transform.translation,
+        Vec3::new(13.0, 0.0, 10.0)
+    );
+    for (id, translation) in [
+        (
+            "floor-marking-walkway-north",
+            Vec3::new(0.0, FLOOR_MARKING_HEIGHT, -14.0),
+        ),
+        (
+            "floor-marking-walkway-south",
+            Vec3::new(0.0, FLOOR_MARKING_HEIGHT, 14.0),
+        ),
+    ] {
+        let marking = visual(id);
+        assert_eq!(marking.transform.translation, translation);
+        assert_eq!(
+            marking.transform.scale,
+            Vec3::new(32.0, 1.0, FLOOR_MARKING_WIDTH)
+        );
+    }
+}
+
+#[test]
+fn design_every_asset_kind_is_either_a_generated_module_or_a_unit_primitive() {
+    assert_eq!(AssetKind::ALL.len(), 9);
+    for kind in AssetKind::ALL {
+        let primitive = kind.primitive();
+        let module = module_for(kind);
+        assert_ne!(
+            primitive.is_some(),
+            module.is_some(),
+            "{kind:?} must be exactly one of a unit primitive or a generated module"
+        );
+    }
+
+    assert_eq!(
+        AssetKind::Floor.primitive(),
+        Some((PrimitiveShape::Quad, PaletteRole::FloorLight))
+    );
+    assert_eq!(
+        AssetKind::Wall.primitive(),
+        Some((PrimitiveShape::Cuboid, PaletteRole::FloorShadow))
+    );
+    assert_eq!(
+        AssetKind::FloorMarking.primitive(),
+        Some((PrimitiveShape::Quad, PaletteRole::SignatureYellow))
+    );
+    assert_eq!(PrimitiveShape::ALL.len(), 2);
+}
+
+#[test]
+fn design_generated_modules_cover_every_declared_asset_scene() {
+    let modules = generated_modules();
+    let declared = ASSET_MODULES
+        .into_iter()
+        .flat_map(|(asset, modules)| {
+            modules
+                .iter()
+                .enumerate()
+                .map(move |(index, module)| (asset.to_owned(), (*module).to_owned(), index))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        modules
+            .iter()
+            .map(|module| (
+                module.asset.to_owned(),
+                module.module.to_owned(),
+                module.scene_index
+            ))
+            .collect::<Vec<_>>(),
+        declared
+    );
+    for module in &modules {
+        assert_eq!(
+            module.path(),
+            format!("{GENERATED_ASSET_DIRECTORY}/{}.glb", module.asset)
+        );
+        assert_eq!(
+            module.scene_path(),
+            format!(
+                "{GENERATED_ASSET_DIRECTORY}/{}.glb#Scene{}",
+                module.asset, module.scene_index
+            )
+        );
+    }
+
+    for kind in AssetKind::ALL {
+        if let Some(module) = module_for(kind) {
+            assert!(
+                modules.contains(&module),
+                "{kind:?} maps outside the pipeline"
+            );
+        }
+    }
+}
+
+#[test]
+fn design_aisle_checkpoints_sample_every_aisle_centreline() {
+    let scene = SceneBlueprint::v0();
+    let checkpoints = scene.aisle_checkpoints();
+    let per_aisle = ((AISLE_Z_MAX - AISLE_Z_MIN) / AISLE_CHECKPOINT_SPACING) as usize + 1;
+
+    assert_eq!(checkpoints.len(), per_aisle * scene.aisles.len());
+    for (aisle_index, aisle) in scene.aisles.iter().enumerate() {
+        let aisle_points = checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.aisle == aisle_index)
+            .collect::<Vec<_>>();
+        assert_eq!(aisle_points.len(), per_aisle);
+        assert_eq!(
+            aisle_points[0].point,
+            Vec2::new(aisle.center_x, aisle.z_min)
+        );
+        assert_eq!(
+            aisle_points[per_aisle - 1].point,
+            Vec2::new(aisle.center_x, aisle.z_max)
+        );
+        for point in &aisle_points {
+            assert_eq!(point.point.x, aisle.center_x);
+        }
+    }
+}
+
+#[test]
+fn design_flood_fill_joins_every_aisle_checkpoint_to_the_player_spawn() {
+    let scene = SceneBlueprint::v0();
+    let report = scene.walkable_report();
+
+    assert_eq!(report.cell_size, WALKABLE_CELL_SIZE);
+    assert!(report.unreachable.is_empty(), "{:?}", report.unreachable);
+    assert!(report.is_connected());
+    assert!(
+        report.reachable_cells > report.total_cells / 2,
+        "expected a mostly open hall, got {}/{}",
+        report.reachable_cells,
+        report.total_cells
+    );
+    assert_eq!(
+        report.narrowest_aisle_clearance,
+        AISLE_HALF_WIDTH * 2.0,
+        "every aisle checkpoint must keep the full authored corridor walkable"
+    );
+    assert!(report.narrowest_aisle_clearance >= PLAYER_RADIUS * 2.0);
+}
+
+#[test]
+fn design_flood_fill_reports_checkpoints_cut_off_from_the_player_spawn() {
+    let mut scene = SceneBlueprint::v0();
+    scene.visuals.push(VisualSpec::new(
+        "aisle-wall",
+        AssetKind::UtilityCart,
+        Vec3::new(AISLE_CENTER_X[1], 0.0, 0.0),
+        true,
+    ));
+    scene.colliders.push(ColliderSpec {
+        id: prop("aisle-wall"),
+        center: Vec2::new(AISLE_CENTER_X[1], 0.0),
+        half_extents: Vec2::new(AISLE_HALF_WIDTH, 0.5),
+    });
+
+    let report = scene.walkable_report();
+    assert!(!report.is_connected());
+    assert!(
+        report
+            .unreachable
+            .iter()
+            .all(|checkpoint| checkpoint.aisle == 1),
+        "{:?}",
+        report.unreachable
+    );
+    assert_eq!(
+        report
+            .unreachable
+            .iter()
+            .map(|checkpoint| checkpoint.point)
+            .collect::<Vec<_>>(),
+        [Vec2::new(AISLE_CENTER_X[1], 0.0)]
+    );
+    assert_eq!(
+        scene.validate(),
+        [SceneValidationError::BlockedAisle { index: 1 }]
+    );
 }
 
 #[test]
@@ -455,6 +842,519 @@ fn design_validator_checks_mid_orbit_camera_target_intervals() {
     assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 180 }));
 }
 
+// ---------------------------------------------------------------------------
+// Real Bevy app harness
+// ---------------------------------------------------------------------------
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TempAssets(PathBuf);
+
+impl TempAssets {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempAssets {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+}
+
+fn repo_assets() -> PathBuf {
+    repo_root().join("assets")
+}
+
+/// Copies every committed generated asset into a private directory so a test
+/// can corrupt or remove exactly one file without touching the repository.
+fn temp_assets(label: &str, mutate: impl FnOnce(&Path)) -> TempAssets {
+    let root = std::env::temp_dir().join(format!(
+        "midcreek-hall-{label}-{}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let generated = root.join(GENERATED_ASSET_DIRECTORY);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&generated).expect("temp asset root should be creatable");
+    for name in ASSET_NAMES {
+        let file = format!("{name}.glb");
+        fs::copy(
+            repo_assets().join(GENERATED_ASSET_DIRECTORY).join(&file),
+            generated.join(&file),
+        )
+        .expect("committed asset should be copyable");
+    }
+    mutate(&generated);
+    TempAssets(root)
+}
+
+fn hall_app(assets: &Path) -> App {
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .build()
+            .disable::<bevy::log::LogPlugin>()
+            .disable::<bevy::winit::WinitPlugin>()
+            .disable::<bevy::app::PanicHandlerPlugin>()
+            .disable::<bevy::app::TerminalCtrlCHandlerPlugin>()
+            .set(BevyAssetPlugin {
+                file_path: assets.to_string_lossy().into_owned(),
+                ..default()
+            })
+            .set(RenderPlugin {
+                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
+                    backends: None,
+                    ..default()
+                })),
+                ..default()
+            }),
+    )
+    .add_plugins(CellShiftPlugin);
+    app.finish();
+    app.cleanup();
+    app
+}
+
+fn settle_assets(app: &mut App) -> AssetLoadState {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        app.update();
+        let state = *app.world().resource::<State<AssetLoadState>>().get();
+        if state != AssetLoadState::Loading {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "generated assets never left AssetLoadState::Loading"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn pump(app: &mut App, frames: usize) {
+    for _ in 0..frames {
+        app.update();
+    }
+}
+
+fn built_hall(assets: &Path) -> App {
+    let mut app = hall_app(assets);
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+    pump(&mut app, 4);
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Ready
+    );
+    app
+}
+
+fn props(app: &mut App) -> Vec<(String, AssetKind, Transform)> {
+    app.world_mut()
+        .query::<(&HallProp, &Transform)>()
+        .iter(app.world())
+        .map(|(prop, transform)| (prop.id.as_str().to_owned(), prop.asset, *transform))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Asset loading contracts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hall_asset_plugin_becomes_ready_only_after_every_generated_module_loads() {
+    let mut app = hall_app(&repo_assets());
+    assert_eq!(
+        *app.world().resource::<State<AssetLoadState>>().get(),
+        AssetLoadState::Loading
+    );
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+    assert!(
+        app.world()
+            .resource::<AssetLoadReport>()
+            .failures()
+            .is_empty()
+    );
+
+    let server = app.world().resource::<AssetServer>().clone();
+    let generated = app.world().resource::<GeneratedAssets>();
+    assert_eq!(generated.documents().len(), ASSET_NAMES.len());
+    assert_eq!(generated.scenes().len(), generated_modules().len());
+    for handle in generated.handle_ids() {
+        assert!(
+            matches!(
+                server.get_recursive_dependency_load_state(handle),
+                Some(RecursiveDependencyLoadState::Loaded)
+            ),
+            "every tracked handle must be loaded before Ready"
+        );
+    }
+
+    let gltfs = app.world().resource::<Assets<Gltf>>();
+    for (asset, modules) in ASSET_MODULES {
+        let document = generated
+            .document(asset)
+            .and_then(|handle| gltfs.get(handle))
+            .unwrap_or_else(|| panic!("{asset} document should be loaded"));
+        for module in modules {
+            assert!(
+                document.named_scenes.contains_key(*module),
+                "{asset} must expose the {module} scene"
+            );
+        }
+    }
+    for kind in AssetKind::ALL {
+        assert_eq!(
+            generated.module_scene(kind).is_some(),
+            module_for(kind).is_some()
+        );
+    }
+}
+
+#[test]
+fn hall_asset_plugin_fails_loudly_when_a_generated_asset_is_missing() {
+    let assets = temp_assets("missing", |generated| {
+        fs::remove_file(generated.join("rack.glb")).expect("fixture asset should be removable");
+    });
+    let mut app = hall_app(assets.path());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Failed);
+    let failures = app
+        .world()
+        .resource::<AssetLoadReport>()
+        .failures()
+        .to_vec();
+    assert!(
+        failures.iter().any(|failure| failure.contains("rack.glb")),
+        "failure report must name the missing file, got {failures:?}"
+    );
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Unbuilt
+    );
+
+    pump(&mut app, 4);
+    assert!(
+        props(&mut app).is_empty(),
+        "a failed asset load must never fall back to procedural props"
+    );
+}
+
+#[test]
+fn hall_asset_plugin_fails_loudly_when_a_generated_asset_is_corrupt() {
+    let assets = temp_assets("corrupt", |generated| {
+        let path = generated.join("utility-props.glb");
+        let mut bytes = fs::read(&path).expect("fixture asset should be readable");
+        bytes.truncate(bytes.len() / 2);
+        fs::write(&path, bytes).expect("fixture asset should be writable");
+    });
+    let mut app = hall_app(assets.path());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Failed);
+    let failures = app
+        .world()
+        .resource::<AssetLoadReport>()
+        .failures()
+        .to_vec();
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("utility-props.glb")),
+        "failure report must name the corrupt file, got {failures:?}"
+    );
+    assert!(props(&mut app).is_empty());
+}
+
+#[test]
+fn hall_asset_plugin_fails_loudly_when_a_module_scene_name_is_wrong() {
+    let assets = temp_assets("mislabelled", |generated| {
+        let cooling = fs::read(generated.join("cooling-unit.glb")).expect("fixture readable");
+        fs::write(generated.join("rack.glb"), cooling).expect("fixture writable");
+    });
+    let mut app = hall_app(assets.path());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Failed);
+    let failures = app
+        .world()
+        .resource::<AssetLoadReport>()
+        .failures()
+        .to_vec();
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("rack") && failure.contains("rack-row")),
+        "failure report must name the missing module scene, got {failures:?}"
+    );
+    assert!(props(&mut app).is_empty());
+}
+
+#[test]
+fn hall_render_assets_cache_one_unit_mesh_per_shape_and_one_material_per_role() {
+    let mut app = hall_app(&repo_assets());
+    app.update();
+
+    let render = app.world().resource::<RenderAssets>();
+    let meshes = PrimitiveShape::ALL
+        .into_iter()
+        .map(|shape| render.mesh(shape).id())
+        .collect::<Vec<_>>();
+    let materials = PaletteRole::ALL
+        .into_iter()
+        .map(|role| render.material(role).id())
+        .collect::<Vec<_>>();
+
+    let mut unique_meshes = meshes.clone();
+    unique_meshes.sort();
+    unique_meshes.dedup();
+    let mut unique_materials = materials.clone();
+    unique_materials.sort();
+    unique_materials.dedup();
+    assert_eq!(unique_meshes.len(), PrimitiveShape::ALL.len());
+    assert_eq!(unique_materials.len(), PaletteRole::ALL.len());
+
+    for shape in PrimitiveShape::ALL {
+        assert_eq!(render.mesh(shape).id(), render.mesh(shape).id());
+    }
+    let stored = app.world().resource::<Assets<StandardMaterial>>();
+    for role in PaletteRole::ALL {
+        let material = stored
+            .get(&render.material(role))
+            .expect("every palette role must have one cached material");
+        assert_eq!(material.base_color, Color::Srgba(role.color()));
+        assert!(material.unlit, "cel shift materials must be unlit");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hall spawning contracts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hall_spawns_no_props_until_every_asset_handle_is_loaded() {
+    let mut app = hall_app(&repo_assets());
+    app.update();
+
+    assert_eq!(
+        *app.world().resource::<State<AssetLoadState>>().get(),
+        AssetLoadState::Loading
+    );
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Unbuilt
+    );
+    assert!(props(&mut app).is_empty());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+    pump(&mut app, 4);
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Ready
+    );
+    assert!(!props(&mut app).is_empty());
+}
+
+#[test]
+fn hall_spawns_every_authored_visual_once_with_the_reviewed_transform() {
+    let mut app = built_hall(&repo_assets());
+    let scene = SceneBlueprint::v0();
+    let spawned = props(&mut app);
+
+    assert_eq!(spawned.len(), scene.visuals.len());
+    assert_eq!(
+        spawned
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>()
+            .len(),
+        scene.visuals.len()
+    );
+    for visual in &scene.visuals {
+        let matches = spawned
+            .iter()
+            .filter(|(id, _, _)| id == visual.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "{} must spawn exactly once", visual.id);
+        let (_, kind, transform) = matches[0];
+        assert_eq!(*kind, visual.asset);
+        assert_eq!(transform.translation, visual.transform.translation);
+        assert_eq!(transform.scale, visual.transform.scale);
+        assert_eq!(
+            transform.rotation,
+            Quat::from_rotation_y(visual.transform.rotation_y_degrees.to_radians())
+        );
+    }
+
+    let mut roots = app.world_mut().query::<&HallRoot>();
+    assert_eq!(roots.iter(app.world()).count(), 1);
+}
+
+#[test]
+fn hall_spawns_unit_primitives_with_cached_meshes_and_palette_materials() {
+    let mut app = built_hall(&repo_assets());
+    let render = app.world().resource::<RenderAssets>().clone();
+    let scene = SceneBlueprint::v0();
+
+    let spawned = app
+        .world_mut()
+        .query::<(&HallProp, &Mesh3d, &MeshMaterial3d<StandardMaterial>)>()
+        .iter(app.world())
+        .map(|(prop, mesh, material)| (prop.id.as_str().to_owned(), mesh.0.id(), material.0.id()))
+        .collect::<Vec<_>>();
+
+    let primitives = scene
+        .visuals
+        .iter()
+        .filter(|visual| visual.asset.primitive().is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(spawned.len(), primitives.len());
+    assert_eq!(primitives.len(), 13);
+
+    for visual in primitives {
+        let (shape, role) = visual.asset.primitive().expect("primitive kind");
+        let (_, mesh, material) = spawned
+            .iter()
+            .find(|(id, _, _)| id == visual.id.as_str())
+            .unwrap_or_else(|| panic!("{} should spawn a primitive", visual.id));
+        assert_eq!(*mesh, render.mesh(shape).id());
+        assert_eq!(*material, render.material(role).id());
+    }
+}
+
+#[test]
+fn hall_spawns_generated_modules_as_shared_scene_roots_without_new_materials() {
+    let mut app = built_hall(&repo_assets());
+    let generated = app.world().resource::<GeneratedAssets>().clone();
+    let scene = SceneBlueprint::v0();
+    let material_count = app.world().resource::<Assets<StandardMaterial>>().len();
+
+    let spawned = app
+        .world_mut()
+        .query::<(&HallProp, &WorldAssetRoot)>()
+        .iter(app.world())
+        .map(|(prop, root)| (prop.id.as_str().to_owned(), prop.asset, root.0.id()))
+        .collect::<Vec<_>>();
+
+    let modules = scene
+        .visuals
+        .iter()
+        .filter(|visual| module_for(visual.asset).is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(spawned.len(), modules.len());
+    assert_eq!(modules.len(), 16);
+
+    for visual in &modules {
+        let (_, kind, handle) = spawned
+            .iter()
+            .find(|(id, _, _)| id == visual.id.as_str())
+            .unwrap_or_else(|| panic!("{} should spawn a generated module", visual.id));
+        assert_eq!(*kind, visual.asset);
+        assert_eq!(
+            *handle,
+            generated
+                .module_scene(visual.asset)
+                .expect("loaded module handle")
+                .id(),
+            "{} must reuse the one cached scene handle for {:?}",
+            visual.id,
+            visual.asset
+        );
+    }
+
+    pump(&mut app, 4);
+    assert_eq!(
+        app.world().resource::<Assets<StandardMaterial>>().len(),
+        material_count,
+        "spawning the hall must not create additional materials"
+    );
+
+    let mut meshes = app.world_mut().query::<&Mesh3d>();
+    assert!(
+        meshes.iter(app.world()).count() > modules.len(),
+        "generated module scenes must actually instantiate their merged meshes"
+    );
+}
+
+#[test]
+fn hall_caches_collider_rectangles_once_and_joins_them_to_visual_ids() {
+    let app = built_hall(&repo_assets());
+    let scene = SceneBlueprint::v0();
+    let colliders = app.world().resource::<HallColliders>();
+
+    assert_eq!(colliders.all(), scene.colliders.as_slice());
+    assert_eq!(
+        app.world().resource::<PlayerSpawnPoint>().0,
+        scene.player_spawn
+    );
+    assert!(app.world().resource::<HallErrors>().errors().is_empty());
+
+    for collider in scene.colliders.iter() {
+        assert!(
+            scene
+                .visual(collider.id.as_str())
+                .is_some_and(|visual| visual.collision_required),
+            "{} must join a collision-required visual",
+            collider.id
+        );
+        assert_eq!(
+            colliders.get(&collider.id).map(|found| found.center),
+            Some(collider.center)
+        );
+        assert!(colliders.overlaps(collider.center, 0.0));
+    }
+
+    assert_eq!(
+        colliders
+            .first_overlap(Vec2::new(RACK_ROW_X[0], 0.0), PLAYER_RADIUS)
+            .map(|collider| collider.id.as_str().to_owned()),
+        Some("rack-row-01".to_owned())
+    );
+    assert!(
+        colliders
+            .first_overlap(scene.player_spawn, PLAYER_RADIUS)
+            .is_none()
+    );
+    for checkpoint in scene.aisle_checkpoints() {
+        assert!(
+            colliders
+                .first_overlap(checkpoint.point, PLAYER_RADIUS)
+                .is_none(),
+            "aisle checkpoint {:?} must stay walkable",
+            checkpoint.point
+        );
+    }
+}
+
+#[test]
+fn hall_refuses_to_spawn_an_invalid_blueprint() {
+    let mut app = hall_app(&repo_assets());
+    let mut broken = SceneBlueprint::v0();
+    broken
+        .colliders
+        .retain(|collider| collider.id != prop("utility-cart"));
+    app.insert_resource(HallBlueprint(broken));
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+    pump(&mut app, 4);
+
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Invalid
+    );
+    assert_eq!(
+        app.world().resource::<HallErrors>().errors(),
+        [SceneValidationError::MissingRequiredCollider(prop(
+            "utility-cart"
+        ))]
+    );
+    assert!(props(&mut app).is_empty());
+    assert!(app.world().get_resource::<HallColliders>().is_none());
+}
+
 #[derive(Resource, Default)]
 struct SetTrace(Vec<CellShiftSet>);
 
@@ -479,25 +1379,22 @@ trace_system!(trace_verification, CellShiftSet::VerificationProbe);
 
 #[test]
 fn design_plugin_configures_shared_system_sets_in_reviewed_order() {
-    let mut app = App::new();
-    app.add_plugins(MinimalPlugins)
-        .add_plugins(CellShiftPlugin)
-        .init_resource::<SetTrace>()
-        .add_systems(
-            Update,
-            (
-                trace_verification.in_set(CellShiftSet::VerificationProbe),
-                trace_hud.in_set(CellShiftSet::UpdateHudAndBadges),
-                trace_follow_camera.in_set(CellShiftSet::FollowCamera),
-                trace_animation.in_set(CellShiftSet::UpdateAnimation),
-                trace_move_player.in_set(CellShiftSet::MovePlayer),
-                trace_operations.in_set(CellShiftSet::UpdateOperations),
-                trace_orbit_intent.in_set(CellShiftSet::UpdateOrbitIntent),
-                trace_read_input.in_set(CellShiftSet::ReadInput),
-                trace_spawn_world.in_set(CellShiftSet::SpawnWorld),
-                trace_asset_ready.in_set(CellShiftSet::AssetReady),
-            ),
-        );
+    let mut app = hall_app(&repo_assets());
+    app.init_resource::<SetTrace>().add_systems(
+        Update,
+        (
+            trace_verification.in_set(CellShiftSet::VerificationProbe),
+            trace_hud.in_set(CellShiftSet::UpdateHudAndBadges),
+            trace_follow_camera.in_set(CellShiftSet::FollowCamera),
+            trace_animation.in_set(CellShiftSet::UpdateAnimation),
+            trace_move_player.in_set(CellShiftSet::MovePlayer),
+            trace_operations.in_set(CellShiftSet::UpdateOperations),
+            trace_orbit_intent.in_set(CellShiftSet::UpdateOrbitIntent),
+            trace_read_input.in_set(CellShiftSet::ReadInput),
+            trace_spawn_world.in_set(CellShiftSet::SpawnWorld),
+            trace_asset_ready.in_set(CellShiftSet::AssetReady),
+        ),
+    );
 
     app.update();
 

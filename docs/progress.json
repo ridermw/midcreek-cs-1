@@ -33,17 +33,17 @@
     {
       "id": "data-hall",
       "title": "Load assets and build the data hall",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "autonomous-assets"
       ],
-      "summary": "Build the authored cel-shift data hall.",
-      "completed_commit": null
+      "summary": "Loaded every generated GLB through an explicit Loading, Ready, and Failed asset state with no procedural fallback, cached one unit mesh per primitive shape and one unlit material per palette role, and spawned the authored 40 m square hall: a polished floor inside low perimeter walls, four rack rows separated by three traversable aisles, four cooling units, three overhead trays with hose drops, painted yellow aisle and walkway markings, the red service cart, and the yellow step stool. Visual and collider lists stay separate and are joined by stable PropId, the colliders are extracted once into a cached vector, and a room-wide flood fill proves every aisle checkpoint shares one walkable component with the player spawn.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "technician-movement",
       "title": "Add the rigged technician and real keyboard movement",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "data-hall"
       ],
@@ -142,6 +142,15 @@
       "impact": "The plan forbids Blender, manual export, and human approval, so the rig, animation clips, and merged equipment geometry had to come from repository-owned source that a build gate can regenerate and byte-compare. Any hash-ordered map, embedded timestamp, or unquantized trigonometric value would have made the committed GLBs unverifiable.",
       "approach": "Assets are declared in assets/source/*.ron and tessellated by src/assetgen.rs. Every collection is ordered by declaration order or by the fixed PaletteRole order, every float is quantized onto a 1e-6 grid with negative zero normalised away, and the asset generator string is a constant with no version, host, path, or time data. Static geometry is merged into one primitive per palette role so server slots and LEDs never become runtime entities.",
       "resolution": "assetgen --check regenerates all five assets into two separate temporary roots, requires the two generations to be byte identical, and then requires the committed GLBs to match them exactly. tests/asset_contract.rs additionally parses every output and asserts node and scene names, the 11 named joints, the three clips, rigid skin weights, approved palette materials, finite bounds, valid indices, and the merge and triangle budgets.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "loud-asset-loading-without-a-gpu",
+      "title": "Proving real Bevy asset loading and hall identity with no GPU and no fallback",
+      "status": "resolved",
+      "impact": "The reviewed plan forbids any procedural fallback when a generated asset is missing or wrong, but a hall that silently substitutes geometry looks identical to a healthy one in a screenshot. The contract therefore had to be proved inside a real Bevy app, and the verification machine has no GPU adapter, so a normal windowed run could not be the gate.",
+      "approach": "src/assets.rs loads every generated document and every declared module scene, polls recursive dependency load state, and additionally requires each loaded glTF document to expose the module scene name the pipeline declares, so a mislabelled but structurally valid file still fails. Failures are recorded in AssetLoadReport and move the app to AssetLoadState::Failed; src/world.rs only spawns on entering AssetLoadState::Ready and refuses to spawn an invalid blueprint at all. Tests drive a real App built from DefaultPlugins with WinitPlugin disabled and RenderPlugin created with no wgpu backend, which registers every asset type and runs the real glTF loader headlessly.",
+      "resolution": "tests/app_contract.rs boots that headless app against the committed assets and asserts Ready, exact spawned entity, transform, cached mesh, palette material, and shared scene-handle contracts, then repeats the run against private copies of the assets with one file removed, one file truncated, and one file replaced by a different module, requiring AssetLoadState::Failed, a report naming the offending path, and zero spawned props each time.",
       "resolved_commit": "HEAD"
     }
   ]

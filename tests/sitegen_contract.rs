@@ -456,7 +456,10 @@ mod progress_contract {
                 .expect("sitegen should launch");
 
             assert_eq!(output.status.code(), Some(0));
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), "data-hall\n");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "technician-movement\n"
+            );
             assert!(output.stderr.is_empty());
         }
     }
@@ -494,14 +497,14 @@ mod progress_contract {
                 ),
                 (
                     "data-hall",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["autonomous-assets"][..],
-                    "Build the authored cel-shift data hall.",
-                    None,
+                    "Loaded every generated GLB through an explicit Loading, Ready, and Failed asset state with no procedural fallback, cached one unit mesh per primitive shape and one unlit material per palette role, and spawned the authored 40 m square hall: a polished floor inside low perimeter walls, four rack rows separated by three traversable aisles, four cooling units, three overhead trays with hose drops, painted yellow aisle and walkway markings, the red service cart, and the yellow step stool. Visual and collider lists stay separate and are joined by stable PropId, the colliders are extracted once into a cached vector, and a room-wide flood fill proves every aisle checkpoint shares one walkable component with the player spawn.",
+                    Some("HEAD"),
                 ),
                 (
                     "technician-movement",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["data-hall"][..],
                     "Add rigged camera-relative technician movement.",
                     None,
@@ -582,7 +585,13 @@ mod progress_contract {
                 .iter()
                 .map(|challenge| challenge.id.as_str())
                 .collect::<Vec<_>>();
-            assert_eq!(challenges, vec!["byte-reproducible-assets-without-a-dcc"]);
+            assert_eq!(
+                challenges,
+                vec![
+                    "byte-reproducible-assets-without-a-dcc",
+                    "loud-asset-loading-without-a-gpu",
+                ]
+            );
             for challenge in &document.challenges {
                 assert!(!challenge.title.trim().is_empty());
                 assert!(!challenge.impact.trim().is_empty());
