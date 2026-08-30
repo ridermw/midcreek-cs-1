@@ -39,26 +39,38 @@ jobs:
           fetch-depth: ${{ env.HISTORY_DEPTH }}
           filter: blob:none
 
-      - name: Prove the checked-out history reaches every referenced commit
-        run: ./scripts/ensure-history.sh
-
-      # The bound above is only worth having if the script that applies it is
-      # proved too. These are unit and fixture tests over repositories built on
-      # disk: they reach no network and start no browser, so they run here as a
-      # precondition rather than as one of the measured gates below.
-      - name: Test the history bound
-        run: python3 scripts/ensure_history_test.py
-
       # The runner's temporary directory is a runner fact, and a job-level
       # `env:` is evaluated before a runner exists. It is resolved here, from
       # the environment the runner really hands the step, so every later step
       # names one workflow-owned result root instead of rebuilding the path.
+      #
+      # It is resolved first, before any step that can fail. A job that died
+      # before this ran would leave the summary below with no result root to
+      # read and no gate file to summarize, and would publish a run that could
+      # not say what went wrong with it.
       - name: Resolve the native result root
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/native"
           echo "RESULT=$RUNNER_TEMP/native" >> "$GITHUB_ENV"
           echo "GATES=$RUNNER_TEMP/native/gates.jsonl" >> "$GITHUB_ENV"
+
+      # The history bound and the script that applies it are measured gates
+      # like every other, not preconditions. A short clone is a fact this run
+      # publishes: the later gates still run, the summary still counts them,
+      # and the artifact still travels, instead of the job ending here with
+      # nothing to show for it. These reach no network beyond the repository's
+      # own remote and start no browser.
+      - name: Run the history gates
+        run: |
+          set -uo pipefail
+
+          ./scripts/run-gate.sh "$GATES" "Published history bound" -- \
+            ./scripts/ensure-history.sh
+
+          ./scripts/run-gate.sh "$GATES" "History bound tests" -- \
+            python3 scripts/ensure_history_test.py
+
 
       - name: Install Linux build prerequisites
         run: |
@@ -163,13 +175,14 @@ jobs:
           ./scripts/run-gate.sh "$GATES" "Release build" -- \
             cargo build --release
 
-          # Every named gate above has to leave exactly one row behind. A gate
-          # name the recording runner refuses is recorded nowhere and its
-          # command never runs, so a run that is short a row would otherwise
-          # publish a green matrix with one gate silently missing from it. The
-          # shortfall becomes a public failed row instead, and the verdict step
-          # below concludes on it like any other red gate.
-          expected=12
+          # Every named gate above has to leave exactly one row behind, and the
+          # history gates measured before them count too. A gate name the
+          # recording runner refuses is recorded nowhere and its command never
+          # runs, so a run that is short a row would otherwise publish a green
+          # matrix with one gate silently missing from it. The shortfall becomes
+          # a public failed row instead, and the verdict step below concludes on
+          # it like any other red gate.
+          expected=14
           recorded=0
           if [[ -f "$GATES" ]]; then
             recorded="$(grep -c '' "$GATES")"
@@ -292,18 +305,22 @@ jobs:
           fetch-depth: ${{ env.HISTORY_DEPTH }}
           filter: blob:none
 
-      - name: Prove the checked-out history reaches every referenced commit
-        run: ./scripts/ensure-history.sh
-
-      # As in Verify: the runner context does not exist when a job-level `env:`
-      # is evaluated, so the result root is resolved from the runner's own
-      # environment in a step.
       - name: Resolve the web result root
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/web"
           echo "RESULT=$RUNNER_TEMP/web" >> "$GITHUB_ENV"
           echo "GATES=$RUNNER_TEMP/web/gates.jsonl" >> "$GITHUB_ENV"
+
+      # As in Verify, the history bound is a measured gate rather than a
+      # precondition, so a short clone is published as a failed row and the web
+      # gates below still run and are still counted.
+      - name: Run the history gate
+        run: |
+          set -uo pipefail
+
+          ./scripts/run-gate.sh "$GATES" "Published history bound" -- \
+            ./scripts/ensure-history.sh
 
       - name: Install Linux build prerequisites
         run: |
@@ -357,8 +374,9 @@ jobs:
 
           # As in Verify: a refused gate name records nothing, so a short row
           # count is published as a failed row rather than as a green matrix
-          # with a gate missing from it.
-          expected=3
+          # with a gate missing from it. The history gate measured before these
+          # counts too.
+          expected=4
           recorded=0
           if [[ -f "$GATES" ]]; then
             recorded="$(grep -c '' "$GATES")"
@@ -426,7 +444,12 @@ jobs:
           fetch-depth: ${{ env.HISTORY_DEPTH }}
           filter: blob:none
 
-      - name: Prove the checked-out history reaches every referenced commit
+      # Publish has to publish. A short clone is already a failed row measured
+      # in Verify, so this repairs the history when it can and never ends the
+      # job when it cannot: the generator below decides what it can publish
+      # from what it actually has.
+      - name: Reach every referenced commit if the history allows it
+        continue-on-error: true
         run: ./scripts/ensure-history.sh
 
       - name: Check out previous Pages site

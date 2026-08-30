@@ -325,5 +325,89 @@ class DeepeningSourceTest(unittest.TestCase):
         self.assertIn("[0-9a-fA-F]{40}", self.SOURCE)
 
 
+class CleanGateOrderTest(unittest.TestCase):
+    """The local gate repairs history before anything validates against it."""
+
+    CHECK = (SCRIPT.parent / "check.sh").read_text(encoding="utf-8")
+
+    def test_the_history_bound_runs_before_progress_validation(self) -> None:
+        """The defect this guards: `set -e` ending the gate on a short clone.
+
+        `sitegen validate` resolves the commit every finished task names. On a
+        shallow checkout that fails, and it fails hard, so the run never
+        reaches the step that would have deepened the history for it.
+        """
+        history = self.CHECK.index("./scripts/ensure-history.sh")
+        validate = self.CHECK.index("sitegen -- validate")
+
+        self.assertLess(
+            history, validate, "history must be repaired before it is validated"
+        )
+
+    def test_the_history_bound_and_its_tests_are_both_in_the_clean_gate(self) -> None:
+        self.assertIn("./scripts/ensure-history.sh", self.CHECK)
+        self.assertIn("python3 scripts/ensure_history_test.py", self.CHECK)
+
+    def test_the_workflow_lint_still_runs_before_the_expensive_gates(self) -> None:
+        """Preserved from the contract this file's ordering rule sits beside."""
+        lint = self.CHECK.index("./scripts/actionlint.sh")
+        clippy = self.CHECK.index("cargo clippy")
+
+        self.assertLess(lint, clippy)
+
+
+class WorkflowGateOrderTest(unittest.TestCase):
+    """Nothing that can fail runs before the result root exists."""
+
+    WORKFLOW = (
+        SCRIPT.parent.parent / ".github" / "workflows" / "pages.yml"
+    ).read_text(encoding="utf-8")
+
+    def job(self, name: str) -> str:
+        start = self.WORKFLOW.index(f"\n  {name}:\n")
+        rest = self.WORKFLOW[start + 1 :]
+        end = rest.find("\n  publish:\n") if name != "publish" else -1
+        return rest if end < 0 else rest[:end]
+
+    def test_each_measured_job_resolves_its_result_root_first(self) -> None:
+        """The defect this guards: a job that died with nothing to report.
+
+        A step that fails before `RESULT` and `GATES` exist leaves the summary
+        with no gate file to read and no root to write, so the run publishes a
+        failure that cannot say which gate it was.
+        """
+        for name, root in (("verify", "native"), ("build-web", "web")):
+            job = self.job(name)
+            resolve = job.index(f"- name: Resolve the {root} result root")
+            for later in ("ensure-history.sh", "run-gate.sh", "apt-get"):
+                self.assertLess(
+                    resolve,
+                    job.index(later),
+                    f"{name} should resolve its result root before {later}",
+                )
+
+    def test_history_validation_is_a_measured_gate_in_both_jobs(self) -> None:
+        for name in ("verify", "build-web"):
+            job = self.job(name)
+            self.assertIn(
+                'run-gate.sh "$GATES" "Published history bound" -- \\', job, name
+            )
+        self.assertIn(
+            'run-gate.sh "$GATES" "History bound tests" -- \\', self.job("verify")
+        )
+
+    def test_the_recorded_row_counts_include_the_history_gates(self) -> None:
+        self.assertIn("expected=14", self.job("verify"))
+        self.assertIn("expected=4", self.job("build-web"))
+
+    def test_publish_never_ends_on_a_history_repair(self) -> None:
+        """Publish has to publish, whatever the history turned out to be."""
+        publish = self.job("publish")
+        step = publish.index("- name: Reach every referenced commit if the history allows it")
+        body = publish[step : step + 400]
+
+        self.assertIn("continue-on-error: true", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

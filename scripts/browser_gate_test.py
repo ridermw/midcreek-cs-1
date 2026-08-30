@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -793,6 +794,60 @@ class BoundedBodyTest(unittest.TestCase):
 
         self.assertIn("budget", str(failure.exception))
 
+    def test_a_real_response_exposes_the_socket_the_reads_are_clamped_on(self) -> None:
+        """The clamp is only a guarantee if the socket is really reachable."""
+        server = TricklingBodyServer()
+        self.addCleanup(server.close)
+
+        with urllib.request.urlopen(server.url, timeout=5) as response:
+            connection = browser_gate.response_socket(response)
+
+            self.assertIsNotNone(
+                connection, "the body reads cannot be clamped to the deadline"
+            )
+            self.assertTrue(hasattr(connection, "settimeout"))
+
+    def test_every_body_read_is_re_clamped_to_what_is_left(self) -> None:
+        """The defect this guards: a body that trickles and then stops dead.
+
+        The connection was opened with the budget that was left at the time.
+        Without re-clamping, a read that starts much later blocks on that
+        original, far larger timeout.
+        """
+
+        class RecordingSocket:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def settimeout(self, timeout: float) -> None:
+                self.timeouts.append(timeout)
+
+        class Raw:
+            def __init__(self, connection: RecordingSocket) -> None:
+                self._sock = connection
+
+        class Response:
+            def __init__(self, connection: RecordingSocket) -> None:
+                self.fp = Raw(connection)
+                self._chunks = [b"a" * 4096, b"b" * 4096, b""]
+
+            def read1(self, size: int) -> bytes:
+                return self._chunks.pop(0)
+
+        connection = RecordingSocket()
+        deadline = browser_gate.Deadline(30.0)
+
+        browser_gate.read_bounded(Response(connection), 1_000_000, deadline, "reading")
+
+        self.assertGreaterEqual(
+            len(connection.timeouts), 3, "each read should have been clamped"
+        )
+        self.assertTrue(all(value <= 30.0 for value in connection.timeouts))
+        self.assertTrue(
+            connection.timeouts[-1] <= connection.timeouts[0],
+            "the clamp should shrink with the remaining budget",
+        )
+
 
 class KeyboardOwnershipTest(unittest.TestCase):
     """Drives the real gate functions against the scriptable page."""
@@ -1388,6 +1443,62 @@ class EntryPointTest(unittest.TestCase):
             return summary, {"class": "play-embed"}
 
         self.replace_run_gate(slow)
+
+        code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 1)
+        self.assertFalse((self.diagnostics / "browser-gate.json").exists())
+        self.assertFalse((self.diagnostics / "embed-gate.json").exists())
+
+    def test_expiring_while_the_sessions_close_is_not_a_pass(self) -> None:
+        """Cleanup is inside the budget too, not after it."""
+        summary = {"canvas": {}, "pixels": {}, "ready_seconds": 1.0, "scroll": {}}
+        expired: list[str] = []
+
+        def open_then_expire(arguments: object, sessions: list, deadline: object) -> tuple:
+            class Session:
+                def close(self) -> None:
+                    expired.append("closed")
+                    deadline._expires = time.monotonic() - 1.0
+
+            class OpenedPage:
+                session = Session()
+                scope = browser_gate.TOP_SCOPE
+
+            sessions.append(OpenedPage())
+            return summary, {"class": "play-embed"}
+
+        self.replace_run_gate(open_then_expire)
+
+        code = browser_gate.main(self.arguments())
+
+        self.assertEqual(expired, ["closed"])
+        self.assertEqual(code, 1)
+        self.assertFalse((self.diagnostics / "browser-gate.json").exists())
+
+    def test_expiring_between_the_reports_leaves_neither_behind(self) -> None:
+        """A half-written pair is evidence the site would otherwise publish."""
+        summary = {"canvas": {}, "pixels": {}, "ready_seconds": 1.0, "scroll": {}}
+
+        class ExpiringDeadline(browser_gate.Deadline):
+            """Expires the moment the first report has been written."""
+
+            def __init__(self, budget: float = 600.0) -> None:
+                super().__init__(budget)
+                self.checks = 0
+
+            def require(self, doing: str) -> float:
+                self.checks += 1
+                if self.checks > 2:
+                    self._expires = time.monotonic() - 1.0
+                return super().require(doing)
+
+        original = browser_gate.Deadline
+        browser_gate.Deadline = ExpiringDeadline
+        self.addCleanup(setattr, browser_gate, "Deadline", original)
+        self.replace_run_gate(
+            lambda arguments, sessions, deadline: (summary, {"class": "play-embed"})
+        )
 
         code = browser_gate.main(self.arguments())
 

@@ -605,24 +605,64 @@ def resolve_url(base_url: str, relative: str) -> str:
     return f"{base_url.rstrip('/')}/{quoted}" if quoted else f"{base_url.rstrip('/')}/"
 
 
+def response_socket(response: object) -> object | None:
+    """The socket underneath an ``http.client`` response, when it is reachable.
+
+    urllib does not publish it, so it is walked defensively — but it is not
+    optional: without it a body that stops arriving blocks on the timeout the
+    connection was opened with, which was clamped to a budget that has since
+    shrunk. A test proves this lookup really finds it on the Python that runs.
+    """
+    fp = getattr(response, "fp", None)
+    for holder in (getattr(fp, "raw", None), fp, response):
+        found = getattr(holder, "_sock", None)
+        if found is not None and hasattr(found, "settimeout"):
+            return found
+    return None
+
+
 def read_bounded(response: object, limit: int, deadline: Deadline, doing: str) -> bytes:
     """Reads at most ``limit`` bytes, spending the whole gate's budget.
 
     A socket timeout is an inactivity timer: a server that sends one byte
-    whenever it is about to expire resets it forever. The deadline is checked
-    between chunks instead, so a trickled body ends the gate rather than
-    extending it, and the timeout the connection was opened with is already
-    clamped to the same budget for a body that stops arriving altogether.
+    whenever it is about to expire resets it forever. So the deadline is
+    checked between chunks, and the socket is re-clamped to what is left of it
+    before each one — otherwise a body that trickles and then stops dead would
+    block on a timeout set when the budget was much larger.
     """
     data = bytearray()
+    connection = response_socket(response)
     reader = getattr(response, "read1", None) or response.read
     while len(data) < limit:
-        deadline.require(doing)
-        chunk = reader(min(4096, limit - len(data)))
+        remaining = deadline.require(doing)
+        if connection is not None:
+            try:
+                connection.settimeout(min(BROWSER_TIMEOUT_SECONDS, remaining))
+            except OSError:
+                pass
+        chunk = read_chunk(reader, min(4096, limit - len(data)), deadline, doing)
         if not chunk:
             break
         data += chunk
     return bytes(data)
+
+
+def read_chunk(reader: object, size: int, deadline: Deadline, doing: str) -> bytes:
+    """One clamped read, with a timeout reported as what it really was."""
+    try:
+        return reader(size)
+    except TimeoutError as failure:
+        # The clamp above is what ended this read, so an expired budget is the
+        # honest explanation; a peer that went quiet inside a live budget is
+        # the other one.
+        deadline.require(doing)
+        raise GateFailure(
+            f"the response stopped arriving while {doing}: {failure}"
+        ) from failure
+    except OSError as failure:
+        raise GateFailure(
+            f"the response could not be read while {doing}: {failure}"
+        ) from failure
 
 
 def require_http_200(base_url: str, relative: str, deadline: Deadline) -> None:
@@ -1422,10 +1462,6 @@ def main(argv: list[str] | None = None) -> int:
     pages: list[Page] = []
     try:
         summary, embed = run_gate(arguments, pages, deadline)
-        # A gate that ran out of time has not passed, however far it got. The
-        # budget is checked once more here so an expired run reports a failure
-        # instead of writing the report a green run publishes.
-        deadline.require("completing the browser gate")
     except GateFailure as failure:
         return report_failure(pages, arguments.diagnostics, str(failure))
     # A driver defect is not a passing gate. Anything the phases above did not
@@ -1441,17 +1477,34 @@ def main(argv: list[str] | None = None) -> int:
         for page in pages:
             page.session.close()
 
-    arguments.diagnostics.mkdir(parents=True, exist_ok=True)
+    # Closing the sessions and writing the reports are the last things this run
+    # does, and running out of time during either of them is still running out
+    # of time. The budget is therefore checked after the cleanup and after each
+    # report, and anything already written is taken back: a partial report left
+    # behind by an expired run is evidence the site would otherwise publish.
+    #
     # `browser-gate.json` is a schema the site generator reads strictly and
     # refuses to grow, so the embed proof is kept beside it rather than added
     # to it. A field this gate invented would make the whole browser evidence
     # unreadable and silently drop it from the published run.
-    (arguments.diagnostics / "browser-gate.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    reports = (
+        (arguments.diagnostics / "browser-gate.json", summary),
+        (arguments.diagnostics / "embed-gate.json", embed),
     )
-    (arguments.diagnostics / "embed-gate.json").write_text(
-        json.dumps(embed, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    try:
+        deadline.require("closing the browser sessions")
+        arguments.diagnostics.mkdir(parents=True, exist_ok=True)
+        for path, document in reports:
+            path.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            deadline.require(f"writing {path.name}")
+    except GateFailure as failure:
+        for path, _ in reports:
+            path.unlink(missing_ok=True)
+        print(f"browser gate failed: {failure}", file=sys.stderr)
+        return 1
+
     print(json.dumps({"standalone": summary, "embedded": embed}, indent=2, sort_keys=True))
     return 0
 
