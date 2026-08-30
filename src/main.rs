@@ -6,6 +6,11 @@
 //!
 //! An unusable output path is a usage error, not a crash: it exits with code 2
 //! and one line on stderr naming the path and the reason.
+//!
+//! `midcreek-cs-1 --verify-flood <bytes>` is the pipe fixture: it writes that
+//! many bytes to each of stdout and stderr and exits successfully, so the
+//! parent watchdog's concurrent drain can be proven against a child that
+//! really does overrun the platform pipe buffers.
 
 use std::process::ExitCode;
 
@@ -19,7 +24,7 @@ fn main() -> ExitCode {
 fn main() -> ExitCode {
     use std::env;
 
-    use midcreek_cs_1::verification::{VerifyOutput, parse_verification_args};
+    use midcreek_cs_1::verification::{VerifyOutput, parse_verification_args, run_flood};
 
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let request = match parse_verification_args(arguments) {
@@ -29,6 +34,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if let Some(bytes) = request.flood {
+        return run_flood(bytes);
+    }
 
     let Some(path) = request.output else {
         midcreek_cs_1::run();

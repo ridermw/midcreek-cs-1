@@ -10,6 +10,7 @@ use bevy::{
     asset::{AssetPlugin as BevyAssetPlugin, RecursiveDependencyLoadState},
     camera::ScalingMode,
     color::palettes::css::BLACK,
+    core_pipeline::tonemapping::{DebandDither, Tonemapping},
     input::{
         ButtonState,
         keyboard::{Key, KeyboardInput, NativeKey},
@@ -34,9 +35,9 @@ use midcreek_cs_1::{
         generated_modules, module_for,
     },
     camera::{
-        CAMERA_DISTANCE, CameraHeading, CameraOrbit, CellShiftCamera, active_coverage,
-        camera_target_bounds, clamp_follow_target, coverage_holds_room, ground_half_depth,
-        ground_quadrilateral,
+        CAMERA_DISTANCE, CEL_SHIFT_DEBAND_DITHER, CEL_SHIFT_TONEMAPPING, CameraHeading,
+        CameraOrbit, CellShiftCamera, active_coverage, camera_target_bounds, clamp_follow_target,
+        coverage_holds_room, ground_half_depth, ground_quadrilateral,
     },
     design::{
         AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
@@ -74,6 +75,7 @@ use midcreek_cs_1::{
         TECHNICIAN_MODEL_FORWARD, Technician, ViewBasis, arrow_input, required_player_parts,
         update_player_animation,
     },
+    verification::{SENTINEL_CLEAR, VERIFICATION_MSAA},
     world::{
         HallBlueprint, HallColliders, HallErrors, HallProp, HallRoot, HallState, PlayerSpawnPoint,
     },
@@ -2916,6 +2918,50 @@ fn camera_app(assets: &Path) -> App {
     )));
     app.update();
     app
+}
+
+#[test]
+fn camera_carries_the_cel_shift_display_contract_in_the_shipped_game() {
+    let mut app = camera_app(&repo_assets());
+    let entity = camera_entity(&mut app);
+
+    // The authored palette has to reach the framebuffer unchanged. Bevy's
+    // `Camera3d` otherwise requires `Tonemapping::TonyMcMapface`, a filmic
+    // display transform, and `DebandDither::Enabled`, which sprays noise over
+    // every flat fill. Both would make the shipped game draw colours the
+    // palette never authored, and — because verification renders the *same*
+    // camera — would make every measured palette ratio a picture no player
+    // ever sees.
+    assert_eq!(
+        app.world().get::<Tonemapping>(entity).copied(),
+        Some(CEL_SHIFT_TONEMAPPING),
+        "the shipped camera must bypass tonemapping"
+    );
+    assert_eq!(CEL_SHIFT_TONEMAPPING, Tonemapping::None);
+    assert_ne!(CEL_SHIFT_TONEMAPPING, Tonemapping::default());
+
+    assert_eq!(
+        app.world().get::<DebandDither>(entity).copied(),
+        Some(CEL_SHIFT_DEBAND_DITHER),
+        "the shipped camera must not dither the flat fills"
+    );
+    assert_eq!(CEL_SHIFT_DEBAND_DITHER, DebandDither::Disabled);
+
+    // Multisampling is the one setting verification is allowed to change, so
+    // the shipped camera must still be on the engine default.
+    assert_eq!(
+        app.world().get::<Msaa>(entity).copied(),
+        Some(Msaa::default()),
+        "the shipped camera must leave multisampling at the engine default"
+    );
+    assert_eq!(VERIFICATION_MSAA, Msaa::Off);
+    assert_ne!(VERIFICATION_MSAA, Msaa::default());
+    assert_eq!(
+        app.world().resource::<ClearColor>().0.to_srgba(),
+        FLOOR_LIGHT,
+        "the shipped clear colour is the floor, not the verification sentinel"
+    );
+    assert_ne!(FLOOR_LIGHT, SENTINEL_CLEAR);
 }
 
 #[test]

@@ -12,8 +12,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, Stdio},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -24,20 +25,23 @@ use std::{
 use bevy::color::ColorToPacked;
 use image::RgbImage;
 use midcreek_cs_1::{
+    camera::{CEL_SHIFT_DEBAND_DITHER, CEL_SHIFT_TONEMAPPING},
     design::{
-        CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, KEY_ART_REFERENCE_PATH,
-        KEY_ART_SHA256, PaletteRole,
+        AssetKind, CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, FLOOR_LIGHT,
+        KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, PaletteRole, SceneBlueprint,
     },
     player::required_player_parts,
     verification::{
         APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CLIP_DIFFERENCE_RANGE,
-        FrameFacts, FrameMetrics, FrameName, GameplayFacts, HudRowFacts, OUTSIDE_CROP_MAX,
-        PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_MAX, StageError, StageMachine,
-        VerificationFault, VerificationReport, VerificationRequest, VerificationStage,
-        VerifyOutput, VerifyOutputError, WORKER_REGION, axis_aligned_fixture, badge_region,
-        black_fixture, blank_hud_fixture, canonical_f64, canonical_float, canonical_json,
-        clip_difference, evaluate_frame, frame_regions, gradient_noise_fixture, hud_region,
-        magenta_border_fixture, missing_badge_fixture, missing_worker_fixture, outside_crop_change,
+        CameraRenderFacts, EQUIPMENT_REGION_MIN_PIXELS, EQUIPMENT_ROLE_MIN, EquipmentCategory,
+        EquipmentFacts, FrameFacts, FrameMetrics, FrameName, GameplayFacts, HudRowFacts,
+        OUTSIDE_CROP_MAX, PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, SENTINEL_MAX,
+        StageError, StageMachine, VERIFICATION_MSAA, VerificationFault, VerificationReport,
+        VerificationRequest, VerificationStage, VerifyOutput, VerifyOutputError, WORKER_REGION,
+        axis_aligned_fixture, badge_region, black_fixture, blank_hud_fixture, canonical_f64,
+        canonical_float, canonical_json, clip_difference, equipment_region, evaluate_frame,
+        flood_bytes, frame_regions, gradient_noise_fixture, hud_region, magenta_border_fixture,
+        missing_badge_fixture, missing_worker_fixture, outside_crop_change,
         parse_verification_args, reference_metrics, semantic_hash, synthetic_badges,
         synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
     },
@@ -600,6 +604,7 @@ fn sample_report() -> VerificationReport {
         badges: Vec::new(),
         tickets: Vec::new(),
         rack_states: vec!["healthy".to_owned(); 4],
+        equipment: Vec::new(),
     };
     VerificationReport {
         schema_version: 1,
@@ -621,6 +626,12 @@ fn sample_report() -> VerificationReport {
             player_spawn: [-6.0, -11.0],
             walkable_connected: true,
             validation_errors: Vec::new(),
+        },
+        camera: CameraRenderFacts {
+            tonemapping: "None".to_owned(),
+            deband_dither: "Disabled".to_owned(),
+            msaa_samples: 1,
+            clear_color: "#FF00FF".to_owned(),
         },
         gameplay: GameplayFacts {
             fault_seed: "0xce115a1fda7ace01".to_owned(),
@@ -963,20 +974,30 @@ fn parse(arguments: &[&str]) -> Result<VerificationRequest, String> {
 }
 
 #[test]
-fn command_line_accepts_the_two_documented_shapes() {
+fn command_line_accepts_the_documented_shapes() {
     assert_eq!(parse(&[]), Ok(VerificationRequest::default()));
     assert_eq!(
         parse(&["--verify-output", "frames"]),
         Ok(VerificationRequest {
             output: Some(PathBuf::from("frames")),
-            fault: None
+            fault: None,
+            flood: None,
         })
     );
     assert_eq!(
         parse(&["--verify-output=frames", "--verify-fault=stall"]),
         Ok(VerificationRequest {
             output: Some(PathBuf::from("frames")),
-            fault: Some(VerificationFault::Stall)
+            fault: Some(VerificationFault::Stall),
+            flood: None,
+        })
+    );
+    assert_eq!(
+        parse(&["--verify-flood", "4096"]),
+        Ok(VerificationRequest {
+            output: None,
+            fault: None,
+            flood: Some(4096),
         })
     );
 }
@@ -989,6 +1010,11 @@ fn command_line_rejects_every_other_shape() {
         vec!["--verify-fault", "stall"],
         vec!["--verify-output", "a", "--verify-fault"],
         vec!["--verify-output", "a", "--verify-fault", "explode"],
+        vec!["--verify-flood"],
+        vec!["--verify-flood", "0"],
+        vec!["--verify-flood", "lots"],
+        vec!["--verify-flood", "16", "--verify-flood", "32"],
+        vec!["--verify-flood", "16", "--verify-output", "a"],
         vec!["--play"],
         vec!["frames"],
     ] {
@@ -1079,23 +1105,54 @@ struct Launch {
     stderr: String,
 }
 
+impl Launch {
+    /// Everything the child said, for a failure message.
+    fn diagnostics(&self) -> String {
+        format!(
+            "stdout ({} bytes):\n{}\nstderr ({} bytes):\n{}",
+            self.stdout.len(),
+            self.stdout,
+            self.stderr.len(),
+            self.stderr
+        )
+    }
+}
+
 /// Runs the compiled game once, polling with `try_wait` and killing the exact
 /// child process if the parent watchdog expires.
-fn launch(output: &Path, fault: Option<VerificationFault>, watchdog: Duration) -> Launch {
+///
+/// Both pipes are drained by their own thread from the moment the child
+/// starts. A parent that instead waits for exit before reading deadlocks the
+/// first time the child writes more than one pipe buffer — a real risk here,
+/// because a failing run prints every metric it measured — and a parent that
+/// drains one pipe to the end before touching the other deadlocks as soon as
+/// the child fills the one it is not reading. `--verify-flood` exists to prove
+/// this loop against a child that overruns both.
+fn launch_arguments(arguments: &[String], watchdog: Duration) -> Launch {
     let _serialized = APP_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let mut command = Command::new(binary());
     command
-        .arg("--verify-output")
-        .arg(output)
+        .args(arguments)
         .current_dir(repository())
         .env("BEVY_ASSET_ROOT", repository())
         .env("RUST_LOG", "error")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(fault) = fault {
-        command.arg("--verify-fault").arg(fault.name());
-    }
     let mut child = command.spawn().expect("the compiled game starts");
+
+    let mut out_pipe = child.stdout.take().expect("stdout was piped");
+    let mut err_pipe = child.stderr.take().expect("stderr was piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buffer);
+        buffer
+    });
 
     let started = Instant::now();
     let deadline = started + watchdog;
@@ -1113,18 +1170,30 @@ fn launch(output: &Path, fault: Option<VerificationFault>, watchdog: Duration) -
             }
         }
     };
-    let collected = child.wait_with_output().unwrap_or_else(|_| Output {
-        status,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    });
+    let elapsed = started.elapsed();
+    // Both pipes are closed by the exited child, so both readers are already
+    // finishing; joining them is what guarantees the buffers are complete.
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     Launch {
         code: status.code(),
         killed,
-        elapsed: started.elapsed(),
-        stdout: String::from_utf8_lossy(&collected.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&collected.stderr).into_owned(),
+        elapsed,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }
+}
+
+fn launch(output: &Path, fault: Option<VerificationFault>, watchdog: Duration) -> Launch {
+    let mut arguments = vec![
+        "--verify-output".to_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+    if let Some(fault) = fault {
+        arguments.push("--verify-fault".to_owned());
+        arguments.push(fault.name().to_owned());
+    }
+    launch_arguments(&arguments, watchdog)
 }
 
 /// One complete rendered run, kept alive for the whole test binary.
@@ -1185,16 +1254,16 @@ fn render_into(root: &Path, label: &str) -> RenderedRun {
 
     assert!(
         !launched.killed,
-        "the {label} verification run had to be killed by the {PARENT_WATCHDOG:?} parent watchdog; artifacts kept in {}\nstderr:\n{}",
+        "the {label} verification run had to be killed by the {PARENT_WATCHDOG:?} parent watchdog; artifacts kept in {}\n{}",
         root.display(),
-        launched.stderr
+        launched.diagnostics()
     );
     assert_eq!(
         launched.code,
         Some(0),
-        "the {label} verification run failed; artifacts kept in {}\nstderr:\n{}",
+        "the {label} verification run failed; artifacts kept in {}\n{}",
         root.display(),
-        launched.stderr
+        launched.diagnostics()
     );
 
     let canonical = fs::read_to_string(root.join(REPORT_FILE_NAME))
@@ -1583,6 +1652,418 @@ fn generated_negative_fixtures_cut_from_real_frames_are_rejected() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Equipment-scoped contracts
+// ---------------------------------------------------------------------------
+
+/// Every authored prop identifier of one category, from the real report.
+fn category_props(facts: &FrameFacts, category: EquipmentCategory) -> Vec<&EquipmentFacts> {
+    facts
+        .equipment
+        .iter()
+        .filter(|prop| prop.category == category.name())
+        .collect()
+}
+
+/// The four settled headings taken from the middle of the hall.
+const CENTER_FRAMES: [FrameName; 4] = [
+    FrameName::HealthyCenterNorthEast,
+    FrameName::SettledSouthEast,
+    FrameName::SettledSouthWest,
+    FrameName::SettledNorthWest,
+];
+
+/// Whether one failing metric is one equipment category's own category-level
+/// contract, rather than a per-prop one.
+fn is_category_metric(metric: &str, category: EquipmentCategory) -> bool {
+    metric.starts_with(&format!("equipment-{}", category.name()))
+}
+
+/// Whether one failing metric names one authored prop of a category.
+fn is_prop_metric(metric: &str, facts: &FrameFacts, category: EquipmentCategory) -> bool {
+    category_props(facts, category)
+        .iter()
+        .any(|prop| metric == format!("equipment-{}", prop.id))
+}
+
+/// Paints a set of projected regions out with the floor colour, which is
+/// exactly what a frame would look like if that equipment had failed to spawn.
+fn mask_regions(base: &RgbImage, facts: &FrameFacts, regions: &[RectFacts]) -> RgbImage {
+    let mut image = base.clone();
+    let floor = image::Rgb(FLOOR_LIGHT.to_u8_array_no_alpha());
+    for rect in regions {
+        let snapped = PixelRect::snap(*rect, facts.width, facts.height);
+        for y in snapped.y..snapped.y + snapped.height {
+            for x in snapped.x..snapped.x + snapped.width {
+                image.put_pixel(x, y, floor);
+            }
+        }
+    }
+    image
+}
+
+/// Every projected region of one category.
+fn category_regions(facts: &FrameFacts, category: EquipmentCategory) -> Vec<RectFacts> {
+    category_props(facts, category)
+        .iter()
+        .flat_map(|prop| prop.regions.clone())
+        .collect()
+}
+
+/// Every mandatory contract one image fails, by metric name.
+fn failed_metric_names(run: &RenderedRun, frame: FrameName, image: &RgbImage) -> Vec<String> {
+    let facts = run.facts(frame);
+    evaluate_frame(
+        frame,
+        facts,
+        &FrameMetrics::compute(image, &frame_regions(facts)),
+        reference_metrics(),
+    )
+    .into_iter()
+    .map(|failure| failure.metric)
+    .collect()
+}
+
+#[test]
+fn equipment_categories_partition_every_authored_asset_kind() {
+    let mut covered = BTreeSet::new();
+    for kind in AssetKind::ALL {
+        if let Some(category) = EquipmentCategory::of(kind) {
+            covered.insert(category.name());
+        }
+    }
+    assert_eq!(
+        covered,
+        EquipmentCategory::ALL
+            .into_iter()
+            .map(EquipmentCategory::name)
+            .collect::<BTreeSet<_>>(),
+        "every category must be reachable from an authored asset kind"
+    );
+
+    // The global surfaces are deliberately not equipment: they are exactly
+    // what the equipment contracts exist to stop standing in for it.
+    for kind in [
+        AssetKind::RenderApron,
+        AssetKind::Floor,
+        AssetKind::FloorGrid,
+        AssetKind::Wall,
+    ] {
+        assert_eq!(EquipmentCategory::of(kind), None, "{kind:?}");
+    }
+    for category in EquipmentCategory::ALL {
+        let groups = category.role_groups();
+        assert!(!groups.is_empty(), "{category:?} needs a role group");
+        assert!(
+            !groups
+                .iter()
+                .all(|group| group == &[PaletteRole::Ink].as_slice()),
+            "{category:?} must not qualify on the inked floor grid alone"
+        );
+    }
+}
+
+#[test]
+fn rendered_run_projects_every_required_equipment_family_from_real_bounds() {
+    let run = rendered_run();
+    let blueprint_props = SceneBlueprint::v0()
+        .visuals
+        .iter()
+        .filter(|visual| EquipmentCategory::of(visual.asset).is_some())
+        .map(|visual| visual.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+
+    for frame in CENTER_FRAMES {
+        let facts = run.facts(frame);
+        let reported = facts
+            .equipment
+            .iter()
+            .map(|prop| prop.id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reported, blueprint_props,
+            "{frame:?} must project every authored equipment prop"
+        );
+        assert!(
+            facts
+                .equipment
+                .windows(2)
+                .all(|pair| pair[0].id < pair[1].id),
+            "{frame:?} equipment must be sorted by prop identifier"
+        );
+
+        for prop in &facts.equipment {
+            let [min, max] = prop.world_bounds;
+            assert!(
+                max[0] > min[0] && max[1] >= min[1] && max[2] > min[2],
+                "{frame:?} {} must carry real 3D bounds, got {:?}",
+                prop.id,
+                prop.world_bounds
+            );
+            let bounds = prop.projected_bounds;
+            let intersects = bounds[2] > 0.0
+                && bounds[3] > 0.0
+                && bounds[0] < f64::from(facts.width)
+                && bounds[1] < f64::from(facts.height);
+            assert_eq!(
+                prop.on_screen, intersects,
+                "{frame:?} {} may only be excluded when its projected bounds miss the viewport, got {bounds:?}",
+                prop.id
+            );
+            if !prop.on_screen {
+                assert!(
+                    prop.regions.is_empty(),
+                    "{frame:?} {} is off screen and must contribute no region",
+                    prop.id
+                );
+            }
+            for rect in &prop.regions {
+                let snapped = PixelRect::snap(*rect, facts.width, facts.height);
+                assert!(
+                    snapped.area() >= EQUIPMENT_REGION_MIN_PIXELS,
+                    "{frame:?} {} kept a {snapped:?} region below the measurable floor",
+                    prop.id
+                );
+            }
+        }
+
+        for category in EquipmentCategory::ALL {
+            let props = category_props(facts, category);
+            let measurable = props
+                .iter()
+                .filter(|prop| prop.on_screen && !prop.regions.is_empty())
+                .count();
+            let excluded = EXPECTED_OFF_SCREEN.contains(&(frame.file_name(), category.name()));
+            if excluded {
+                assert!(
+                    props.iter().all(|prop| !prop.on_screen),
+                    "{frame:?} {} is recorded as out of shot, so no prop of it may project into the viewport",
+                    category.name()
+                );
+            } else {
+                assert!(
+                    measurable > 0,
+                    "{frame:?} must keep at least one measurable {} region",
+                    category.name()
+                );
+            }
+        }
+        for rack in 1..=4 {
+            let id = format!("rack-row-{rack:02}");
+            assert!(
+                facts.equipment.iter().any(|prop| prop.id == id),
+                "{frame:?} must project {id}"
+            );
+        }
+    }
+
+    // Every category is in shot on at least three of the four centre frames,
+    // so no family can be excluded everywhere.
+    for category in EquipmentCategory::ALL {
+        let excluded = CENTER_FRAMES
+            .into_iter()
+            .filter(|frame| EXPECTED_OFF_SCREEN.contains(&(frame.file_name(), category.name())))
+            .count();
+        assert!(
+            excluded <= 1,
+            "{} may not be out of shot on more than one centre frame",
+            category.name()
+        );
+    }
+}
+
+/// The one authored family that genuinely leaves the orthographic rectangle at
+/// a centre heading, with the frame it leaves it on.
+///
+/// The utility cart is a single prop parked at `(-13, -10)`; at the SouthWest
+/// heading the camera follows the technician to `(-10.35, 0)` and the cart
+/// projects entirely below the 720-pixel viewport. That is the one exclusion
+/// the equipment contracts allow, it is proven from the cart's own unclipped
+/// projected bounds in the report, and pinning it here means a *new* exclusion
+/// can never appear quietly.
+const EXPECTED_OFF_SCREEN: [(&str, &str); 1] = [("07-settled-sw.png", "utility-cart")];
+
+#[test]
+fn every_center_frame_carries_real_equipment_pixels_with_margin() {
+    let run = rendered_run();
+    let mut report = Vec::new();
+    for frame in CENTER_FRAMES {
+        let facts = run.facts(frame);
+        let metrics = run.metrics(frame);
+        for category in EquipmentCategory::ALL {
+            if EXPECTED_OFF_SCREEN.contains(&(frame.file_name(), category.name())) {
+                continue;
+            }
+            let best = category_props(facts, category)
+                .iter()
+                .flat_map(|prop| {
+                    prop.regions.iter().enumerate().filter_map(|(segment, _)| {
+                        let region = metrics.region(&equipment_region(&prop.id, segment))?;
+                        category
+                            .role_groups()
+                            .iter()
+                            .map(|group| group.iter().map(|role| region.near(*role)).sum::<f64>())
+                            .fold(None::<f64>, |low, share| {
+                                Some(low.map_or(share, |value| value.min(share)))
+                            })
+                    })
+                })
+                .fold(0.0f64, f64::max);
+            report.push(format!(
+                "{} {} {best:.4}",
+                frame.file_name(),
+                category.name()
+            ));
+            assert!(
+                best >= EQUIPMENT_ROLE_MIN * 2.0,
+                "{} {} measured {best:.4}, which leaves no margin over the {EQUIPMENT_ROLE_MIN} floor",
+                frame.file_name(),
+                category.name()
+            );
+        }
+    }
+    println!("equipment margins:\n{}", report.join("\n"));
+}
+
+#[test]
+fn masking_one_equipment_category_fails_that_category_alone() {
+    let run = rendered_run();
+    for frame in CENTER_FRAMES {
+        let facts = run.facts(frame);
+        assert!(
+            failed_metric_names(run, frame, run.frame(frame)).is_empty(),
+            "{frame:?} must pass before its mutations can prove anything"
+        );
+
+        for category in EquipmentCategory::ALL {
+            if EXPECTED_OFF_SCREEN.contains(&(frame.file_name(), category.name())) {
+                continue;
+            }
+            let regions = category_regions(facts, category);
+            let masked = mask_regions(run.frame(frame), facts, &regions);
+            let failures = failed_metric_names(run, frame, &masked);
+            let equipment = failures
+                .iter()
+                .filter(|metric| metric.starts_with("equipment-"))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            assert!(
+                equipment
+                    .iter()
+                    .any(|metric| is_category_metric(metric, category)),
+                "{frame:?}: masking {} must fail its own equipment contract, got {failures:?}",
+                category.name()
+            );
+            for other in EquipmentCategory::ALL {
+                if other == category {
+                    continue;
+                }
+                let collateral = equipment
+                    .iter()
+                    .filter(|metric| is_category_metric(metric, other))
+                    .collect::<Vec<_>>();
+                assert!(
+                    collateral.is_empty(),
+                    "{frame:?}: masking {} must leave {} green, got {collateral:?}",
+                    category.name(),
+                    other.name()
+                );
+
+                // Per-prop collateral is only ever allowed between the one
+                // pair the hall is authored to overlap: `OVERHEAD_TRAY_HEIGHT`
+                // is chosen so a tray hung over an aisle projects onto a rack
+                // row, so masking either family does cover part of the other.
+                let coupled = matches!(
+                    (category, other),
+                    (
+                        EquipmentCategory::OverheadRouting,
+                        EquipmentCategory::RackRows
+                    ) | (
+                        EquipmentCategory::RackRows,
+                        EquipmentCategory::OverheadRouting
+                    )
+                );
+                if coupled {
+                    continue;
+                }
+                let props = equipment
+                    .iter()
+                    .filter(|metric| is_prop_metric(metric, facts, other))
+                    .collect::<Vec<_>>();
+                assert!(
+                    props.is_empty(),
+                    "{frame:?}: masking {} must leave every {} prop green, got {props:?}",
+                    category.name(),
+                    other.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn masking_one_rack_row_fails_only_that_rack_row() {
+    let run = rendered_run();
+    for frame in CENTER_FRAMES {
+        let facts = run.facts(frame);
+        let rows = category_props(facts, EquipmentCategory::RackRows)
+            .into_iter()
+            .filter(|prop| !prop.regions.is_empty())
+            .map(|prop| (prop.id.clone(), prop.regions.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.len() >= 3,
+            "{frame:?} must measure at least three of the four rack rows, got {}",
+            rows.len()
+        );
+
+        for (id, regions) in &rows {
+            let masked = mask_regions(run.frame(frame), facts, regions);
+            let failures = failed_metric_names(run, frame, &masked);
+            assert!(
+                failures.contains(&format!("equipment-{id}")),
+                "{frame:?}: masking {id} must fail its own contract, got {failures:?}"
+            );
+            for (other, _) in &rows {
+                if other == id {
+                    continue;
+                }
+                assert!(
+                    !failures.contains(&format!("equipment-{other}")),
+                    "{frame:?}: masking {id} must leave {other} green, got {failures:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hiding_the_utility_cart_passes_every_global_contract_and_fails_the_equipment_one() {
+    let run = rendered_run();
+    let frame = FrameName::HealthyCenterNorthEast;
+    let facts = run.facts(frame);
+    let regions = category_regions(facts, EquipmentCategory::UtilityCart);
+    let masked = mask_regions(run.frame(frame), facts, &regions);
+    let failures = failed_metric_names(run, frame, &masked);
+
+    // This is the whole reason the equipment contracts exist: a frame the cart
+    // vanished from still satisfies every whole-frame histogram, because the
+    // floor grid, apron, and walls supply the ratios on their own.
+    let global = failures
+        .iter()
+        .filter(|metric| !metric.starts_with("equipment-"))
+        .collect::<Vec<_>>();
+    assert!(
+        global.is_empty(),
+        "the global contracts were expected to miss a vanished cart entirely, they reported {global:?}"
+    );
+    assert!(
+        failures.contains(&"equipment-utility-cart".to_owned()),
+        "the equipment contract must catch it, got {failures:?}"
+    );
+}
+
 #[test]
 fn semantic_report_reproduces_in_a_different_output_directory() {
     let primary = rendered_run();
@@ -1600,11 +2081,196 @@ fn semantic_report_reproduces_in_a_different_output_directory() {
         "two semantically identical runs must produce the same report"
     );
     assert_eq!(
+        primary.canonical, second.canonical,
+        "two semantically identical runs must serialize byte for byte"
+    );
+    assert_eq!(
         semantic_hash(&primary.canonical),
         semantic_hash(&second.canonical),
         "the canonical semantic hash must not depend on the output directory"
     );
+    // Neither document may carry the directory it happened to be written into.
+    for (label, run) in [("primary", primary), ("reproduction", &second)] {
+        for other in [&primary.root, &second.root] {
+            assert_scan_is_clean(
+                &run.canonical,
+                &[other.to_string_lossy().into_owned()],
+                label,
+            );
+        }
+    }
     let _ = fs::remove_dir_all(&second.root);
+}
+
+/// Fails when a canonical document carries any of `banned`.
+fn assert_scan_is_clean(canonical: &str, banned: &[String], label: &str) {
+    let found = scan_violations(canonical, banned);
+    assert!(
+        found.is_empty(),
+        "the {label} canonical report must not carry {found:?}"
+    );
+}
+
+/// Every banned substring one canonical document actually carries.
+fn scan_violations(canonical: &str, banned: &[String]) -> Vec<String> {
+    banned
+        .iter()
+        .filter(|needle| canonical.contains(needle.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Everything a canonical report may never carry, whoever produced it.
+fn banned_report_substrings() -> Vec<String> {
+    let mut banned = [
+        "timestamp",
+        "generated_at",
+        "elapsed",
+        "duration_ms",
+        "hostname",
+        "user",
+        "/Users/",
+        "/home/",
+        "/tmp/",
+        "/var/folders/",
+        "C:\\",
+        "BEVY_ASSET_ROOT",
+        "CARGO",
+        "RUST_LOG",
+        "HOME",
+        "PATH",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    banned.push(repository().to_string_lossy().into_owned());
+    if let Some(home) = std::env::var_os("HOME") {
+        banned.push(home.to_string_lossy().into_owned());
+    }
+    banned
+}
+
+#[test]
+fn the_real_canonical_report_carries_no_wall_clock_host_path_or_environment() {
+    let run = rendered_run();
+    let banned = banned_report_substrings();
+    assert_scan_is_clean(&run.canonical, &banned, "real");
+
+    // The scan has to be load-bearing rather than vacuous: doctoring the real
+    // document with the absolute output root it was written into, a host
+    // clock, and an environment name must be caught by the same scan.
+    for injected in [
+        run.root.to_string_lossy().into_owned(),
+        "\"generated_at\": \"2026-01-01T00:00:00Z\"".to_owned(),
+        "\"BEVY_ASSET_ROOT\": \"x\"".to_owned(),
+    ] {
+        let doctored = run
+            .canonical
+            .replace("\"frames\":", &format!("{injected}\n  \"frames\":"));
+        assert!(
+            !scan_violations(&doctored, &banned).is_empty(),
+            "the scan must catch {injected:?}"
+        );
+    }
+
+    // The sample unit test proves the schema; this proves the document the
+    // real child actually wrote, byte for byte.
+    assert_eq!(
+        run.canonical,
+        canonical_json(&run.report),
+        "the child must write exactly the canonical serialization of its own report"
+    );
+    assert!(run.canonical.ends_with("}\n"));
+    assert_eq!(run.canonical.matches("\r\n").count(), 0);
+
+    let assets = run.report.assets.keys().cloned().collect::<Vec<_>>();
+    assert!(!assets.is_empty(), "the report pins generated assets");
+    for key in assets
+        .iter()
+        .chain(run.report.sources.keys())
+        .chain(run.report.references.keys())
+        .chain(run.report.asset_sources.keys())
+    {
+        assert!(
+            !Path::new(key).is_absolute() && !key.contains("..") && !key.starts_with('/'),
+            "{key} must be a repository-relative path"
+        );
+    }
+    for name in run.report.frames.keys() {
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "{name} must be a bare file name"
+        );
+    }
+
+    let mut sorted = assets.clone();
+    sorted.sort();
+    assert_eq!(assets, sorted, "the real report's maps must be sorted");
+}
+
+#[test]
+fn the_real_run_camera_renders_the_production_display_contract() {
+    let run = rendered_run();
+    let camera = &run.report.camera;
+
+    assert_eq!(
+        camera.tonemapping,
+        format!("{CEL_SHIFT_TONEMAPPING:?}"),
+        "the captured frames must come from the production display transform"
+    );
+    assert_eq!(
+        camera.deband_dither,
+        format!("{CEL_SHIFT_DEBAND_DITHER:?}"),
+        "the captured frames must come from the production dither"
+    );
+    assert_eq!(
+        camera.msaa_samples,
+        VERIFICATION_MSAA.samples(),
+        "multisampling is the one render setting verification may change"
+    );
+    assert_eq!(
+        camera.clear_color,
+        format!("#{}", SENTINEL_CLEAR.to_hex().trim_start_matches('#')).to_uppercase(),
+        "the clear colour is the other allowed difference: the magenta sentinel"
+    );
+}
+
+#[test]
+fn the_parent_drains_both_pipes_while_the_child_is_still_running() {
+    // 8 MiB on each stream is more than a hundred times any platform's pipe
+    // capacity, so a parent that waited for exit before reading, or drained
+    // one stream to the end before the other, would be blocked here forever
+    // and would come back killed with truncated buffers.
+    const REQUESTED: u64 = 8 * 1024 * 1024;
+    let expected = flood_bytes(REQUESTED);
+    let launched = launch_arguments(
+        &["--verify-flood".to_owned(), REQUESTED.to_string()],
+        PARENT_WATCHDOG,
+    );
+
+    assert!(
+        !launched.killed,
+        "the flood fixture must finish on its own, it was killed after {:?}",
+        launched.elapsed
+    );
+    assert_eq!(launched.code, Some(0));
+    assert_eq!(
+        launched.stdout.len() as u64,
+        expected,
+        "stdout must be captured whole"
+    );
+    assert_eq!(
+        launched.stderr.len() as u64,
+        expected,
+        "stderr must be captured whole"
+    );
+    assert!(
+        launched.stdout.ends_with('\n') && launched.stderr.ends_with('\n'),
+        "both buffers must end on a complete line"
+    );
+    assert!(
+        launched.diagnostics().len() as u64 >= expected * 2,
+        "a failure message must carry both complete buffers"
+    );
 }
 
 #[test]

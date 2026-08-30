@@ -60,6 +60,7 @@ use std::{
 };
 
 use bevy::{
+    camera::primitives::Aabb,
     color::{ColorToPacked, Srgba},
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
     input::{
@@ -80,12 +81,13 @@ use crate::{
     assetgen::ASSET_NAMES,
     assets::AssetLoadState,
     camera::{
-        CameraHeading, CameraOrbit, CellShiftCamera, clamp_follow_target, ground_quadrilateral,
+        CEL_SHIFT_DEBAND_DITHER, CEL_SHIFT_TONEMAPPING, CameraHeading, CameraOrbit,
+        CellShiftCamera, clamp_follow_target, ground_quadrilateral,
     },
     design::{
-        CHARACTER_SHEET_REFERENCE_PATH, KEY_ART_REFERENCE_PATH, MAX_ACTIVE_TICKETS, PLAYER_RADIUS,
-        PaletteRole, RENDER_COVERAGE_SIZE, ROOM_SIZE, SceneBlueprint, VERIFICATION_WINDOW_HEIGHT,
-        VERIFICATION_WINDOW_WIDTH,
+        AssetKind, CHARACTER_SHEET_REFERENCE_PATH, KEY_ART_REFERENCE_PATH, MAX_ACTIVE_TICKETS,
+        PLAYER_RADIUS, PaletteRole, RACK_ROW_X, RENDER_COVERAGE_SIZE, ROOM_SIZE, SceneBlueprint,
+        VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
     },
     hud::{
         BadgeKind, BadgeVisibility, ControlsPanel, HudReport, HudStatus, QueueRowNode,
@@ -100,7 +102,7 @@ use crate::{
         PlayerAnimationState, PlayerAnimations, PlayerClip, PlayerParts, PlayerRigReport,
         PlayerRigState, Technician, ViewBasis, required_player_parts,
     },
-    world::{HallBlueprint, HallState, PlayerSpawnPoint},
+    world::{HallBlueprint, HallProp, HallState, PlayerSpawnPoint},
 };
 
 // ---------------------------------------------------------------------------
@@ -200,6 +202,23 @@ impl FrameName {
     /// sentinel gate applies at its strictest.
     pub const fn is_settled(self) -> bool {
         !matches!(self, Self::MidOrbit)
+    }
+
+    /// Whether this frame is one of the four settled headings taken from the
+    /// middle of the hall, where the authored equipment is in shot.
+    ///
+    /// These are the frames the equipment contracts run on: one per heading,
+    /// with the technician at the spawn point or at the repaired rack rather
+    /// than pushed into a room corner, so every family of authored equipment
+    /// has something inside the orthographic rectangle to be seen in.
+    pub const fn is_center_settled(self) -> bool {
+        matches!(
+            self,
+            Self::HealthyCenterNorthEast
+                | Self::SettledSouthEast
+                | Self::SettledSouthWest
+                | Self::SettledNorthWest
+        )
     }
 }
 
@@ -857,6 +876,129 @@ fn journey_repair_spot(center: Vec2, half_extents: Vec2) -> Vec2 {
 }
 
 // ---------------------------------------------------------------------------
+// Equipment identity
+// ---------------------------------------------------------------------------
+
+/// One family of authored equipment the rendered hall has to actually show.
+///
+/// The whole-frame contracts are global histograms: floor, rack, ink, yellow,
+/// and edge mass measured over every pixel. A 72 m inked floor grid, a hazard
+/// striped apron, and four white perimeter walls can satisfy all of them on
+/// their own, so a frame in which every rack, cooling unit, tray, hose, and
+/// cart failed to spawn could still pass. These categories close that hole:
+/// each one is measured *inside the screen rectangle its own authored geometry
+/// projects into*, so the evidence cannot be borrowed from the room around it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EquipmentCategory {
+    /// The four server rack rows.
+    RackRows,
+    /// The four wall-side cooling units.
+    CoolingUnits,
+    /// The overhead cable trays and the hose drops hung under them.
+    OverheadRouting,
+    /// The red service cart.
+    UtilityCart,
+    /// The yellow step stool and the painted floor markings.
+    FloorFurniture,
+}
+
+impl EquipmentCategory {
+    /// Every category, in stable order.
+    pub const ALL: [Self; 5] = [
+        Self::RackRows,
+        Self::CoolingUnits,
+        Self::OverheadRouting,
+        Self::UtilityCart,
+        Self::FloorFurniture,
+    ];
+
+    /// The stable name this category is reported and measured under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RackRows => "rack-rows",
+            Self::CoolingUnits => "cooling-units",
+            Self::OverheadRouting => "overhead-routing",
+            Self::UtilityCart => "utility-cart",
+            Self::FloorFurniture => "floor-furniture",
+        }
+    }
+
+    /// The category one authored [`AssetKind`] belongs to.
+    ///
+    /// The apron, floor, floor grid, and walls are deliberately absent: they
+    /// are the global surfaces these contracts exist to stop standing in for
+    /// equipment.
+    pub const fn of(kind: AssetKind) -> Option<Self> {
+        match kind {
+            AssetKind::RackRow => Some(Self::RackRows),
+            AssetKind::CoolingUnit => Some(Self::CoolingUnits),
+            AssetKind::OverheadTray | AssetKind::HoseDrop => Some(Self::OverheadRouting),
+            AssetKind::UtilityCart => Some(Self::UtilityCart),
+            AssetKind::StepStool | AssetKind::FloorMarking => Some(Self::FloorFurniture),
+            AssetKind::RenderApron | AssetKind::Floor | AssetKind::FloorGrid | AssetKind::Wall => {
+                None
+            }
+        }
+    }
+
+    /// The palette groups a region has to carry before it counts as raster
+    /// evidence that this category was really drawn.
+    ///
+    /// Every group is authored into the module itself. No group can be
+    /// satisfied by the floor, which is [`PaletteRole::FloorLight`] and
+    /// [`PaletteRole::FloorShadow`] — and no category is allowed to qualify on
+    /// [`PaletteRole::Ink`] alone, because the raised floor grid inks a panel
+    /// seam grid across the whole rendered coverage and would otherwise hand
+    /// every category a free pass.
+    ///
+    /// The cooling unit's [`PaletteRole::TealAccent`] is its fan hub and
+    /// spokes: a 0.8 m detail on one face of a 2.1 m by 4.1 m unit, which the
+    /// measured frames put between 0.03 % and 0.4 % of the unit's own
+    /// rectangle depending on which way that face is turned. It is therefore
+    /// grouped with the unit's inked outlines rather than given a threshold of
+    /// its own, which no honest number could carry margin at.
+    pub const fn role_groups(self) -> &'static [&'static [PaletteRole]] {
+        match self {
+            Self::RackRows | Self::CoolingUnits => &[
+                &[PaletteRole::RackWhite, PaletteRole::RackShadow],
+                &[PaletteRole::TealAccent, PaletteRole::Ink],
+            ],
+            Self::OverheadRouting => &[&[PaletteRole::HoseCharcoal, PaletteRole::Ink]],
+            Self::UtilityCart => &[&[PaletteRole::FaultRed], &[PaletteRole::Ink]],
+            Self::FloorFurniture => &[&[PaletteRole::SignatureYellow], &[PaletteRole::Ink]],
+        }
+    }
+
+    /// Whether every on-screen prop of this category has to carry its own
+    /// evidence, rather than the category being satisfied by any one member.
+    ///
+    /// Only the rack rows are named individually by the contract: four rows is
+    /// the authored hall, and one row disappearing is exactly the regression a
+    /// category-wide check would hide behind the other three.
+    pub const fn requires_every_prop(self) -> bool {
+        matches!(self, Self::RackRows)
+    }
+}
+
+/// Longest world-space span, in metres, of one projected equipment segment.
+///
+/// A rack row is 16 m long and a floor marking 24 m. Projecting the whole prop
+/// as one box would produce a screen rectangle that is mostly the floor either
+/// side of a thin diagonal, so the measured shares would say more about the
+/// floor than about the equipment. Splitting the real 3D bounds along their
+/// longest horizontal axis first keeps every measured rectangle tight around
+/// the geometry that produced it.
+pub const EQUIPMENT_SEGMENT_METRES: f32 = 2.5;
+
+/// Most segments one prop's bounds are ever split into.
+pub const EQUIPMENT_MAX_SEGMENTS: usize = 16;
+
+/// Smallest on-screen area, in pixels, a projected segment must keep before it
+/// is measured at all. Anything smaller is a sliver at the frame edge with too
+/// few pixels to carry a stable ratio.
+pub const EQUIPMENT_REGION_MIN_PIXELS: u64 = 900;
+
+// ---------------------------------------------------------------------------
 // Canonical report
 // ---------------------------------------------------------------------------
 
@@ -957,6 +1099,49 @@ pub struct TicketFacts {
     pub created_tick: u64,
 }
 
+/// One authored equipment prop, projected onto one captured frame.
+///
+/// Every number here comes from the real spawned meshes and the real camera:
+/// the world bounds are the union of the prop's own [`Aabb`]s and those of
+/// every descendant the generated scene spawned, and the rectangles are those
+/// bounds pushed through [`Camera::world_to_viewport`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EquipmentFacts {
+    /// The authored prop identifier.
+    pub id: String,
+    /// The [`EquipmentCategory`] this prop belongs to.
+    pub category: String,
+    /// World-space bounds of the spawned meshes: `[min, max]`, in metres.
+    pub world_bounds: [[f64; 3]; 2],
+    /// Unclipped projected bounds: `[min_x, min_y, max_x, max_y]`, in pixels.
+    pub projected_bounds: [f64; 4],
+    /// Whether those projected bounds intersect the viewport at all. A prop
+    /// that is false here is the only kind the contracts may skip.
+    pub on_screen: bool,
+    /// The measurable projected segments, clipped to the viewport, in segment
+    /// order. Empty when nothing survived [`EQUIPMENT_REGION_MIN_PIXELS`].
+    pub regions: Vec<RectFacts>,
+}
+
+/// The render settings the one game camera actually carried.
+///
+/// Recorded from the live camera entity so the contract that verification only
+/// changes multisampling is checked against the running product rather than
+/// against the source that configured it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraRenderFacts {
+    /// The display transform, as `{:?}` of [`Tonemapping`].
+    pub tonemapping: String,
+    /// The deband dither, as `{:?}` of [`DebandDither`].
+    pub deband_dither: String,
+    /// Multisample count; `1` is [`Msaa::Off`].
+    pub msaa_samples: u32,
+    /// The clear colour, as `#RRGGBB`.
+    pub clear_color: String,
+}
+
 /// One observed ticket lifecycle event.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1045,6 +1230,9 @@ pub struct FrameFacts {
     pub tickets: Vec<TicketFacts>,
     /// Every rack's state, in stable rack order.
     pub rack_states: Vec<String>,
+    /// Every authored equipment prop, projected onto this frame, sorted by
+    /// prop identifier.
+    pub equipment: Vec<EquipmentFacts>,
 }
 
 /// The authored hall the run actually validated.
@@ -1127,6 +1315,8 @@ pub struct VerificationReport {
     pub sources: BTreeMap<String, String>,
     /// The authored hall.
     pub blueprint: BlueprintFacts,
+    /// The render settings the one game camera carried.
+    pub camera: CameraRenderFacts,
     /// The deterministic simulation.
     pub gameplay: GameplayFacts,
     /// Every captured frame, by frame file name.
@@ -1842,6 +2032,185 @@ fn worker_crop(world: &mut World, player: Vec2, viewport: UVec2) -> RectFacts {
     }
 }
 
+/// Every authored equipment prop, projected onto the current viewport.
+///
+/// The bounds are the real ones: for each [`HallProp`] in an
+/// [`EquipmentCategory`], the world-space union of the [`Aabb`] Bevy computed
+/// for its own mesh and for every mesh the generated scene spawned beneath it.
+/// Those bounds are split along their longest horizontal axis into segments no
+/// longer than [`EQUIPMENT_SEGMENT_METRES`], and each segment's eight corners
+/// are pushed through the live [`Camera`] projection.
+fn equipment_facts(world: &mut World, viewport: UVec2) -> Vec<EquipmentFacts> {
+    let camera = world
+        .query_filtered::<(&Camera, &GlobalTransform), With<CellShiftCamera>>()
+        .iter(world)
+        .next()
+        .map(|(camera, transform)| (camera.clone(), *transform));
+    let Some((camera, view)) = camera else {
+        return Vec::new();
+    };
+
+    let props = world
+        .query::<(Entity, &HallProp)>()
+        .iter(world)
+        .filter_map(|(entity, prop)| {
+            EquipmentCategory::of(prop.asset)
+                .map(|category| (entity, prop.id.as_str().to_owned(), category))
+        })
+        .collect::<Vec<_>>();
+
+    let limit = viewport.as_vec2();
+    let mut facts = Vec::with_capacity(props.len());
+    for (entity, id, category) in props {
+        let Some((world_min, world_max)) = mesh_bounds(world, entity) else {
+            continue;
+        };
+
+        let mut bounds_min = Vec2::splat(f32::INFINITY);
+        let mut bounds_max = Vec2::splat(f32::NEG_INFINITY);
+        let mut regions = Vec::new();
+        for (segment_min, segment_max) in segment_bounds(world_min, world_max) {
+            let Some((min, max)) = project_box(&camera, &view, segment_min, segment_max) else {
+                continue;
+            };
+            bounds_min = bounds_min.min(min);
+            bounds_max = bounds_max.max(max);
+
+            let clipped_min = min.max(Vec2::ZERO).min(limit);
+            let clipped_max = max.max(Vec2::ZERO).min(limit);
+            let size = (clipped_max - clipped_min).max(Vec2::ZERO);
+            let rect = RectFacts {
+                x: canonical_float(clipped_min.x),
+                y: canonical_float(clipped_min.y),
+                width: canonical_float(size.x),
+                height: canonical_float(size.y),
+            };
+            if PixelRect::snap(rect, viewport.x, viewport.y).area() >= EQUIPMENT_REGION_MIN_PIXELS {
+                regions.push(rect);
+            }
+        }
+        if !bounds_min.is_finite() || !bounds_max.is_finite() {
+            continue;
+        }
+
+        let on_screen = bounds_max.x > 0.0
+            && bounds_max.y > 0.0
+            && bounds_min.x < limit.x
+            && bounds_min.y < limit.y;
+        facts.push(EquipmentFacts {
+            id,
+            category: category.name().to_owned(),
+            world_bounds: [
+                [
+                    canonical_float(world_min.x),
+                    canonical_float(world_min.y),
+                    canonical_float(world_min.z),
+                ],
+                [
+                    canonical_float(world_max.x),
+                    canonical_float(world_max.y),
+                    canonical_float(world_max.z),
+                ],
+            ],
+            projected_bounds: [
+                canonical_float(bounds_min.x),
+                canonical_float(bounds_min.y),
+                canonical_float(bounds_max.x),
+                canonical_float(bounds_max.y),
+            ],
+            on_screen,
+            regions: if on_screen { regions } else { Vec::new() },
+        });
+    }
+    facts.sort_by(|left, right| left.id.cmp(&right.id));
+    facts
+}
+
+/// The world-space bounds of every mesh spawned at or under one entity.
+fn mesh_bounds(world: &World, root: Entity) -> Option<(Vec3, Vec3)> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut stack = vec![root];
+    while let Some(entity) = stack.pop() {
+        if let Some(children) = world.get::<Children>(entity) {
+            stack.extend(children.iter());
+        }
+        let (Some(aabb), Some(global)) = (
+            world.get::<Aabb>(entity),
+            world.get::<GlobalTransform>(entity),
+        ) else {
+            continue;
+        };
+        let center = Vec3::from(aabb.center);
+        let half = Vec3::from(aabb.half_extents);
+        for corner in 0..8u8 {
+            let local = center + half * corner_sign(corner);
+            let point = global.transform_point(local);
+            min = min.min(point);
+            max = max.max(point);
+        }
+    }
+    (min.is_finite() && max.is_finite()).then_some((min, max))
+}
+
+/// The `-1`/`+1` sign vector of one axis-aligned box corner.
+fn corner_sign(corner: u8) -> Vec3 {
+    Vec3::new(
+        if corner & 1 == 0 { -1.0 } else { 1.0 },
+        if corner & 2 == 0 { -1.0 } else { 1.0 },
+        if corner & 4 == 0 { -1.0 } else { 1.0 },
+    )
+}
+
+/// Splits one world-space box along its longest horizontal axis.
+fn segment_bounds(min: Vec3, max: Vec3) -> Vec<(Vec3, Vec3)> {
+    let span = max - min;
+    let (axis, length) = if span.x >= span.z {
+        (0usize, span.x)
+    } else {
+        (2usize, span.z)
+    };
+    let count =
+        ((length / EQUIPMENT_SEGMENT_METRES).ceil() as usize).clamp(1, EQUIPMENT_MAX_SEGMENTS);
+    let step = length / count as f32;
+    (0..count)
+        .map(|index| {
+            let low = min[axis] + step * index as f32;
+            let high = if index + 1 == count {
+                max[axis]
+            } else {
+                low + step
+            };
+            let mut segment_min = min;
+            let mut segment_max = max;
+            segment_min[axis] = low;
+            segment_max[axis] = high;
+            (segment_min, segment_max)
+        })
+        .collect()
+}
+
+/// Projects one world-space box onto the viewport, as unclipped pixel bounds.
+fn project_box(
+    camera: &Camera,
+    view: &GlobalTransform,
+    min: Vec3,
+    max: Vec3,
+) -> Option<(Vec2, Vec2)> {
+    let center = (min + max) * 0.5;
+    let half = (max - min) * 0.5;
+    let mut low = Vec2::splat(f32::INFINITY);
+    let mut high = Vec2::splat(f32::NEG_INFINITY);
+    for corner in 0..8u8 {
+        let point = camera
+            .world_to_viewport(view, center + half * corner_sign(corner))
+            .ok()?;
+        low = low.min(point);
+        high = high.max(point);
+    }
+    Some((low, high))
+}
+
 /// The laid-out rectangle of one UI node, in logical pixels.
 fn ui_rect(world: &World, entity: Entity) -> Option<RectFacts> {
     let node = world.get::<ComputedNode>(entity)?;
@@ -1983,6 +2352,7 @@ fn frame_facts(
             .iter()
             .map(|rack| rack_state_name(*rack).to_owned())
             .collect(),
+        equipment: equipment_facts(world, viewport),
     })
 }
 
@@ -2125,6 +2495,7 @@ fn step_stage(
             if !missing.is_empty() {
                 return Err(format!("the technician rig is missing {missing:?}"));
             }
+            check_camera_render_settings(world)?;
 
             run.observations.rig_parts = state.parts.clone();
             run.observations.blueprint = Some(BlueprintFacts {
@@ -2581,6 +2952,7 @@ fn build_report(world: &mut World, run: &mut VerificationRun) -> VerificationRep
     } else {
         "failure"
     };
+    let camera = camera_render_facts(world);
 
     VerificationReport {
         schema_version: 1,
@@ -2598,6 +2970,7 @@ fn build_report(world: &mut World, run: &mut VerificationRun) -> VerificationRep
         references: reference_hashes,
         sources: source_hashes,
         blueprint,
+        camera,
         gameplay: GameplayFacts {
             fault_seed: format!("{FAULT_SCHEDULER_SEED:#018x}"),
             fixed_step_seconds: canonical_f64(FIXED_STEP_SECONDS),
@@ -2613,6 +2986,58 @@ fn build_report(world: &mut World, run: &mut VerificationRun) -> VerificationRep
         },
         frames: run.observations.frames.clone(),
     }
+}
+
+/// Reads the render settings off the one live game camera.
+fn camera_render_facts(world: &mut World) -> CameraRenderFacts {
+    let clear_color = world
+        .get_resource::<ClearColor>()
+        .map_or(Srgba::NONE, |clear| clear.0.to_srgba());
+    let settings = world
+        .query_filtered::<(Option<&Tonemapping>, Option<&DebandDither>, Option<&Msaa>), With<CellShiftCamera>>()
+        .iter(world)
+        .next()
+        .map(|(tonemapping, dither, msaa)| (tonemapping.copied(), dither.copied(), msaa.copied()));
+    let (tonemapping, dither, msaa) = settings.unwrap_or((None, None, None));
+    CameraRenderFacts {
+        tonemapping: tonemapping.map_or_else(|| "absent".to_owned(), |value| format!("{value:?}")),
+        deband_dither: dither.map_or_else(|| "absent".to_owned(), |value| format!("{value:?}")),
+        msaa_samples: msaa.map_or(0, |value| value.samples()),
+        clear_color: format!("#{}", clear_color.to_hex().trim_start_matches('#')),
+    }
+}
+
+/// Fails the run unless the live camera renders the production cel-shift
+/// display contract, with multisampling as the single allowed difference.
+///
+/// This is the point of the whole harness: the analyzed frame has to be the
+/// frame the shipped game draws. If the display transform or the dither were
+/// ever set here rather than in [`crate::camera`], every palette contract
+/// below would be measuring a picture no player ever sees.
+fn check_camera_render_settings(world: &mut World) -> Result<(), String> {
+    let facts = camera_render_facts(world);
+    let expected_tonemapping = format!("{CEL_SHIFT_TONEMAPPING:?}");
+    let expected_dither = format!("{CEL_SHIFT_DEBAND_DITHER:?}");
+    if facts.tonemapping != expected_tonemapping {
+        return Err(format!(
+            "the game camera must carry the production display transform {expected_tonemapping}, it carried {}",
+            facts.tonemapping
+        ));
+    }
+    if facts.deband_dither != expected_dither {
+        return Err(format!(
+            "the game camera must carry the production dither {expected_dither}, it carried {}",
+            facts.deband_dither
+        ));
+    }
+    if facts.msaa_samples != VERIFICATION_MSAA.samples() {
+        return Err(format!(
+            "the verification camera must render with {} samples, it carried {}",
+            VERIFICATION_MSAA.samples(),
+            facts.msaa_samples
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2651,22 +3076,31 @@ impl Plugin for VerificationPlugin {
     }
 }
 
-/// Turns off multisampling and tonemapping for the captured frames.
+/// The one render setting the verification camera is allowed to change.
 ///
-/// The cel-shift contract forbids gradients and noise, so the verification
-/// camera renders the authored palette straight through: no MSAA blending, no
-/// display transform, and no deband dither.
+/// Multisampling resolves neighbouring authored fills into blended in-between
+/// colours that belong to no [`PaletteRole`], which would make every palette
+/// ratio a function of how many edges happened to be in shot. Everything else
+/// the camera renders with — [`CEL_SHIFT_TONEMAPPING`] and
+/// [`CEL_SHIFT_DEBAND_DITHER`] — is the production camera's own contract.
+pub const VERIFICATION_MSAA: Msaa = Msaa::Off;
+
+/// Turns off multisampling for the captured frames.
+///
+/// This is the *only* render setting verification is allowed to change on the
+/// camera, and it is changed because MSAA resolves neighbouring authored fills
+/// into blended in-between colours that belong to no palette role. Every other
+/// display setting — [`CEL_SHIFT_TONEMAPPING`] and [`CEL_SHIFT_DEBAND_DITHER`]
+/// — is the production camera's own contract, so the analyzed frame is the
+/// frame the shipped game draws.
 fn configure_verification_camera(
     mut commands: Commands,
     cameras: Query<Entity, (With<CellShiftCamera>, Without<VerificationCamera>)>,
 ) {
     for entity in &cameras {
-        commands.entity(entity).insert((
-            VerificationCamera,
-            Msaa::Off,
-            Tonemapping::None,
-            DebandDither::Disabled,
-        ));
+        commands
+            .entity(entity)
+            .insert((VerificationCamera, VERIFICATION_MSAA));
     }
 }
 
@@ -2730,6 +3164,51 @@ pub struct VerificationRequest {
     pub output: Option<PathBuf>,
     /// The fault to inject into that run.
     pub fault: Option<VerificationFault>,
+    /// How many bytes the flood fixture writes to each of stdout and stderr
+    /// before exiting successfully, when one was requested.
+    pub flood: Option<u64>,
+}
+
+/// Largest flood the fixture will produce, so a typo cannot fill a disk.
+pub const FLOOD_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One line the flood fixture writes, including its newline.
+const FLOOD_LINE: &str = "the parent must drain this pipe while the child is still running\n";
+
+/// Writes `bytes` to each of stdout and stderr, interleaved, then returns.
+///
+/// This exists for exactly one contract: a parent that waits for a child
+/// before reading its pipes deadlocks the moment the child writes more than
+/// one pipe buffer, and a parent that reads one pipe to the end before the
+/// other deadlocks as soon as the child fills the one it is not reading. The
+/// fixture writes far more than any platform's pipe capacity on *both*
+/// streams, so a parent that gets this wrong hangs until its watchdog instead
+/// of passing quietly.
+pub fn run_flood(bytes: u64) -> std::process::ExitCode {
+    use std::io::Write;
+
+    let capped = bytes.min(FLOOD_LIMIT_BYTES);
+    let line = FLOOD_LINE.as_bytes();
+    let lines = capped.div_ceil(line.len() as u64);
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+    for _ in 0..lines {
+        if out.write_all(line).is_err() || err.write_all(line).is_err() {
+            return std::process::ExitCode::from(3);
+        }
+    }
+    if out.flush().is_err() || err.flush().is_err() {
+        return std::process::ExitCode::from(3);
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// How many bytes [`run_flood`] really writes to each stream for a request.
+pub fn flood_bytes(requested: u64) -> u64 {
+    let line = FLOOD_LINE.len() as u64;
+    requested.min(FLOOD_LIMIT_BYTES).div_ceil(line) * line
 }
 
 /// Parses the supported flags.
@@ -2741,6 +3220,7 @@ pub fn parse_verification_args(
 ) -> Result<VerificationRequest, String> {
     const OUTPUT: &str = "--verify-output";
     const FAULT: &str = "--verify-fault";
+    const FLOOD: &str = "--verify-flood";
     let mut arguments = arguments.into_iter();
     let mut request = VerificationRequest::default();
     while let Some(argument) = arguments.next() {
@@ -2767,15 +3247,33 @@ pub fn parse_verification_args(
                 }
                 request.fault = Some(VerificationFault::parse(&value)?);
             }
+            FLOOD => {
+                let Some(value) = value.or_else(|| arguments.next()) else {
+                    return Err(format!("{FLOOD} requires a byte count"));
+                };
+                if request.flood.is_some() {
+                    return Err(format!("{FLOOD} was given more than once"));
+                }
+                let bytes = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("{FLOOD} requires a byte count, got {value}"))?;
+                if bytes == 0 {
+                    return Err(format!("{FLOOD} requires a positive byte count"));
+                }
+                request.flood = Some(bytes);
+            }
             _ => {
                 return Err(format!(
-                    "unknown argument {argument}; usage: midcreek-cs-1 [{OUTPUT} <directory>] [{FAULT} <fault>]"
+                    "unknown argument {argument}; usage: midcreek-cs-1 [{OUTPUT} <directory>] [{FAULT} <fault>] [{FLOOD} <bytes>]"
                 ));
             }
         }
     }
     if request.fault.is_some() && request.output.is_none() {
         return Err(format!("{FAULT} only applies to a {OUTPUT} run"));
+    }
+    if request.flood.is_some() && (request.output.is_some() || request.fault.is_some()) {
+        return Err(format!("{FLOOD} is a fixture and runs on its own"));
     }
     Ok(request)
 }
@@ -2938,8 +3436,21 @@ impl FrameMetrics {
 
         let raw = image.as_raw();
         let stride = width as usize * 3;
+        let mut active = Vec::with_capacity(rects.len());
         for y in 0..height {
             let row = y as usize * stride;
+            // Regions are resolved per row rather than per pixel: a frame
+            // carries one crop, a handful of HUD panels and badges, and one
+            // rectangle per projected equipment segment, and testing every one
+            // of them against every pixel would dominate the walk.
+            active.clear();
+            active.extend(
+                rects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rect)| y >= rect.y && y < rect.y + rect.height)
+                    .map(|(slot, rect)| (slot, *rect)),
+            );
             for x in 0..width {
                 let index = row + x as usize * 3;
                 let red = raw[index];
@@ -2978,10 +3489,11 @@ impl FrameMetrics {
                     palette_hits += 1;
                 }
 
-                for (slot, rect) in rects.iter().enumerate() {
-                    if !rect.contains(x, y) {
+                for (slot, rect) in &active {
+                    if x < rect.x || x >= rect.x + rect.width {
                         continue;
                     }
+                    let slot = *slot;
                     region_pixels[slot] += 1;
                     region_luminance[slot] += pixel_luminance;
                     if is_sentinel {
@@ -3230,6 +3742,11 @@ pub fn hud_region(panel: &str) -> String {
     format!("hud-{panel}")
 }
 
+/// The stable region name of one projected equipment segment.
+pub fn equipment_region(id: &str, segment: usize) -> String {
+    format!("equipment-{id}-{segment:02}")
+}
+
 /// Every region one frame's mandatory contracts measure, derived from the
 /// canonical report rather than from the image.
 pub fn frame_regions(facts: &FrameFacts) -> BTreeMap<String, PixelRect> {
@@ -3255,6 +3772,14 @@ pub fn frame_regions(facts: &FrameFacts) -> BTreeMap<String, PixelRect> {
             );
         }
     }
+    for prop in &facts.equipment {
+        for (segment, rect) in prop.regions.iter().enumerate() {
+            regions.insert(
+                equipment_region(&prop.id, segment),
+                PixelRect::snap(*rect, facts.width, facts.height),
+            );
+        }
+    }
     regions
 }
 
@@ -3275,6 +3800,183 @@ fn state_role_name(state: &str) -> Option<PaletteRole> {
         "repairing" => Some(PaletteRole::WorkerHardHat),
         "resolved" => Some(PaletteRole::HealthyGreen),
         _ => None,
+    }
+}
+
+/// Smallest share of a qualifying region each required equipment role group
+/// must cover.
+///
+/// This is deliberately low and blunt. A projected segment is an axis-aligned
+/// box around a diagonal solid, so even a rack cabinet that fills its segment
+/// leaves the corners to the floor behind it; what the number has to separate
+/// is "the equipment is drawn here" from "there is nothing here but floor",
+/// and the measured margin on every real frame is recorded in the Task 8
+/// report.
+pub const EQUIPMENT_ROLE_MIN: f64 = 0.04;
+
+/// One authored prop's projected regions, resolved against measured metrics.
+struct EquipmentEvidence<'a> {
+    facts: &'a EquipmentFacts,
+    /// Every measurable region of this prop, with the share of each required
+    /// role group inside it.
+    measured: Vec<(String, Vec<f64>)>,
+}
+
+impl EquipmentEvidence<'_> {
+    /// Whether at least one region carried every required role group.
+    fn qualifies(&self) -> bool {
+        self.measured
+            .iter()
+            .any(|(_, shares)| shares.iter().all(|share| *share >= EQUIPMENT_ROLE_MIN))
+    }
+
+    /// The best region, and the weakest group inside it, for a failure message.
+    fn best(&self) -> Option<(&str, f64)> {
+        self.measured
+            .iter()
+            .filter_map(|(name, shares)| {
+                shares
+                    .iter()
+                    .copied()
+                    .fold(None::<f64>, |low, share| {
+                        Some(low.map_or(share, |value: f64| value.min(share)))
+                    })
+                    .map(|weakest| (name.as_str(), weakest))
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+    }
+}
+
+/// Resolves one category's projected regions against the measured frame.
+fn equipment_evidence<'a>(
+    facts: &'a FrameFacts,
+    metrics: &FrameMetrics,
+    category: EquipmentCategory,
+) -> Vec<EquipmentEvidence<'a>> {
+    facts
+        .equipment
+        .iter()
+        .filter(|prop| prop.category == category.name())
+        .map(|prop| {
+            let measured = prop
+                .regions
+                .iter()
+                .enumerate()
+                .filter_map(|(segment, _)| {
+                    let name = equipment_region(&prop.id, segment);
+                    let region = metrics.region(&name)?;
+                    let shares = category
+                        .role_groups()
+                        .iter()
+                        .map(|group| group.iter().map(|role| region.near(*role)).sum::<f64>())
+                        .collect::<Vec<_>>();
+                    Some((name, shares))
+                })
+                .collect();
+            EquipmentEvidence {
+                facts: prop,
+                measured,
+            }
+        })
+        .collect()
+}
+
+/// Checks that every authored equipment family really drew itself into the
+/// screen rectangle its own 3D bounds project onto.
+///
+/// A category whose every prop projects clear of the viewport is skipped, and
+/// only then: the report carries the unclipped projected bounds of each prop,
+/// so every skip is auditable, and `rack-rows` additionally has to be present
+/// in full whatever the camera is looking at.
+fn evaluate_equipment(
+    name: &str,
+    facts: &FrameFacts,
+    metrics: &FrameMetrics,
+    failures: &mut Vec<MetricFailure>,
+) {
+    for category in EquipmentCategory::ALL {
+        let evidence = equipment_evidence(facts, metrics, category);
+        let expected = if category == EquipmentCategory::RackRows {
+            RACK_ROW_X.len()
+        } else {
+            1
+        };
+        if evidence.len() < expected {
+            failures.push(failure(
+                name,
+                &format!("equipment-{}-authored", category.name()),
+                evidence.len() as f64,
+                format!(
+                    "at least {expected} projected {} prop(s); the hall spawned {}",
+                    category.name(),
+                    evidence.len()
+                ),
+            ));
+            continue;
+        }
+
+        let on_screen = evidence
+            .iter()
+            .filter(|prop| prop.facts.on_screen)
+            .collect::<Vec<_>>();
+        if on_screen.is_empty() {
+            // Every prop of this family projects clear of the viewport, which
+            // is the one documented exclusion. The projected bounds in the
+            // report are what prove it.
+            continue;
+        }
+
+        let measurable = on_screen
+            .iter()
+            .filter(|prop| !prop.measured.is_empty())
+            .copied()
+            .collect::<Vec<_>>();
+        if measurable.is_empty() {
+            failures.push(failure(
+                name,
+                &format!("equipment-{}-measurable", category.name()),
+                0.0,
+                format!(
+                    "at least one {} region of {EQUIPMENT_REGION_MIN_PIXELS} pixels on screen",
+                    category.name()
+                ),
+            ));
+            continue;
+        }
+
+        if !measurable.iter().any(|prop| prop.qualifies()) {
+            let (region, weakest) = measurable
+                .iter()
+                .filter_map(|prop| prop.best())
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+                .unwrap_or(("none", 0.0));
+            failures.push(failure(
+                name,
+                &format!("equipment-{}", category.name()),
+                weakest,
+                format!(
+                    "at least {EQUIPMENT_ROLE_MIN} of every authored role group in one projected region; the best was {region}"
+                ),
+            ));
+        }
+
+        if !category.requires_every_prop() {
+            continue;
+        }
+        for prop in measurable {
+            if prop.qualifies() {
+                continue;
+            }
+            let (region, weakest) = prop.best().unwrap_or(("none", 0.0));
+            failures.push(failure(
+                name,
+                &format!("equipment-{}", prop.facts.id),
+                weakest,
+                format!(
+                    "at least {EQUIPMENT_ROLE_MIN} of every authored role group in one projected region; the best was {region}"
+                ),
+            ));
+        }
     }
 }
 
@@ -3394,6 +4096,10 @@ pub fn evaluate_frame(
                 format!("at least {DIAGONAL_BAND_MIN}"),
             ));
         }
+    }
+
+    if frame.is_center_settled() {
+        evaluate_equipment(name, facts, metrics, &mut failures);
     }
 
     let distance = metrics.histogram_distance(reference);

@@ -614,7 +614,13 @@ requires every other one to be refused without moving the machine.
 - every capture costs exactly `CAPTURE_FRAMES` simulated frames and every
   resize exactly `RESIZE_FRAMES`, so GPU readback latency can never leak into
   simulated time;
-- MSAA off, tonemapping off, deband dither off, magenta clear colour;
+- MSAA off and the magenta clear colour, which are the *only* two render
+  settings verification changes. Bypassed tonemapping and disabled deband
+  dither are the shipped camera's own cel-shift display contract
+  (`CEL_SHIFT_TONEMAPPING`, `CEL_SHIFT_DEBAND_DITHER` in `src/camera.rs`), so
+  the analyzed frame is the frame the game draws. The run records the live
+  camera's settings in the report and fails in `validate-blueprint` if they
+  ever drift;
 - the canonical report sorts every map, rounds every float onto the `1e-6`
   grid, uses relative paths, and carries no wall clock, host, or environment
   value. Two runs in different output directories produce byte-identical
@@ -658,6 +664,44 @@ metrics are measured once and cached for the process.
 | HUD | computed rectangles on screen and carrying the live state colours |
 | Key-art histogram | nearest-palette L1 distance `<= 0.90` |
 | Edge density | `0.35x` to `2.5x` the key art |
+| Authored equipment | every family carries its own palette inside its own projected bounds, on the four centre settled frames |
+
+### Equipment-scoped contracts
+
+The whole-frame contracts above are global histograms, and a 72 m inked floor
+grid, a striped apron, and four white perimeter walls can satisfy every one of
+them on their own. So on the four settled headings taken from the middle of the
+hall — `01-healthy-center-ne`, `06-settled-se`, `07-settled-sw`,
+`08-settled-nw` — each authored equipment family is also measured *inside the
+screen rectangle its own geometry projects into*.
+
+The rectangles are real: for each `HallProp`, the world-space union of the
+`Aabb` Bevy computed for its meshes and for every mesh the generated scene
+spawned under it, split along its longest horizontal axis into segments no
+longer than `EQUIPMENT_SEGMENT_METRES`, each segment's eight corners pushed
+through the live `Camera::world_to_viewport`. Both the unclipped projected
+bounds and the clipped measurable segments are written to the report.
+
+| Family | Required palette, per qualifying region |
+|---|---|
+| `rack-rows`, all four rows individually | rack white or shadow, and teal or ink |
+| `cooling-units` | rack white or shadow, and teal or ink |
+| `overhead-routing` (trays and hose drops) | hose charcoal or ink |
+| `utility-cart` | fault red, and ink |
+| `floor-furniture` (step stool and floor markings) | signature yellow, and ink |
+
+Each group must cover at least `EQUIPMENT_ROLE_MIN` (4%) of one measurable
+region. The measured frames sit between 9.4% and 79.6%, so the closest margin
+is 2.3 times the bound. A prop may only be skipped when its projected bounds
+miss the viewport entirely, and the one family that genuinely leaves the
+orthographic rectangle at a centre heading — the single utility cart, at the
+SouthWest heading — is pinned by name in the contract so a new exclusion can
+never appear quietly.
+
+Masking one family's rectangles out to floor colour fails that family's
+contract and leaves every other family green; masking one rack row fails that
+row alone. Masking the cart passes *every* global contract, which is exactly
+the hole these contracts close.
 
 ### Proving the gate can fail
 
@@ -675,6 +719,13 @@ proven against the same image the gate accepted a moment earlier.
   naming that stage;
 - `hang` also disables the app watchdog, so the 50-second parent watchdog has
   to kill that exact child. Frames already captured are kept.
+
+`--verify-flood <bytes>` is the pipe fixture: the binary writes that many bytes
+to *both* stdout and stderr and exits successfully. The parent drains both
+pipes on their own threads from the moment the child starts, and the fixture
+overruns any platform's pipe capacity by more than a hundred times, so a parent
+that waited for exit before reading, or drained one stream to the end before
+the other, deadlocks and is killed instead of passing quietly.
 
 ### Diagnosing a failure
 

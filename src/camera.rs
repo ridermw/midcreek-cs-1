@@ -65,7 +65,11 @@
 //! camera entity: it reads the basis this module publishes every frame, before
 //! [`CellShiftSet::MovePlayer`].
 
-use bevy::{camera::ScalingMode, prelude::*};
+use bevy::{
+    camera::ScalingMode,
+    core_pipeline::tonemapping::{DebandDither, Tonemapping},
+    prelude::*,
+};
 
 use crate::{
     CellShiftSet,
@@ -449,6 +453,24 @@ pub fn orthographic_projection() -> Projection {
     })
 }
 
+/// The display transform the cel-shift look is authored against.
+///
+/// The art direction is flat authored colour: every surface is a typed
+/// [`PaletteRole`](crate::design::PaletteRole) and the frame must carry that
+/// exact value to the framebuffer. Bevy's `Camera3d` otherwise requires
+/// `Tonemapping::TonyMcMapface`, a filmic display transform that shifts and
+/// desaturates those hues, so the shipped game would draw colours the palette
+/// never authored.
+pub const CEL_SHIFT_TONEMAPPING: Tonemapping = Tonemapping::None;
+
+/// The dither the cel-shift look is authored against.
+///
+/// `Camera3d` otherwise requires `DebandDither::Enabled`, which sprays
+/// sub-quantum noise over every flat fill to hide gradient banding. There are
+/// no gradients here, so all it does is break the flat fills the palette
+/// contract measures.
+pub const CEL_SHIFT_DEBAND_DITHER: DebandDither = DebandDither::Disabled;
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -480,6 +502,8 @@ fn spawn_camera(mut commands: Commands, orbit: Res<CameraOrbit>) {
         CellShiftCamera,
         Name::new("cell-shift-camera"),
         Camera3d::default(),
+        CEL_SHIFT_TONEMAPPING,
+        CEL_SHIFT_DEBAND_DITHER,
         orthographic_projection(),
         camera_transform(orbit.yaw_radians(), Vec2::ZERO),
     ));
