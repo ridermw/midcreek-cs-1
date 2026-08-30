@@ -600,6 +600,200 @@ class FakePage:
         return [(kind, code) for active, kind, code in self.dispatched if active == owner]
 
 
+class FakeSocket:
+    """A socket that records its bounds and never actually goes anywhere."""
+
+    def __init__(self, *, handshake: bytes = b"", sendall_blocks: bool = False) -> None:
+        self.timeouts: list[float] = []
+        self.sent = bytearray()
+        self.closed = False
+        self._inbox = bytearray(handshake)
+        self._sendall_blocks = sendall_blocks
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+    def sendall(self, data: bytes) -> None:
+        if self._sendall_blocks:
+            raise TimeoutError("timed out")
+        self.sent += data
+
+    def recv(self, size: int) -> bytes:
+        if not self._inbox:
+            raise TimeoutError("timed out")
+        chunk = bytes(self._inbox[:size])
+        del self._inbox[:size]
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+UPGRADE = (
+    b"HTTP/1.1 101 Switching Protocols\r\n"
+    b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+)
+
+
+class TricklingBodyServer:
+    """An HTTP server that answers 200 and then trickles a body forever."""
+
+    def __init__(self) -> None:
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self.port = self._listener.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self._listener.accept()
+        except OSError:
+            return
+        with connection:
+            try:
+                connection.recv(4096)
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n"
+                )
+                while not self._stop.is_set():
+                    # One byte at a time: every read is prompt, the body never
+                    # ends, and an inactivity timer would never fire.
+                    connection.sendall(b"x")
+                    time.sleep(0.01)
+            except OSError:
+                return
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+
+
+class BoundedWriteTest(unittest.TestCase):
+    """Connecting and writing spend the same budget as reading."""
+
+    def fake_connect(self, socket_factory) -> list:
+        captured: list = []
+
+        def connect(address, timeout=None):
+            captured.append(timeout)
+            return socket_factory()
+
+        original = browser_gate.socket.create_connection
+        browser_gate.socket.create_connection = connect
+        self.addCleanup(
+            setattr, browser_gate.socket, "create_connection", original
+        )
+        return captured
+
+    def test_connecting_is_clamped_to_the_remaining_budget(self) -> None:
+        captured = self.fake_connect(lambda: FakeSocket(handshake=UPGRADE))
+
+        browser_gate.WebSocket(
+            "ws://127.0.0.1:1/devtools/page/1",
+            timeout=30,
+            deadline=browser_gate.Deadline(0.5),
+        )
+
+        self.assertEqual(len(captured), 1)
+        self.assertLessEqual(captured[0], 0.5)
+
+    def test_a_connect_that_never_answers_is_a_gate_failure(self) -> None:
+        def refuse():
+            raise TimeoutError("timed out")
+
+        self.fake_connect(refuse)
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.WebSocket(
+                "ws://127.0.0.1:1/devtools/page/1",
+                timeout=30,
+                deadline=browser_gate.Deadline(5.0),
+            )
+
+        self.assertIn("could not be reached", str(failure.exception))
+
+    def test_a_handshake_that_cannot_be_written_is_bounded(self) -> None:
+        fake = FakeSocket(handshake=UPGRADE, sendall_blocks=True)
+        self.fake_connect(lambda: fake)
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.WebSocket(
+                "ws://127.0.0.1:1/devtools/page/1",
+                timeout=30,
+                deadline=browser_gate.Deadline(0.5),
+            )
+
+        self.assertIn("stopped accepting", str(failure.exception))
+        self.assertTrue(fake.timeouts, "the write should have been bounded first")
+        self.assertLessEqual(max(fake.timeouts), 0.5)
+
+    def test_a_command_that_cannot_be_written_is_bounded(self) -> None:
+        fake = FakeSocket(handshake=UPGRADE)
+        self.fake_connect(lambda: fake)
+        client = browser_gate.WebSocket(
+            "ws://127.0.0.1:1/devtools/page/1",
+            timeout=30,
+            deadline=browser_gate.Deadline(0.5),
+        )
+        fake._sendall_blocks = True
+
+        with self.assertRaises(GateFailure) as failure:
+            client.send('{"id":1}')
+
+        self.assertIn("stopped accepting", str(failure.exception))
+
+    def test_a_write_past_the_budget_never_reaches_the_socket(self) -> None:
+        fake = FakeSocket(handshake=UPGRADE)
+        self.fake_connect(lambda: fake)
+        client = browser_gate.WebSocket(
+            "ws://127.0.0.1:1/devtools/page/1",
+            timeout=30,
+            deadline=browser_gate.Deadline(30.0),
+        )
+        sent = len(fake.sent)
+        client._deadline._expires = time.monotonic() - 1.0
+
+        with self.assertRaises(GateFailure) as failure:
+            client.send('{"id":1}')
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertEqual(len(fake.sent), sent, "an expired gate writes nothing")
+
+
+class BoundedBodyTest(unittest.TestCase):
+    """An HTTP body spends the total budget, not an inactivity timer."""
+
+    def test_a_trickled_body_cannot_outlive_the_budget(self) -> None:
+        server = TricklingBodyServer()
+        self.addCleanup(server.close)
+        deadline = browser_gate.Deadline(0.5)
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.require_http_200(server.url, "", deadline)
+        elapsed = time.monotonic() - started
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertLess(elapsed, 5.0, "the trickled body reset the timer")
+
+    def test_a_fetch_past_the_budget_is_never_attempted(self) -> None:
+        server = TricklingBodyServer()
+        self.addCleanup(server.close)
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.require_http_200(server.url, "", browser_gate.Deadline(0.0))
+
+        self.assertIn("budget", str(failure.exception))
+
+
 class KeyboardOwnershipTest(unittest.TestCase):
     """Drives the real gate functions against the scriptable page."""
 
@@ -1179,6 +1373,27 @@ class EntryPointTest(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             browser_gate.gate_arguments(arguments)
+
+    def test_a_run_that_finished_past_its_budget_is_not_a_pass(self) -> None:
+        """The defect this guards: every phase passed, but far too late.
+
+        A gate that ran out of time proved nothing about a browser anybody will
+        wait for, and the report it would write is the one a green run
+        publishes.
+        """
+        summary = {"canvas": {}, "pixels": {}, "ready_seconds": 1.0, "scroll": {}}
+
+        def slow(arguments: object, sessions: list, deadline: object) -> tuple:
+            deadline._expires = time.monotonic() - 1.0
+            return summary, {"class": "play-embed"}
+
+        self.replace_run_gate(slow)
+
+        code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 1)
+        self.assertFalse((self.diagnostics / "browser-gate.json").exists())
+        self.assertFalse((self.diagnostics / "embed-gate.json").exists())
 
 
 if __name__ == "__main__":

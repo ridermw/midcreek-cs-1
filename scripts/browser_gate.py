@@ -159,9 +159,20 @@ class WebSocket:
         self._timeout = timeout
         self._deadline = Deadline() if deadline is None else deadline
         host, port, resource = match.group(1), int(match.group(2)), match.group(3)
-        self._deadline.require("connecting to the DevTools endpoint")
-        self._socket = socket.create_connection((host, port), timeout=timeout)
-        self._socket.settimeout(timeout)
+        # Connecting is a network operation like any other, so it spends the
+        # same budget: a host that accepts slowly cannot buy the gate more time
+        # than it has left.
+        remaining = self._deadline.require("connecting to the DevTools endpoint")
+        try:
+            self._socket = socket.create_connection(
+                (host, port), timeout=min(timeout, remaining)
+            )
+        except OSError as failure:
+            self._deadline.require("connecting to the DevTools endpoint")
+            raise GateFailure(
+                f"the DevTools endpoint at {host}:{port} could not be reached: {failure}"
+            ) from failure
+        self._socket.settimeout(min(timeout, remaining))
         self._buffer = b""
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
@@ -172,7 +183,7 @@ class WebSocket:
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n"
         )
-        self._socket.sendall(request.encode("ascii"))
+        self._sendall(request.encode("ascii"), "sending the DevTools handshake")
         # The upgrade response is read under the same deadline as everything
         # else, and its headers are capped: a server that answers with an
         # endless header block is not completing a handshake.
@@ -187,15 +198,43 @@ class WebSocket:
         if b"101" not in head.split(b"\r\n", 1)[0]:
             raise GateFailure(f"DevTools refused the WebSocket upgrade: {head!r}")
 
+    def _bound(self, doing: str) -> float:
+        """Clamps the socket to what is left of the whole gate, and says so.
+
+        Every blocking operation on this socket goes through here, so no read
+        and no write can outlive the budget by staying just inside a per-call
+        timeout that resets on every byte.
+        """
+        remaining = self._deadline.require(doing)
+        bounded = min(self._timeout, remaining)
+        try:
+            self._socket.settimeout(bounded)
+        except OSError:
+            pass
+        return bounded
+
+    def _sendall(self, data: bytes, doing: str) -> None:
+        self._bound(doing)
+        try:
+            self._socket.sendall(data)
+        except TimeoutError as failure:
+            # A write that timed out because the budget clamped it is a budget
+            # failure, not a slow peer; say which one it was.
+            self._deadline.require(doing)
+            raise GateFailure(
+                f"the DevTools WebSocket stopped accepting {len(data)} bytes "
+                f"while {doing}: {failure}"
+            ) from failure
+        except OSError as failure:
+            raise GateFailure(
+                f"the DevTools WebSocket could not be written while {doing}: {failure}"
+            ) from failure
+
     def _read_more(self) -> None:
         # Every read is bounded by what is left of the whole gate, so a stream
         # that trickles one byte at a time can never outlive the budget by
         # staying just inside a per-read timeout forever.
-        remaining = self._deadline.require("reading from the DevTools WebSocket")
-        try:
-            self._socket.settimeout(min(self._timeout, remaining))
-        except OSError:
-            pass
+        self._bound("reading from the DevTools WebSocket")
         try:
             chunk = self._socket.recv(65536)
         except TimeoutError as failure:
@@ -229,7 +268,7 @@ class WebSocket:
             header += struct.pack(">Q", length)
         header += mask
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
-        self._socket.sendall(bytes(header) + masked)
+        self._sendall(bytes(header) + masked, "sending a DevTools command")
 
     def receive(self) -> str:
         """Returns the next complete message, reassembled across fragments."""
@@ -300,7 +339,7 @@ class WebSocket:
         mask = os.urandom(4)
         header = bytearray([0x80 | self.PONG, 0x80 | len(payload)]) + mask
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        self._socket.sendall(bytes(header) + masked)
+        self._sendall(bytes(header) + masked, "answering a DevTools ping")
 
     def _need(self, count: int) -> None:
         while len(self._buffer) < count:
@@ -566,6 +605,26 @@ def resolve_url(base_url: str, relative: str) -> str:
     return f"{base_url.rstrip('/')}/{quoted}" if quoted else f"{base_url.rstrip('/')}/"
 
 
+def read_bounded(response: object, limit: int, deadline: Deadline, doing: str) -> bytes:
+    """Reads at most ``limit`` bytes, spending the whole gate's budget.
+
+    A socket timeout is an inactivity timer: a server that sends one byte
+    whenever it is about to expire resets it forever. The deadline is checked
+    between chunks instead, so a trickled body ends the gate rather than
+    extending it, and the timeout the connection was opened with is already
+    clamped to the same budget for a body that stops arriving altogether.
+    """
+    data = bytearray()
+    reader = getattr(response, "read1", None) or response.read
+    while len(data) < limit:
+        deadline.require(doing)
+        chunk = reader(min(4096, limit - len(data)))
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+
 def require_http_200(base_url: str, relative: str, deadline: Deadline) -> None:
     url = resolve_url(base_url, relative)
     timeout = min(BROWSER_TIMEOUT_SECONDS, deadline.require(f"fetching {relative}"))
@@ -574,7 +633,7 @@ def require_http_200(base_url: str, relative: str, deadline: Deadline) -> None:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if response.status != 200:
                 raise GateFailure(f"{relative} returned HTTP {response.status}")
-            response.read(1024)
+            read_bounded(response, 1024, deadline, f"reading {relative}")
     except urllib.error.URLError as failure:
         raise GateFailure(f"{relative} could not be fetched: {failure}") from failure
 
@@ -683,7 +742,7 @@ def open_page(cdp_port: int, url: str, deadline: Deadline) -> DevTools:
         remaining = deadline.require("waiting for a DevTools endpoint")
         try:
             with urllib.request.urlopen(version_url, timeout=min(2.0, remaining)) as response:
-                json.loads(response.read())
+                json.loads(read_bounded(response, 64 * 1024, deadline, "reading the DevTools version"))
                 break
         except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout):
             time.sleep(0.25)
@@ -694,7 +753,9 @@ def open_page(cdp_port: int, url: str, deadline: Deadline) -> DevTools:
         method="PUT",
     )
     with urllib.request.urlopen(new_target, timeout=timeout) as response:
-        target = json.loads(response.read())
+        target = json.loads(
+            read_bounded(response, 64 * 1024, deadline, "reading the new browser target")
+        )
     session = DevTools(target["webSocketDebuggerUrl"], deadline=deadline)
     session.call("Page.enable")
     session.call("Runtime.enable")
@@ -1361,6 +1422,10 @@ def main(argv: list[str] | None = None) -> int:
     pages: list[Page] = []
     try:
         summary, embed = run_gate(arguments, pages, deadline)
+        # A gate that ran out of time has not passed, however far it got. The
+        # budget is checked once more here so an expired run reports a failure
+        # instead of writing the report a green run publishes.
+        deadline.require("completing the browser gate")
     except GateFailure as failure:
         return report_failure(pages, arguments.diagnostics, str(failure))
     # A driver defect is not a passing gate. Anything the phases above did not

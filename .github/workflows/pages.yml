@@ -42,6 +42,13 @@ jobs:
       - name: Prove the checked-out history reaches every referenced commit
         run: ./scripts/ensure-history.sh
 
+      # The bound above is only worth having if the script that applies it is
+      # proved too. These are unit and fixture tests over repositories built on
+      # disk: they reach no network and start no browser, so they run here as a
+      # precondition rather than as one of the measured gates below.
+      - name: Test the history bound
+        run: python3 scripts/ensure_history_test.py
+
       # The runner's temporary directory is a runner fact, and a job-level
       # `env:` is evaluated before a runner exists. It is resolved here, from
       # the environment the runner really hands the step, so every later step
@@ -274,8 +281,19 @@ jobs:
     permissions:
       contents: read
     steps:
+      # This job runs the site generator too — `scripts/web-smoke.sh` builds the
+      # real homepage the browser gate proves — and the generator resolves the
+      # commit every finished task names. So this checkout gets the same
+      # bounded depth, the same blob filter, and the same proof that the depth
+      # really reaches those commits as the jobs that validate them.
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ env.HISTORY_DEPTH }}
+          filter: blob:none
+
+      - name: Prove the checked-out history reaches every referenced commit
+        run: ./scripts/ensure-history.sh
 
       # As in Verify: the runner context does not exist when a job-level `env:`
       # is evaluated, so the result root is resolved from the runner's own

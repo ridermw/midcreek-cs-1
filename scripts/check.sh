@@ -83,6 +83,13 @@ cargo run --quiet --bin sitegen -- validate \
   --plan docs/implementation-plan.md \
   --repository .
 
+# The published timeline needs a checkout that reaches every commit it names.
+# The bound and its script are proved here, on a repository built on disk: no
+# network, no browser, no renderer.
+step "published history bound"
+./scripts/ensure-history.sh
+python3 scripts/ensure_history_test.py
+
 step "pure and integration tests"
 cargo test --lib --bins
 cargo test --test asset_contract
