@@ -239,6 +239,16 @@ impl AssetReadyProof {
     /// tracks and the modules the pipeline declares. Readiness requires this to
     /// be empty, so a proof that skips, duplicates, or misbinds a handle can
     /// never satisfy [`AssetLoadState::Ready`].
+    ///
+    /// The mismatch branches below are defensive integrity checks rather than
+    /// expected runtime outcomes. [`resolve_asset_load_state`] builds the proof
+    /// from the same [`GeneratedAssets`] registry only after every tracked
+    /// document and scene reports loaded and every declared module name, index,
+    /// and spawned handle agrees. A gap is therefore unreachable through that
+    /// successful construction path today. Keeping the checks makes the proof
+    /// self-validating for mutation tests and ensures a future constructor
+    /// refactor fails closed instead of allowing an incomplete proof to set the
+    /// Ready latch.
     pub fn gaps(&self, generated: &GeneratedAssets) -> Vec<String> {
         let mut gaps = Vec::new();
 
@@ -534,6 +544,8 @@ fn resolve_asset_load_state(
         // Readiness is a one-way latch, so the reason for it is captured here,
         // in the same branch and the same frame, and never re-derived later.
         let proof = AssetReadyProof::new(proven_documents, proven_modules);
+        // This should be empty by construction. Treating a defensive proof gap
+        // as a load failure keeps that invariant explicit and fail-closed.
         failures = proof.gaps(&generated);
         if failures.is_empty() {
             commands.insert_resource(proof);
