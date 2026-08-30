@@ -1,0 +1,59 @@
+{
+  "canvas": {
+    "buffer": [
+      1152,
+      648
+    ],
+    "height": 648,
+    "width": 1152
+  },
+  "pixels": {
+    "palette_classes": [
+      "FLOOR_SHADOW",
+      "FLOOR_LIGHT",
+      "INK",
+      "RACK_SHADOW",
+      "RACK_WHITE",
+      "WORKER_SLATE",
+      "TEAL_ACCENT",
+      "SIGNATURE_YELLOW",
+      "HOSE_CHARCOAL"
+    ],
+    "region": [
+      64,
+      128,
+      1216,
+      776
+    ],
+    "sampled_pixels": 46656,
+    "unmatched_share": 0.02,
+    "variance": [
+      4983.645,
+      4016.222,
+      4516.022
+    ]
+  },
+  "ready_seconds": 4.82,
+  "scroll": {
+    "focused_deltas": {
+      "ArrowDown": 0.0,
+      "ArrowLeft": 0.0,
+      "ArrowRight": 0.0,
+      "ArrowUp": 0.0,
+      "KeyE": 0.0,
+      "KeyQ": 0.0,
+      "Space": 0.0
+    },
+    "probe": "scroll-probe",
+    "reserve_pixels": 1963.0,
+    "unfocused_deltas": {
+      "ArrowDown": 40.0,
+      "ArrowLeft": 0.0,
+      "ArrowRight": 0.0,
+      "ArrowUp": 0.0,
+      "KeyE": 0.0,
+      "KeyQ": 0.0,
+      "Space": 897.0
+    }
+  }
+}

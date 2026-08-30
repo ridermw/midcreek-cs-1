@@ -1,0 +1,961 @@
+{
+  "asset_sources": {
+    "assets/source/cooling-unit.ron": "e93fc327ca3f3bf34e0b0757ad468c047ed55bdb61796beb115d91a25db024e1",
+    "assets/source/infrastructure.ron": "8507f9dabd07fcfa97ba5b629d9ad7a2b9e08a8814a8fbc8095592b5b85edbef",
+    "assets/source/rack.ron": "767de7dcacbb435fc6f1b9c66943ef172f6d35dbb762773b3f98a80072f1c868",
+    "assets/source/technician.ron": "e1fe6064efe498f0511b5ea443d3370ce034bd852d75fa1f717276f4b739c8f1",
+    "assets/source/utility-props.ron": "93d497c8c69331e72ebaa9610d9258204e4d51627e4d416fda7508185069662d"
+  },
+  "assets": {
+    "assets/generated/cooling-unit.glb": "576beb4dcfa468f875a32b7dd3a3e09c28b3ecb3ffe20c4a70ad8453e771fe1c",
+    "assets/generated/infrastructure.glb": "31946ce8b869506d0ba170867a165d4c8388f240294f6a6d9e5ef2335be8bd0d",
+    "assets/generated/rack.glb": "088bcf31d9ed75e057abff432e88be7bc71e584a001a094ed030a4a760e47480",
+    "assets/generated/technician.glb": "db0582eb1d7976651522e0bacf9e57e2ebbef19b95320e130fb439dea9bb3606",
+    "assets/generated/utility-props.glb": "3ac07a9b2835896dcdbdeeb03bd333868327e7f0cca3dfd6618bd009f4099d9c"
+  },
+  "blueprint": {
+    "aisles": 3,
+    "colliders": 13,
+    "coverage": [
+      72.0,
+      72.0
+    ],
+    "player_spawn": [
+      -6.0,
+      -11.0
+    ],
+    "rack_rows": 4,
+    "room": [
+      40.0,
+      40.0
+    ],
+    "validation_errors": [],
+    "visuals": 35,
+    "walkable_connected": true
+  },
+  "camera": {
+    "clear_color": "#FF00FF",
+    "deband_dither": "Disabled",
+    "msaa_samples": 1,
+    "tonemapping": "None"
+  },
+  "failed_stage": "repair-capture",
+  "failure_reason": "capture timed out while writing /Users/runner/work/midcreek-cs-1/target/render-contract/primary/04-repairing-ne.png",
+  "frames": {
+    "01-healthy-center-ne.png": {
+      "badges": [
+        {
+          "kind": "none",
+          "rack": 0,
+          "rect": null,
+          "visibility": "no-ticket"
+        },
+        {
+          "kind": "none",
+          "rack": 1,
+          "rect": null,
+          "visibility": "no-ticket"
+        },
+        {
+          "kind": "none",
+          "rack": 2,
+          "rect": null,
+          "visibility": "no-ticket"
+        },
+        {
+          "kind": "none",
+          "rack": 3,
+          "rect": null,
+          "visibility": "no-ticket"
+        }
+      ],
+      "camera_progress": 1.0,
+      "camera_settled": true,
+      "camera_target": [
+        -6.0,
+        -11.0
+      ],
+      "camera_yaw_degrees": 45.0,
+      "equipment": [
+        {
+          "category": "cooling-units",
+          "id": "cooling-unit-east-north",
+          "on_screen": false,
+          "projected_bounds": [
+            996.817,
+            891.56,
+            1268.346,
+            1191.545
+          ],
+          "regions": [],
+          "world_bounds": [
+            [
+              11.9,
+              -0.035,
+              -8.25
+            ],
+            [
+              14.8,
+              2.66,
+              -3.35
+            ]
+          ]
+        },
+        {
+          "category": "floor-furniture",
+          "id": "floor-marking-aisle-01-east",
+          "on_screen": true,
+          "projected_bounds": [
+            -119.237,
+            365.279,
+            720.415,
+            1069.47
+          ],
+          "regions": [
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 632.69,
+              "y": 365.279
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 549.142,
+              "y": 435.348
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 465.595,
+              "y": 505.416
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 382.048,
+              "y": 575.485
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 298.5,
+              "y": 645.554
+            }
+          ],
+          "world_bounds": [
+            [
+              -4.81,
+              0.01,
+              -12.0
+            ],
+            [
+              -4.69,
+              0.01,
+              12.0
+            ]
+          ]
+        }
+      ],
+      "ground_quadrilateral": [
+        [
+          -9.027,
+          4.358
+        ],
+        [
+          9.358,
+          -14.027
+        ],
+        [
+          -2.973,
+          -26.358
+        ],
+        [
+          -21.358,
+          -7.973
+        ]
+      ],
+      "heading": "north-east",
+      "height": 720,
+      "hud_panels": {
+        "controls": {
+          "height": 40.0,
+          "width": 340.0,
+          "x": 924.0,
+          "y": 664.0
+        },
+        "queue": {
+          "height": 51.0,
+          "width": 216.0,
+          "x": 16.0,
+          "y": 16.0
+        }
+      },
+      "hud_rows": [],
+      "hud_status": "all-healthy",
+      "movement_locked": false,
+      "path": "01-healthy-center-ne.png",
+      "player_clip": "idle",
+      "player_position": [
+        -6.0,
+        -11.0
+      ],
+      "rack_states": [
+        "healthy",
+        "healthy",
+        "healthy",
+        "healthy"
+      ],
+      "stage": "healthy-capture",
+      "tickets": [],
+      "width": 1280,
+      "worker_crop": {
+        "height": 90.0,
+        "width": 40.0,
+        "x": 600.0,
+        "y": 300.0
+      }
+    },
+    "02-fault-queue-ne.png": {
+      "badges": [
+        {
+          "kind": "none",
+          "rack": 0,
+          "rect": null,
+          "visibility": "no-ticket"
+        },
+        {
+          "kind": "fault",
+          "rack": 1,
+          "rect": {
+            "height": 22.0,
+            "width": 34.0,
+            "x": 344.509,
+            "y": 639.383
+          },
+          "visibility": "shown"
+        },
+        {
+          "kind": "fault",
+          "rack": 2,
+          "rect": null,
+          "visibility": "off-screen"
+        },
+        {
+          "kind": "fault",
+          "rack": 3,
+          "rect": null,
+          "visibility": "off-screen"
+        }
+      ],
+      "camera_progress": 1.0,
+      "camera_settled": true,
+      "camera_target": [
+        -6.0,
+        -11.0
+      ],
+      "camera_yaw_degrees": 45.0,
+      "equipment": [
+        {
+          "category": "cooling-units",
+          "id": "cooling-unit-east-north",
+          "on_screen": false,
+          "projected_bounds": [
+            996.817,
+            891.56,
+            1268.346,
+            1191.545
+          ],
+          "regions": [],
+          "world_bounds": [
+            [
+              11.9,
+              -0.035,
+              -8.25
+            ],
+            [
+              14.8,
+              2.66,
+              -3.35
+            ]
+          ]
+        },
+        {
+          "category": "floor-furniture",
+          "id": "floor-marking-aisle-01-east",
+          "on_screen": true,
+          "projected_bounds": [
+            -119.237,
+            365.279,
+            720.415,
+            1069.47
+          ],
+          "regions": [
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 632.69,
+              "y": 365.279
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 549.142,
+              "y": 435.348
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 465.595,
+              "y": 505.416
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 382.048,
+              "y": 575.485
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 298.5,
+              "y": 645.554
+            }
+          ],
+          "world_bounds": [
+            [
+              -4.81,
+              0.01,
+              -12.0
+            ],
+            [
+              -4.69,
+              0.01,
+              12.0
+            ]
+          ]
+        }
+      ],
+      "ground_quadrilateral": [
+        [
+          -9.027,
+          4.358
+        ],
+        [
+          9.358,
+          -14.027
+        ],
+        [
+          -2.973,
+          -26.358
+        ],
+        [
+          -21.358,
+          -7.973
+        ]
+      ],
+      "heading": "north-east",
+      "height": 720,
+      "hud_panels": {
+        "controls": {
+          "height": 40.0,
+          "width": 340.0,
+          "x": 924.0,
+          "y": 664.0
+        },
+        "queue": {
+          "height": 114.0,
+          "width": 216.0,
+          "x": 16.0,
+          "y": 16.0
+        },
+        "queue-row-0": {
+          "height": 18.0,
+          "width": 200.0,
+          "x": 24.0,
+          "y": 41.0
+        },
+        "queue-row-1": {
+          "height": 18.0,
+          "width": 200.0,
+          "x": 24.0,
+          "y": 62.0
+        },
+        "queue-row-2": {
+          "height": 18.0,
+          "width": 200.0,
+          "x": 24.0,
+          "y": 83.0
+        }
+      },
+      "hud_rows": [
+        {
+          "label": "T0001 R03 Critical",
+          "progress": 0.0,
+          "rack": 2,
+          "severity": "critical",
+          "slot": 0,
+          "state": "faulted",
+          "ticket": 1
+        },
+        {
+          "label": "T0002 R02 Critical",
+          "progress": 0.0,
+          "rack": 1,
+          "severity": "critical",
+          "slot": 1,
+          "state": "faulted",
+          "ticket": 2
+        },
+        {
+          "label": "T0003 R04 Critical",
+          "progress": 0.0,
+          "rack": 3,
+          "severity": "critical",
+          "slot": 2,
+          "state": "faulted",
+          "ticket": 3
+        }
+      ],
+      "hud_status": "tickets-open",
+      "movement_locked": false,
+      "path": "02-fault-queue-ne.png",
+      "player_clip": "idle",
+      "player_position": [
+        -6.0,
+        -11.0
+      ],
+      "rack_states": [
+        "healthy",
+        "faulted",
+        "faulted",
+        "faulted"
+      ],
+      "stage": "fault-queue-capture",
+      "tickets": [
+        {
+          "created_tick": 240,
+          "id": 1,
+          "rack": 2,
+          "severity": "critical"
+        },
+        {
+          "created_tick": 480,
+          "id": 2,
+          "rack": 1,
+          "severity": "critical"
+        },
+        {
+          "created_tick": 720,
+          "id": 3,
+          "rack": 3,
+          "severity": "critical"
+        }
+      ],
+      "width": 1280,
+      "worker_crop": {
+        "height": 90.0,
+        "width": 40.0,
+        "x": 600.0,
+        "y": 300.0
+      }
+    },
+    "03-walk-ne.png": {
+      "badges": [
+        {
+          "kind": "none",
+          "rack": 0,
+          "rect": null,
+          "visibility": "no-ticket"
+        },
+        {
+          "kind": "fault",
+          "rack": 1,
+          "rect": {
+            "height": 22.0,
+            "width": 34.0,
+            "x": 520.307,
+            "y": 491.946
+          },
+          "visibility": "shown"
+        },
+        {
+          "kind": "fault",
+          "rack": 2,
+          "rect": null,
+          "visibility": "off-screen"
+        },
+        {
+          "kind": "fault",
+          "rack": 3,
+          "rect": null,
+          "visibility": "off-screen"
+        }
+      ],
+      "camera_progress": 1.0,
+      "camera_settled": true,
+      "camera_target": [
+        -6.0,
+        -5.95
+      ],
+      "camera_yaw_degrees": 45.0,
+      "equipment": [
+        {
+          "category": "cooling-units",
+          "id": "cooling-unit-east-north",
+          "on_screen": false,
+          "projected_bounds": [
+            1170.875,
+            745.583,
+            1442.404,
+            1045.568
+          ],
+          "regions": [],
+          "world_bounds": [
+            [
+              11.9,
+              -0.035,
+              -8.25
+            ],
+            [
+              14.8,
+              2.66,
+              -3.35
+            ]
+          ]
+        },
+        {
+          "category": "floor-furniture",
+          "id": "floor-marking-aisle-01-east",
+          "on_screen": true,
+          "projected_bounds": [
+            54.821,
+            219.302,
+            894.472,
+            923.492
+          ],
+          "regions": [
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 806.748,
+              "y": 219.302
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 723.2,
+              "y": 289.37
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 639.653,
+              "y": 359.439
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 556.105,
+              "y": 429.508
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 472.558,
+              "y": 499.577
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 389.011,
+              "y": 569.645
+            },
+            {
+              "height": 73.572,
+              "width": 87.725,
+              "x": 305.463,
+              "y": 639.714
+            },
+            {
+              "height": 10.217,
+              "width": 87.725,
+              "x": 221.916,
+              "y": 709.783
+            }
+          ],
+          "world_bounds": [
+            [
+              -4.81,
+              0.01,
+              -12.0
+            ],
+            [
+              -4.69,
+              0.01,
+              12.0
+            ]
+          ]
+        }
+      ],
+      "ground_quadrilateral": [
+        [
+          -9.027,
+          9.408
+        ],
+        [
+          9.358,
+          -8.977
+        ],
+        [
+          -2.973,
+          -21.308
+        ],
+        [
+          -21.358,
+          -2.923
+        ]
+      ],
+      "heading": "north-east",
+      "height": 720,
+      "hud_panels": {
+        "controls": {
+          "height": 40.0,
+          "width": 340.0,
+          "x": 924.0,
+          "y": 664.0
+        },
+        "queue": {
+          "height": 114.0,
+          "width": 216.0,
+          "x": 16.0,
+          "y": 16.0
+        },
+        "queue-row-0": {
+          "height": 18.0,
+          "width": 200.0,
+          "x": 24.0,
+          "y": 41.0
+        },
+        "queue-row-1": {
+          "height": 18.0,
+          "width": 200.0,
+          "x": 24.0,
+          "y": 62.0
+        },
+        "queue-row-2": {
+          "height": 18.0,
+          "width": 200.0,
+          "x": 24.0,
+          "y": 83.0
+        }
+      },
+      "hud_rows": [
+        {
+          "label": "T0001 R03 Critical",
+          "progress": 0.0,
+          "rack": 2,
+          "severity": "critical",
+          "slot": 0,
+          "state": "faulted",
+          "ticket": 1
+        },
+        {
+          "label": "T0002 R02 Critical",
+          "progress": 0.0,
+          "rack": 1,
+          "severity": "critical",
+          "slot": 1,
+          "state": "faulted",
+          "ticket": 2
+        },
+        {
+          "label": "T0003 R04 Critical",
+          "progress": 0.0,
+          "rack": 3,
+          "severity": "critical",
+          "slot": 2,
+          "state": "faulted",
+          "ticket": 3
+        }
+      ],
+      "hud_status": "move-closer",
+      "movement_locked": false,
+      "path": "03-walk-ne.png",
+      "player_clip": "walk",
+      "player_position": [
+        -6.0,
+        -5.95
+      ],
+      "rack_states": [
+        "healthy",
+        "faulted",
+        "faulted",
+        "faulted"
+      ],
+      "stage": "walk-capture",
+      "tickets": [
+        {
+          "created_tick": 240,
+          "id": 1,
+          "rack": 2,
+          "severity": "critical"
+        },
+        {
+          "created_tick": 480,
+          "id": 2,
+          "rack": 1,
+          "severity": "critical"
+        },
+        {
+          "created_tick": 720,
+          "id": 3,
+          "rack": 3,
+          "severity": "critical"
+        }
+      ],
+      "width": 1280,
+      "worker_crop": {
+        "height": 90.0,
+        "width": 40.0,
+        "x": 600.0,
+        "y": 300.0
+      }
+    }
+  },
+  "gameplay": {
+    "busy_pauses": 1,
+    "capacity_pauses": 1,
+    "duplicate_pauses": 0,
+    "fault_seed": "0xce115a1fda7ace01",
+    "fixed_step_seconds": 0.017,
+    "interactions": [
+      {
+        "distance": 3.68,
+        "outcome": "out-of-range",
+        "rack": 1,
+        "stage": "keyboard-journey",
+        "ticket": null
+      },
+      {
+        "distance": null,
+        "outcome": "started",
+        "rack": 1,
+        "stage": "begin-repair",
+        "ticket": 2
+      }
+    ],
+    "keys": [
+      {
+        "key": "space",
+        "stage": "keyboard-journey",
+        "state": "pressed"
+      },
+      {
+        "key": "space",
+        "stage": "keyboard-journey",
+        "state": "released"
+      },
+      {
+        "key": "arrow-down",
+        "stage": "keyboard-journey",
+        "state": "pressed"
+      },
+      {
+        "key": "arrow-left",
+        "stage": "keyboard-journey",
+        "state": "pressed"
+      },
+      {
+        "key": "q",
+        "stage": "keyboard-journey",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "keyboard-journey",
+        "state": "pressed"
+      },
+      {
+        "key": "q",
+        "stage": "keyboard-journey",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "keyboard-journey",
+        "state": "released"
+      },
+      {
+        "key": "arrow-left",
+        "stage": "begin-repair",
+        "state": "released"
+      },
+      {
+        "key": "arrow-down",
+        "stage": "begin-repair",
+        "state": "released"
+      },
+      {
+        "key": "space",
+        "stage": "begin-repair",
+        "state": "pressed"
+      },
+      {
+        "key": "space",
+        "stage": "begin-repair",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "orbit-south-east",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "orbit-south-east",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "orbit-south-west",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "orbit-south-west",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "orbit-north-west",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "orbit-north-west",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "mid-orbit-capture",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "mid-orbit-capture",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "corner-probes",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "corner-probes",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "corner-probes",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "corner-probes",
+        "state": "released"
+      },
+      {
+        "key": "e",
+        "stage": "corner-probes",
+        "state": "pressed"
+      },
+      {
+        "key": "e",
+        "stage": "corner-probes",
+        "state": "released"
+      }
+    ],
+    "repaired_rack": 1,
+    "rig_parts": [
+      "bone-arm-lower-left",
+      "bone-arm-lower-right",
+      "bone-arm-upper-left",
+      "bone-arm-upper-right",
+      "bone-chest",
+      "bone-head",
+      "bone-hips",
+      "bone-leg-left",
+      "bone-leg-right",
+      "bone-spine",
+      "bone-tool",
+      "technician-skin"
+    ],
+    "ticket_history": [
+      {
+        "event": "opened",
+        "rack": 2,
+        "severity": "critical",
+        "tick": 240,
+        "ticket": 1
+      },
+      {
+        "event": "opened",
+        "rack": 1,
+        "severity": "critical",
+        "tick": 480,
+        "ticket": 2
+      },
+      {
+        "event": "opened",
+        "rack": 3,
+        "severity": "critical",
+        "tick": 720,
+        "ticket": 3
+      },
+      {
+        "event": "removed",
+        "rack": 1,
+        "severity": "critical",
+        "tick": 1281,
+        "ticket": 2
+      },
+      {
+        "event": "opened",
+        "rack": 1,
+        "severity": "warning",
+        "tick": 1761,
+        "ticket": 4
+      }
+    ],
+    "tickets_emitted": 4
+  },
+  "references": {
+    "docs/reference/cel-shift-character-sheet.png": "8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25",
+    "docs/reference/cel-shift-key-art.png": "a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75"
+  },
+  "result": "failure",
+  "schema_version": 1,
+  "sources": {
+    "src/camera.rs": "02c0c60a0f4da5e5b7e29767da983f8404af9e772cf931d16d17f5badb8ad45f",
+    "src/design.rs": "c3402ab21b43618decf428f0f13015b0af545a4622caa4786381ef673f373b58",
+    "src/hud.rs": "1486d626d8620f5afdf4dc7c4ffe89c35e5c3abf0ff707daf1dd06b9783a3ed7",
+    "src/operations.rs": "929abd66960b75f299f4b67b2665ce94e259ca136797646b424e4e1500657df7",
+    "src/player.rs": "dec5d7af10a81ac3e40c9fc948de90500964cf81f6cafbe7db6c4825ec05a6c1",
+    "src/verification.rs": "632563ebf8017d14d2d3baa1bfb354463d305048a828809ad9cb22f7421fa86e",
+    "src/world.rs": "c68a38daa4949a30dfbaafbc03d8be27cff827eb8a4a8fc88e69119925f7ddef"
+  },
+  "stages": [
+    "boot",
+    "wait-for-assets",
+    "validate-blueprint",
+    "healthy-capture",
+    "seed-three-faults",
+    "fault-queue-capture",
+    "keyboard-journey",
+    "walk-capture",
+    "begin-repair",
+    "repair-capture"
+  ]
+}

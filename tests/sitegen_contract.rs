@@ -1685,3 +1685,834 @@ mod web_source_contract {
             .to_owned()
     }
 }
+
+mod verification_publication_contract {
+    use super::support::{
+        browser_root, green_evidence, prior_gallery, raw_report, verification_root,
+    };
+    use super::*;
+    use midcreek_cs_1::{
+        design::{CHARACTER_SHEET_SHA256, KEY_ART_SHA256},
+        sitegen::{
+            BROWSER_FRAME_FILE, CURRENT_SCREENSHOTS, GALLERY_FILE, GALLERY_FRAMES, GalleryManifest,
+            HISTORY_SCREENSHOTS, VERIFICATION_FILE, VerificationEvidence, VerificationSummary,
+            WORKER_CROP_FILE, update_gallery,
+        },
+        verification::{ARTIFACT_NAMES, FrameName, VerificationReport},
+    };
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    // -----------------------------------------------------------------------
+    // Sanitized projection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_public_projection_carries_only_declared_evidence() {
+        let summary = green_evidence().summary;
+        let json = serde_json::to_string(&summary).unwrap();
+
+        // Round-tripping through the strict public shape proves the projection
+        // emits nothing the published schema does not declare.
+        let parsed = serde_json::from_str::<VerificationSummary>(&json).unwrap();
+        assert_eq!(parsed, summary);
+        for forbidden in [
+            "command_line",
+            "stdout",
+            "stderr",
+            "environment",
+            "failure_reason",
+            "/Users/",
+            "/home/",
+            "RUNNER_TEMP",
+            "ground_quadrilateral",
+            "player_position",
+        ] {
+            assert!(!json.contains(forbidden), "{forbidden} leaked into {json}");
+        }
+    }
+
+    #[test]
+    fn the_public_projection_keeps_the_named_gates_hashes_and_camera_facts() {
+        let summary = green_evidence().summary;
+
+        assert_eq!(summary.frames.len(), FrameName::ALL.len());
+        assert_eq!(summary.camera.msaa_samples, 1);
+        assert_eq!(summary.camera.clear_color, "#FF00FF");
+        assert_eq!(summary.hashes.sources.len(), 7);
+        assert_eq!(summary.hashes.assets.len(), 5);
+        assert_eq!(summary.hashes.asset_sources.len(), 5);
+        assert_eq!(
+            summary
+                .hashes
+                .references
+                .get("docs/reference/cel-shift-key-art.png"),
+            Some(&KEY_ART_SHA256.to_owned())
+        );
+        assert!(summary.succeeded);
+        assert!(
+            summary.metric_failures.is_empty(),
+            "{:?}",
+            summary.metric_failures
+        );
+        assert_eq!(summary.metrics.get("render.frames-captured"), Some(&14.0));
+        assert_eq!(summary.metrics.get("browser.palette-classes"), Some(&9.0));
+    }
+
+    #[test]
+    fn the_semantic_hash_is_the_games_own_canonical_report_hash() {
+        let report = raw_report("report.json");
+        let expected = midcreek_cs_1::verification::semantic_hash(
+            &midcreek_cs_1::verification::canonical_json(&report),
+        );
+
+        assert_eq!(green_evidence().summary.semantic_visual_hash, expected);
+    }
+
+    #[test]
+    fn a_raw_report_carrying_undeclared_fields_is_refused() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&read(verification_root().join("report.json"))).unwrap();
+        let object = raw.as_object_mut().unwrap();
+        object.insert(
+            "command_line".to_owned(),
+            serde_json::json!("/Users/runner/target/debug/midcreek-cs-1 --verify-output /tmp/x"),
+        );
+        object.insert(
+            "environment".to_owned(),
+            serde_json::json!({ "GITHUB_TOKEN": "ghp_example" }),
+        );
+
+        let parsed = serde_json::from_str::<VerificationReport>(&raw.to_string());
+
+        let message = parsed
+            .expect_err("hostile fields must be refused")
+            .to_string();
+        assert!(message.contains("unknown field"), "{message}");
+    }
+
+    #[test]
+    fn a_raw_browser_gate_carrying_undeclared_fields_is_refused() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&read(browser_root().join("browser-gate.json"))).unwrap();
+        raw.as_object_mut().unwrap().insert(
+            "chrome_path".to_owned(),
+            serde_json::json!("/usr/bin/google-chrome"),
+        );
+
+        let parsed =
+            serde_json::from_str::<midcreek_cs_1::sitegen::BrowserGateReport>(&raw.to_string());
+
+        assert!(parsed.is_err(), "the browser gate shape must be strict");
+    }
+
+    #[test]
+    fn an_artifact_path_that_escapes_the_artifact_root_is_refused() {
+        let mut report = raw_report("report.json");
+        let name = FrameName::HealthyCenterNorthEast.file_name();
+        report.frames.get_mut(name).unwrap().path = "../../../etc/passwd".to_owned();
+
+        let result = VerificationEvidence::project(&report, &verification_root(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedArtifact { path })
+                if path == Path::new("../../../etc/passwd")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn an_absolute_artifact_path_is_refused() {
+        let mut report = raw_report("report.json");
+        let name = FrameName::HealthyCenterNorthEast.file_name();
+        report.frames.get_mut(name).unwrap().path = "/etc/passwd".to_owned();
+
+        let result = VerificationEvidence::project(&report, &verification_root(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedArtifact { .. })),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn an_artifact_symlink_is_refused() {
+        let root = scratch("symlinked-artifacts");
+        copy_verification_fixture(root.path());
+        let name = FrameName::HealthyCenterNorthEast.file_name();
+        fs::remove_file(root.path().join(name)).unwrap();
+        std::os::unix::fs::symlink(verification_root().join(name), root.path().join(name)).unwrap();
+
+        let result = VerificationEvidence::project(&raw_report("report.json"), root.path(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedArtifact { .. })),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_missing_artifact_is_refused() {
+        let root = scratch("missing-artifact");
+        copy_verification_fixture(root.path());
+        fs::remove_file(root.path().join(FrameName::ResolvedNorthEast.file_name())).unwrap();
+
+        let result = VerificationEvidence::project(&raw_report("report.json"), root.path(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::MissingInput { path })
+                if path.file_name().is_some_and(|name| name == "05-resolved-ne.png")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_corrupt_artifact_is_refused() {
+        let root = scratch("corrupt-artifact");
+        copy_verification_fixture(root.path());
+        fs::write(
+            root.path().join(FrameName::WalkNorthEast.file_name()),
+            b"\x89PNG\r\n\x1a\nnot actually an image",
+        )
+        .unwrap();
+
+        let result = VerificationEvidence::project(&raw_report("report.json"), root.path(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::CorruptArtifact { path, .. })
+                if path.file_name().is_some_and(|name| name == "03-walk-ne.png")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn an_artifact_whose_pixels_disagree_with_the_report_is_refused() {
+        let mut report = raw_report("report.json");
+        report
+            .frames
+            .get_mut(FrameName::MidOrbit.file_name())
+            .unwrap()
+            .width = 640;
+
+        let result = VerificationEvidence::project(&report, &verification_root(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::CorruptArtifact { path, .. })
+                if path.file_name().is_some_and(|name| name == "09-mid-orbit.png")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_report_whose_reference_hashes_disagree_with_the_approved_manifest_is_refused() {
+        let mut report = raw_report("report.json");
+        report.references.insert(
+            "docs/reference/cel-shift-key-art.png".to_owned(),
+            "0".repeat(64),
+        );
+
+        let result = VerificationEvidence::project(&report, &verification_root(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::ReferenceProvenance { .. })),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gallery ordering and deduplication
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn adds_gallery_entry_only_when_visual_hash_changes() {
+        let existing = prior_gallery();
+        let latest = existing
+            .entries
+            .last()
+            .unwrap()
+            .semantic_visual_hash
+            .clone();
+
+        let same = update_gallery(
+            &existing,
+            &report_with_hash(&latest),
+            &commit_summary("3333333333333333333333333333333333333333"),
+        );
+        assert_eq!(same.entries.len(), 1);
+        assert_eq!(same, existing);
+
+        let changed = update_gallery(
+            &existing,
+            &report_with_hash(&"d".repeat(64)),
+            &commit_summary("3333333333333333333333333333333333333333"),
+        );
+        assert_eq!(changed.entries.len(), 2);
+        assert_eq!(
+            changed.entries[0].semantic_visual_hash,
+            existing.entries[0].semantic_visual_hash
+        );
+        assert_eq!(changed.entries[1].source_commit, "3".repeat(40));
+    }
+
+    #[test]
+    fn a_gallery_entry_records_frames_metrics_and_deltas_against_the_previous_entry() {
+        let existing = prior_gallery();
+        let mut summary = report_with_hash(&"e".repeat(64));
+        summary
+            .metrics
+            .insert("gameplay.tickets-emitted".to_owned(), 5.0);
+
+        let updated = update_gallery(
+            &existing,
+            &summary,
+            &commit_summary("3333333333333333333333333333333333333333"),
+        );
+
+        let entry = updated.entries.last().unwrap();
+        assert_eq!(entry.current_task, "autonomous-assets");
+        assert_eq!(entry.committed_at, "2026-08-30T09:00:00Z");
+        assert_eq!(
+            entry.metric_deltas.get("gameplay.tickets-emitted"),
+            Some(&2.0)
+        );
+        for (label, file) in GALLERY_FRAMES {
+            assert_eq!(
+                entry.frames.get(label).map(String::as_str),
+                Some(format!("{HISTORY_SCREENSHOTS}/33333333/{file}").as_str()),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            entry.frames.get("worker").map(String::as_str),
+            Some(format!("{HISTORY_SCREENSHOTS}/33333333/{WORKER_CROP_FILE}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_repeated_source_commit_never_duplicates_a_gallery_entry() {
+        let existing = prior_gallery();
+        let commit = existing.entries[0].source_commit.clone();
+
+        let updated = update_gallery(
+            &existing,
+            &report_with_hash(&"f".repeat(64)),
+            &commit_summary(&commit),
+        );
+
+        assert_eq!(updated, existing);
+    }
+
+    #[test]
+    fn a_failed_verification_leaves_the_previous_gallery_unchanged() {
+        let existing = prior_gallery();
+        let mut summary = report_with_hash(&"a".repeat(64));
+        summary.succeeded = false;
+
+        let updated = update_gallery(
+            &existing,
+            &summary,
+            &commit_summary("3333333333333333333333333333333333333333"),
+        );
+
+        assert_eq!(updated, existing);
+    }
+
+    // -----------------------------------------------------------------------
+    // Screenshot promotion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_green_build_promotes_every_verification_frame_and_the_browser_proof() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let current = site.root().join(CURRENT_SCREENSHOTS);
+
+        for frame in FrameName::ALL {
+            assert!(
+                current.join(frame.file_name()).is_file(),
+                "{} was not promoted",
+                frame.file_name()
+            );
+        }
+        assert!(current.join(WORKER_CROP_FILE).is_file());
+        assert!(current.join(BROWSER_FRAME_FILE).is_file());
+        assert!(site.root().join(VERIFICATION_FILE).is_file());
+    }
+
+    #[test]
+    fn the_promoted_frames_are_byte_identical_to_the_verified_artifacts() {
+        let site = build_fixture_site("verified-game").unwrap();
+
+        for frame in FrameName::ALL {
+            assert_eq!(
+                sha256(
+                    site.root()
+                        .join(CURRENT_SCREENSHOTS)
+                        .join(frame.file_name())
+                ),
+                sha256(verification_root().join(frame.file_name())),
+                "{} was altered on publication",
+                frame.file_name()
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_declared_verification_artifacts_are_copied() {
+        let root = scratch("extra-artifacts");
+        copy_verification_fixture(root.path());
+        fs::write(root.path().join("stderr.log"), "thread 'main' panicked").unwrap();
+        fs::write(root.path().join("stdout.log"), "/Users/runner/work").unwrap();
+        let mut inputs = site_inputs("verified-game");
+        inputs.verification = Some(
+            VerificationEvidence::project(&raw_report("report.json"), root.path(), None).unwrap(),
+        );
+
+        let site = build_site_from_inputs("extra-artifacts", &inputs).unwrap();
+
+        let published = fs::read_dir(site.root().join(CURRENT_SCREENSHOTS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(!published.contains("stderr.log"));
+        assert!(!published.contains("stdout.log"));
+        assert!(!published.contains(midcreek_cs_1::verification::REPORT_FILE_NAME));
+        assert_eq!(published.len(), FrameName::ALL.len() + 1);
+        assert!(ARTIFACT_NAMES.contains(&"report.json"));
+    }
+
+    #[test]
+    fn the_worker_crop_is_the_reported_rectangle_of_the_center_frame() {
+        let site = build_fixture_site("verified-game").unwrap();
+
+        let crop = image::open(site.root().join(CURRENT_SCREENSHOTS).join(WORKER_CROP_FILE))
+            .unwrap()
+            .to_rgb8();
+        let center =
+            image::open(verification_root().join(FrameName::HealthyCenterNorthEast.file_name()))
+                .unwrap()
+                .to_rgb8();
+        let reported = green_evidence().summary.frames[0].worker_crop;
+
+        assert_eq!(
+            (crop.width(), crop.height()),
+            (reported.width, reported.height)
+        );
+        assert_eq!((crop.width(), crop.height()), (40, 90));
+        for y in 0..crop.height() {
+            for x in 0..crop.width() {
+                assert_eq!(
+                    crop.get_pixel(x, y),
+                    center.get_pixel(reported.x + x, reported.y + y),
+                    "the crop must be the reported rectangle at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_changed_visual_hash_publishes_one_new_history_entry() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let gallery: GalleryManifest =
+            serde_json::from_str(&read(site.root().join(GALLERY_FILE))).unwrap();
+
+        assert_eq!(gallery.entries.len(), 2);
+        let entry = gallery.entries.last().unwrap();
+        assert_eq!(entry.source_commit, "1".repeat(40));
+        for path in entry.frames.values() {
+            assert!(
+                site.root().join(path).is_file(),
+                "{path} was recorded but never published"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_visual_hash_deduplicates_but_still_publishes_the_current_frames() {
+        let mut inputs = site_inputs("verified-game");
+        let hash = inputs
+            .verification
+            .as_ref()
+            .unwrap()
+            .summary
+            .semantic_visual_hash
+            .clone();
+        let mut gallery = prior_gallery();
+        gallery.entries[0].semantic_visual_hash = hash;
+        inputs.gallery = Some(gallery);
+
+        let site = build_site_from_inputs("unchanged-hash", &inputs).unwrap();
+
+        let published: GalleryManifest =
+            serde_json::from_str(&read(site.root().join(GALLERY_FILE))).unwrap();
+        assert_eq!(published.entries.len(), 1);
+        assert!(
+            !site
+                .root()
+                .join(HISTORY_SCREENSHOTS)
+                .join("11111111")
+                .exists(),
+            "an unchanged hash must not open a history entry"
+        );
+        assert!(
+            site.root()
+                .join(CURRENT_SCREENSHOTS)
+                .join(FrameName::HealthyCenterNorthEast.file_name())
+                .is_file(),
+            "the current frame is retained even without a new history entry"
+        );
+    }
+
+    #[test]
+    fn a_failed_verification_publishes_no_screenshots_or_gallery() {
+        let site = build_fixture_site("failed-verification").unwrap();
+
+        assert!(
+            !site.root().join("screenshots").exists(),
+            "a failed run must leave the retained screenshots alone"
+        );
+        assert!(!site.root().join(GALLERY_FILE).exists());
+        assert!(site.root().join(VERIFICATION_FILE).is_file());
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendered evidence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn renders_gate_counts_and_durations() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+
+        assert_text(&html, "#tests", "Rendered image contracts");
+        assert_text(&html, "#tests", "14 passed");
+        assert_text(&html, "#tests", "Browser readiness");
+        assert_text(&html, "#tests", "4.82 s");
+    }
+
+    #[test]
+    fn comparison_page_includes_reference_provenance() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+
+        assert!(html.contains(KEY_ART_SHA256), "{html}");
+        assert!(html.contains(CHARACTER_SHEET_SHA256));
+        assert!(html.contains("a30e12b63a36743015b1c73eeca6248"));
+        assert!(html.contains("8a5a31e7bceb8ad16b3481d2bae89e7"));
+        assert_text(&html, "#comparison", "docs/reference/cel-shift-key-art.png");
+    }
+
+    #[test]
+    fn the_comparison_slider_shows_the_current_frame_against_the_key_art() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#comparison [data-comparison] img").unwrap();
+        let sources = document
+            .select(&selector)
+            .map(|image| {
+                let alt = image.value().attr("alt").unwrap_or_default().to_owned();
+                assert!(
+                    !alt.trim().is_empty(),
+                    "every comparison image needs alt text"
+                );
+                image.value().attr("src").unwrap_or_default().to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains(&"reference/cel-shift-key-art.png".to_owned()));
+        assert!(sources.contains(&format!(
+            "{CURRENT_SCREENSHOTS}/{}",
+            FrameName::HealthyCenterNorthEast.file_name()
+        )));
+        assert!(!html.contains("No verified current frame"));
+        assert!(html.contains("data-compare-control"));
+    }
+
+    #[test]
+    fn the_worker_crop_is_shown_beside_the_character_sheet() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#comparison .character-comparison img").unwrap();
+        let sources = document
+            .select(&selector)
+            .map(|image| image.value().attr("src").unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sources,
+            [
+                "reference/cel-shift-character-sheet.png".to_owned(),
+                format!("{CURRENT_SCREENSHOTS}/{WORKER_CROP_FILE}"),
+            ]
+        );
+        assert!(!html.contains("No verified worker crop"));
+    }
+
+    #[test]
+    fn renders_the_metric_table_with_values_and_deltas() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+
+        assert_text(&html, "#tests", "render.frames-captured");
+        assert_text(&html, "#tests", "browser.ready-seconds");
+        assert_text(&html, "#tests", "gameplay.tickets-emitted");
+        assert_text(&html, "#tests", "Change");
+    }
+
+    #[test]
+    fn renders_the_exact_source_paths_and_hashes_of_the_verified_run() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+        let summary = green_evidence().summary;
+
+        assert_text(&html, "#tests", "src/verification.rs");
+        assert_text(&html, "#tests", "assets/generated/rack.glb");
+        assert_text(&html, "#tests", &summary.semantic_visual_hash);
+        assert!(html.contains(summary.hashes.sources["src/verification.rs"].as_str()));
+    }
+
+    #[test]
+    fn renders_the_screenshot_history_with_accessible_images() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+        let gallery: GalleryManifest =
+            serde_json::from_str(&read(site.root().join(GALLERY_FILE))).unwrap();
+        let vouched = gallery
+            .entries
+            .iter()
+            .flat_map(|entry| entry.frames.values().cloned())
+            .collect::<BTreeSet<_>>();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#screenshots img").unwrap();
+        let images = document.select(&selector).collect::<Vec<_>>();
+
+        assert!(!images.is_empty(), "a green run publishes a visual history");
+        for image in images {
+            let alt = image.value().attr("alt").unwrap_or_default();
+            let source = image.value().attr("src").unwrap_or_default();
+            assert!(!alt.trim().is_empty(), "history images need alt text");
+            assert!(!source.starts_with('/'), "{source} must stay relative");
+            // Older accepted points are retained by assembly, so the published
+            // manifest is what vouches for pixels this build did not write.
+            assert!(
+                site.root().join(source).is_file() || vouched.contains(source),
+                "{source} is neither published nor declared"
+            );
+        }
+        assert_text(&html, "#screenshots", "11111111");
+        assert_text(&html, "#screenshots", "22222222");
+    }
+
+    #[test]
+    fn a_history_image_the_gallery_does_not_declare_is_still_a_broken_link() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let index = site.root().join("index.html");
+        let html = read(&index).replace(
+            &format!("{HISTORY_SCREENSHOTS}/22222222/"),
+            &format!("{HISTORY_SCREENSHOTS}/undeclared/"),
+        );
+        fs::write(&index, html).unwrap();
+
+        let result = midcreek_cs_1::sitegen::validate_site_output(
+            site.root(),
+            &site_inputs("verified-game").progress,
+        );
+
+        assert!(
+            matches!(&result, Err(SitegenError::BrokenLocalLink { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn the_publication_mode_names_what_the_page_actually_carries() {
+        let verified = build_fixture_site("verified-game").unwrap().index_html();
+        let failed = build_fixture_site("failed-verification")
+            .unwrap()
+            .index_html();
+        let status_only = build_fixture_site("green").unwrap().index_html();
+
+        assert_text(&verified, ".hero-badge", "Evidence");
+        assert_text(&failed, ".hero-badge", "Status");
+        assert_text(&status_only, ".hero-badge", "Status");
+        assert!(!verified.contains("status-only phase"));
+    }
+
+    #[test]
+    fn links_full_logs_to_github_actions_rather_than_publishing_them() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+
+        assert!(html.contains("https://github.com/ridermw/midcreek-cs-1/actions/runs/456"));
+        assert_text(&html, "#tests", "Open the workflow run");
+    }
+
+    #[test]
+    fn a_failed_run_publishes_failed_metric_names_and_values_without_raw_logs() {
+        let html = build_fixture_site("failed-verification")
+            .unwrap()
+            .index_html();
+
+        assert_text(&html, "#tests", "render.frames-captured");
+        assert_text(&html, "#tests", "repair-capture");
+        assert!(!html.contains("capture timed out while writing"), "{html}");
+        assert!(!html.contains("/Users/runner"), "{html}");
+        assert!(!html.contains("target/render-contract"), "{html}");
+    }
+
+    #[test]
+    fn a_failed_run_keeps_the_previous_history_visible_without_broken_images() {
+        let site = build_fixture_site("failed-verification").unwrap();
+        let html = site.index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#screenshots img").unwrap();
+
+        assert_text(&html, "#screenshots", "22222222");
+        assert_eq!(
+            document.select(&selector).count(),
+            0,
+            "a failed build must not link images it did not publish"
+        );
+    }
+
+    #[test]
+    fn no_local_path_or_raw_log_reaches_any_generated_page() {
+        for fixture in ["verified-game", "failed-verification"] {
+            let site = build_fixture_site(fixture).unwrap();
+            for relative in ["index.html", VERIFICATION_FILE] {
+                let path = site.root().join(relative);
+                if !path.is_file() {
+                    continue;
+                }
+                let text = read(&path);
+                for forbidden in [
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/Users/",
+                    "/home/",
+                    "file://",
+                    "stderr.log",
+                    "panicked",
+                ] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{fixture}/{relative} leaked {forbidden}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_build_cli_renders_a_verified_preview_site() {
+        let output = cli_build(
+            "tests/fixtures/sitegen/verified-game/inputs.json",
+            "verified",
+        );
+
+        assert!(output.join(GALLERY_FILE).is_file());
+        assert!(
+            output
+                .join(CURRENT_SCREENSHOTS)
+                .join(FrameName::HealthyCenterNorthEast.file_name())
+                .is_file()
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn the_build_cli_renders_a_failure_preview_site() {
+        let output = cli_build(
+            "tests/fixtures/sitegen/failed-verification/inputs.json",
+            "failed",
+        );
+
+        assert!(!output.join("screenshots").exists());
+        assert!(read(output.join("index.html")).contains("repair-capture"));
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn cli_build(inputs: &str, name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!(
+            "midcreek-sitegen-preview-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let result = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(root)
+            .args([
+                "build",
+                "--inputs",
+                inputs,
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        output
+    }
+
+    fn report_with_hash(hash: &str) -> VerificationSummary {
+        let mut summary = green_evidence().summary;
+        summary.semantic_visual_hash = hash.to_owned();
+        summary
+    }
+
+    fn commit_summary(sha: &str) -> midcreek_cs_1::sitegen::CommitSummary {
+        midcreek_cs_1::sitegen::CommitSummary {
+            sha: sha.to_owned(),
+            subject: "Publish verification evidence".to_owned(),
+            committed_at: "2026-08-30T09:00:00Z".to_owned(),
+            task_id: Some("autonomous-assets".to_owned()),
+        }
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/verification-fixtures")
+            .join(format!("{name}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        Scratch(root)
+    }
+
+    fn copy_verification_fixture(destination: &Path) {
+        for entry in fs::read_dir(verification_root()).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
+}

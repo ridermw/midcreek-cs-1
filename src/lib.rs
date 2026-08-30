@@ -5,6 +5,11 @@ pub mod design;
 pub mod hud;
 pub mod operations;
 pub mod player;
+/// The site generator is a native publication tool: it reads the repository,
+/// decodes verified frames, and writes files. The browser build never carries
+/// it, so the packaged game stays free of the Markdown, HTML, and image
+/// machinery publication needs.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sitegen;
 /// Autonomous verification is a native-only gate; the browser build never
 /// carries the harness, the analyzers, or the fixtures.

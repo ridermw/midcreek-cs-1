@@ -1,0 +1,16 @@
+{
+  "progress": "progress.json",
+  "plan": "plan.md",
+  "reference_manifest": "../../../../docs/reference/manifest.json",
+  "workflow": "workflow.json",
+  "repo": "repo.json",
+  "gallery": "../gallery/prior-gallery.json",
+  "verification": {
+    "report": "../verification/report.json",
+    "artifacts": "../verification",
+    "browser": {
+      "report": "../browser/browser-gate.json",
+      "artifacts": "../browser"
+    }
+  }
+}

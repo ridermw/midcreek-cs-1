@@ -6,9 +6,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use midcreek_cs_1::sitegen::{
-    CommitSummary, ProgressDocument, ProgressError, ReferenceManifest, RepoFacts, SiteInputs,
-    SiteManifest, SitegenError, WorkflowSummary, build_site, validate_progress,
+use midcreek_cs_1::{
+    sitegen::{
+        BrowserGateReport, CommitSummary, GalleryManifest, ProgressDocument, ProgressError,
+        ReferenceManifest, RepoFacts, SiteInputs, SiteManifest, SitegenError, VerificationEvidence,
+        WorkflowSummary, build_site, validate_progress,
+    },
+    verification::VerificationReport,
 };
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
@@ -119,15 +123,70 @@ pub fn site_inputs(name: &str) -> SiteInputs {
     let workflow = serde_json::from_str::<WorkflowSummary>(&read(root.join("workflow.json")))
         .expect("workflow fixture should match the strict schema");
     let repo = fixture_repo_facts(name);
+    let (verification, gallery) = match name {
+        "verified-game" => (Some(green_evidence()), Some(prior_gallery())),
+        "failed-verification" => (Some(failed_evidence()), Some(prior_gallery())),
+        _ => (None, None),
+    };
     SiteInputs {
         progress,
         plan_markdown: read(root.join("plan.md")),
         reference_manifest,
-        verification: None,
+        verification,
+        gallery,
         workflow,
         repo,
         playable: None,
     }
+}
+
+/// The directory a real `--verify-output` run writes, as a committed fixture.
+pub fn verification_root() -> PathBuf {
+    fixture_root().join("verification")
+}
+
+/// The directory `scripts/web-smoke.sh` writes, as a committed fixture.
+pub fn browser_root() -> PathBuf {
+    fixture_root().join("browser")
+}
+
+/// One committed raw report, parsed through the game's own strict schema.
+pub fn raw_report(file_name: &str) -> VerificationReport {
+    serde_json::from_str(&read(verification_root().join(file_name)))
+        .expect("the fixture report should match the game's canonical schema")
+}
+
+/// The committed raw browser gate document.
+pub fn raw_browser() -> BrowserGateReport {
+    serde_json::from_str(&read(browser_root().join("browser-gate.json")))
+        .expect("the fixture gate summary should match the browser gate schema")
+}
+
+/// The sanitized projection of the green fixture run.
+pub fn green_evidence() -> VerificationEvidence {
+    let browser = raw_browser();
+    VerificationEvidence::project(
+        &raw_report("report.json"),
+        &verification_root(),
+        Some((&browser, browser_root().as_path())),
+    )
+    .expect("the green fixture should project")
+}
+
+/// The sanitized projection of the failed fixture run.
+pub fn failed_evidence() -> VerificationEvidence {
+    VerificationEvidence::project(
+        &raw_report("failed-report.json"),
+        &verification_root(),
+        None,
+    )
+    .expect("a failed run still projects its public evidence")
+}
+
+/// The gallery a previous `pages-live` publication left behind.
+pub fn prior_gallery() -> GalleryManifest {
+    serde_json::from_str(&read(fixture_root().join("gallery/prior-gallery.json")))
+        .expect("the gallery fixture should match the strict schema")
 }
 
 pub fn assert_has_element_id(html: &str, id: &str) {

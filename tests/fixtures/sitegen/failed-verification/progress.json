@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "project": "Cell Shift Data Center POC",
+  "tasks": [
+    {
+      "id": "foundation-contracts",
+      "title": "Establish the project and reviewed contracts",
+      "status": "done",
+      "depends_on": [],
+      "summary": "Pinned the project and established reviewed contracts.",
+      "completed_commit": "2222222222222222222222222222222222222222"
+    },
+    {
+      "id": "pages-foundation",
+      "title": "Publish the status-only progress hub",
+      "status": "done",
+      "depends_on": [
+        "foundation-contracts"
+      ],
+      "summary": "Rendered the status, plan, challenge, and comparison hub.",
+      "completed_commit": "1111111111111111111111111111111111111111"
+    },
+    {
+      "id": "autonomous-assets",
+      "title": "Build the autonomous no-Blender asset pipeline",
+      "status": "in_progress",
+      "depends_on": [
+        "pages-foundation"
+      ],
+      "summary": "Publishing verification evidence beside the approved direction.",
+      "completed_commit": null
+    }
+  ],
+  "challenges": [
+    {
+      "id": "browser-readiness",
+      "title": "Browser readiness without a game build",
+      "status": "resolved",
+      "impact": "The public hub must not imply an unverified build is playable.",
+      "approach": "Publish an explicit status-only Play panel until the WASM gate exists.",
+      "resolution": "The browser gate proves a real rendered frame before publication.",
+      "resolved_commit": "1111111111111111111111111111111111111111"
+    }
+  ]
+}

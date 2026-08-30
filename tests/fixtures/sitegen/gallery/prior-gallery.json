@@ -1,0 +1,25 @@
+{
+  "entries": [
+    {
+      "semantic_visual_hash": "3f1c9a0d5b74e2681f0ac35d9e8b47126ad0f5b3c8917e4d26a0bb5f31c7d9e0",
+      "source_commit": "2222222222222222222222222222222222222222",
+      "committed_at": "2026-08-29T20:00:00Z",
+      "current_task": "pages-foundation",
+      "frames": {
+        "center": "screenshots/history/22222222/01-healthy-center-ne.png",
+        "fault": "screenshots/history/22222222/02-fault-queue-ne.png",
+        "repair": "screenshots/history/22222222/04-repairing-ne.png",
+        "resolved": "screenshots/history/22222222/05-resolved-ne.png",
+        "worker": "screenshots/history/22222222/worker-crop.png"
+      },
+      "metrics": {
+        "browser.ready-seconds": 4.0,
+        "gameplay.tickets-emitted": 3.0,
+        "hall.rack-rows": 4.0,
+        "render.frames-captured": 14.0,
+        "worker.crop-pixels": 3200.0
+      },
+      "metric_deltas": {}
+    }
+  ]
+}

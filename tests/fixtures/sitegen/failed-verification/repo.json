@@ -1,0 +1,21 @@
+{
+  "head_sha": "1111111111111111111111111111111111111111",
+  "known_commits": [
+    "1111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222"
+  ],
+  "commits": [
+    {
+      "sha": "1111111111111111111111111111111111111111",
+      "subject": "Render the progress hub",
+      "committed_at": "2026-08-29T21:30:00Z",
+      "task_id": "pages-foundation"
+    },
+    {
+      "sha": "2222222222222222222222222222222222222222",
+      "subject": "Establish reviewed contracts",
+      "committed_at": "2026-08-29T20:00:00Z",
+      "task_id": "foundation-contracts"
+    }
+  ]
+}

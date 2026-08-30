@@ -663,3 +663,172 @@ fn a_green_first_run_without_any_game_still_publishes_status_only() {
     assert_eq!(disposition, BuildDisposition::GreenReplacement);
     assert!(output.path().join("index.html").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Screenshot history and gallery retention
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_green_replacement_keeps_the_previous_screenshot_history() {
+    let previous = fixture_site(
+        "previous-history",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("gallery.json", r#"{"entries":[{"source_commit":"old"}]}"#),
+            (
+                "screenshots/current/01-healthy-center-ne.png",
+                "old current",
+            ),
+            (
+                "screenshots/history/22222222/01-healthy-center-ne.png",
+                "old history",
+            ),
+        ],
+    );
+    let mut current_files = vec![
+        ("index.html", "CURRENT SOURCE: GREEN"),
+        ("gallery.json", r#"{"entries":[{"source_commit":"new"}]}"#),
+        (
+            "screenshots/current/01-healthy-center-ne.png",
+            "new current",
+        ),
+        (
+            "screenshots/history/11111111/01-healthy-center-ne.png",
+            "new history",
+        ),
+    ];
+    current_files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("current-history", &current_files);
+    let output = TempDirectory::new("history-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::GreenReplacement);
+    assert_eq!(
+        fs::read_to_string(
+            output
+                .path()
+                .join("screenshots/history/22222222/01-healthy-center-ne.png")
+        )
+        .unwrap(),
+        "old history",
+        "a green publication must never lose the visual history"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            output
+                .path()
+                .join("screenshots/history/11111111/01-healthy-center-ne.png")
+        )
+        .unwrap(),
+        "new history"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            output
+                .path()
+                .join("screenshots/current/01-healthy-center-ne.png")
+        )
+        .unwrap(),
+        "new current",
+        "the current frames are replaced wholesale"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        r#"{"entries":[{"source_commit":"new"}]}"#
+    );
+}
+
+#[test]
+fn a_failed_run_retains_the_previous_gallery_and_screenshots() {
+    let previous = fixture_site(
+        "previous-gallery",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("gallery.json", r#"{"entries":[{"source_commit":"old"}]}"#),
+            (
+                "screenshots/current/01-healthy-center-ne.png",
+                "old current",
+            ),
+            (
+                "screenshots/history/22222222/01-healthy-center-ne.png",
+                "old history",
+            ),
+            ("play/game_bg.wasm", "last-known-good-game"),
+        ],
+    );
+    let current = fixture_site(
+        "current-failed-gallery",
+        &[("index.html", "CURRENT SOURCE: FAILED")],
+    );
+    let output = TempDirectory::new("failed-gallery-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        r#"{"entries":[{"source_commit":"old"}]}"#
+    );
+    assert_eq!(
+        fs::read_to_string(
+            output
+                .path()
+                .join("screenshots/current/01-healthy-center-ne.png")
+        )
+        .unwrap(),
+        "old current"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            output
+                .path()
+                .join("screenshots/history/22222222/01-healthy-center-ne.png")
+        )
+        .unwrap(),
+        "old history"
+    );
+}
+
+#[test]
+fn a_first_green_run_without_a_previous_site_publishes_its_own_history() {
+    let mut files = vec![
+        ("index.html", "CURRENT SOURCE: GREEN"),
+        ("gallery.json", r#"{"entries":[]}"#),
+        (
+            "screenshots/history/11111111/01-healthy-center-ne.png",
+            "new history",
+        ),
+    ];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("first-history", &files);
+    let output = TempDirectory::new("first-history-output");
+
+    let disposition = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::GreenReplacement);
+    assert!(
+        output
+            .path()
+            .join("screenshots/history/11111111/01-healthy-center-ne.png")
+            .is_file()
+    );
+}

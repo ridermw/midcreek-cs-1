@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use image::ImageReader;
@@ -10,9 +10,47 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::design::{
-    CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, KEY_ART_REFERENCE_PATH, KEY_ART_SHA256,
+use crate::{
+    design::{
+        CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, KEY_ART_REFERENCE_PATH,
+        KEY_ART_SHA256,
+    },
+    verification::{
+        FrameFacts, FrameName, PixelRect, VerificationReport, canonical_json, semantic_hash,
+    },
 };
+
+/// The published directory holding the frames of the current verified run.
+pub const CURRENT_SCREENSHOTS: &str = "screenshots/current";
+
+/// The published directory holding one folder per accepted history entry.
+pub const HISTORY_SCREENSHOTS: &str = "screenshots/history";
+
+/// The published screenshot history manifest.
+pub const GALLERY_FILE: &str = "gallery.json";
+
+/// The published sanitized projection of the verification reports.
+pub const VERIFICATION_FILE: &str = "verification.json";
+
+/// The published crop of the technician, taken from the centre frame.
+pub const WORKER_CROP_FILE: &str = "worker-crop.png";
+
+/// The published browser-gate canvas screenshot.
+pub const BROWSER_FRAME_FILE: &str = "browser-canvas.png";
+
+/// The browser gate's own canvas screenshot, inside its diagnostics directory.
+pub const BROWSER_CANVAS_ARTIFACT: &str = "canvas.png";
+
+/// The four frames the public comparison and every history entry carry.
+pub const GALLERY_FRAMES: [(&str, &str); 4] = [
+    ("center", "01-healthy-center-ne.png"),
+    ("fault", "02-fault-queue-ne.png"),
+    ("repair", "04-repairing-ne.png"),
+    ("resolved", "05-resolved-ne.png"),
+];
+
+/// The stable label of the crop published beside the character sheet.
+pub const WORKER_FRAME_LABEL: &str = "worker";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -124,13 +162,225 @@ pub struct WorkflowSummary {
     pub gates: Vec<GateSummary>,
 }
 
+// ---------------------------------------------------------------------------
+// Raw publication inputs
+// ---------------------------------------------------------------------------
+
+/// The document `scripts/browser_gate.py` writes, exactly as it writes it.
+///
+/// The shape is strict so a gate summary that grew a field, or that was edited
+/// by hand, is refused instead of being published unread.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserGateReport {
+    /// The measured canvas.
+    pub canvas: BrowserCanvasFacts,
+    /// The analysed canvas region.
+    pub pixels: BrowserPixelFacts,
+    /// How long the game took to report `data-game-state="ready"`.
+    pub ready_seconds: f64,
+    /// The no-scroll assertion and its positive control.
+    pub scroll: BrowserScrollFacts,
+}
+
+/// The canvas geometry the browser gate measured.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserCanvasFacts {
+    /// The drawing buffer size, `[width, height]`.
+    pub buffer: [u32; 2],
+    /// The laid-out CSS height.
+    pub height: u32,
+    /// The laid-out CSS width.
+    pub width: u32,
+}
+
+/// The canvas-region analysis the browser gate performed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserPixelFacts {
+    /// Approved palette classes that met the minimum share.
+    pub palette_classes: Vec<String>,
+    /// The sampled region, `[left, top, right, bottom]`.
+    pub region: [u32; 4],
+    /// How many pixels were sampled.
+    pub sampled_pixels: u64,
+    /// Share of sampled pixels matching no approved role.
+    pub unmatched_share: f64,
+    /// Per-channel variance across the sampled region.
+    pub variance: [f64; 3],
+}
+
+/// The no-scroll assertion and the positive control that proves it can fail.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserScrollFacts {
+    /// Scroll deltas recorded while the canvas held focus.
+    pub focused_deltas: BTreeMap<String, f64>,
+    /// The neutral element the positive control focused.
+    pub probe: String,
+    /// The scroll reserve the page kept below the fold.
+    pub reserve_pixels: f64,
+    /// Scroll deltas recorded while the neutral probe held focus.
+    pub unfocused_deltas: BTreeMap<String, f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Sanitized public projection
+// ---------------------------------------------------------------------------
+
+/// One pixel rectangle, snapped onto the grid of the frame it belongs to.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicRect {
+    /// Left edge, in pixels.
+    pub x: u32,
+    /// Top edge, in pixels.
+    pub y: u32,
+    /// Width, in pixels.
+    pub width: u32,
+    /// Height, in pixels.
+    pub height: u32,
+}
+
+/// The render settings the one game camera carried.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCamera {
+    /// The display transform.
+    pub tonemapping: String,
+    /// The deband dither.
+    pub deband_dither: String,
+    /// Multisample count.
+    pub msaa_samples: u32,
+    /// The clear colour, as `#RRGGBB`.
+    pub clear_color: String,
+}
+
+/// Every SHA-256 the run recorded, by repository-relative path.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicHashes {
+    /// Generated assets.
+    pub assets: BTreeMap<String, String>,
+    /// Declarative asset sources.
+    pub asset_sources: BTreeMap<String, String>,
+    /// Approved references.
+    pub references: BTreeMap<String, String>,
+    /// Verification source files.
+    pub sources: BTreeMap<String, String>,
+}
+
+/// The selected camera, ticket, and UI facts one captured frame publishes.
+///
+/// Everything a frame recorded about world positions, ground projections, key
+/// messages, and interaction outcomes stays in the private report.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicFrame {
+    /// The canonical frame file name.
+    pub name: String,
+    /// The artifact path the report declared, relative to its own directory.
+    pub artifact: String,
+    /// Required width.
+    pub width: u32,
+    /// Required height.
+    pub height: u32,
+    /// The stage that captured it.
+    pub stage: String,
+    /// The settled heading the camera was turning towards.
+    pub heading: String,
+    /// The interpolated camera yaw, in degrees.
+    pub camera_yaw_degrees: f64,
+    /// Whether the orbit had settled.
+    pub camera_settled: bool,
+    /// The status line the HUD showed.
+    pub hud_status: String,
+    /// How many tickets were open.
+    pub open_tickets: usize,
+    /// Every rack's state, in stable rack order.
+    pub rack_states: Vec<String>,
+    /// The projected technician crop, snapped onto the frame's pixel grid.
+    pub worker_crop: PublicRect,
+    /// How many authored equipment props projected into the viewport.
+    pub equipment_on_screen: usize,
+}
+
+/// One published metric that missed its published bound.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicMetricFailure {
+    /// The metric name, in the published vocabulary.
+    pub metric: String,
+    /// The measured value.
+    pub value: f64,
+    /// The bound it had to satisfy.
+    pub expected: String,
+}
+
+/// What the headless browser proved about the packaged game.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicBrowser {
+    /// How long the game took to report readiness.
+    pub ready_seconds: f64,
+    /// The measured canvas width.
+    pub canvas_width: u32,
+    /// The measured canvas height.
+    pub canvas_height: u32,
+    /// Approved palette classes present in the canvas region.
+    pub palette_classes: Vec<String>,
+    /// Share of sampled pixels matching no approved role.
+    pub unmatched_share: f64,
+    /// How many pixels were sampled.
+    pub sampled_pixels: u64,
+    /// The canvas screenshot, relative to the browser artifact directory.
+    pub screenshot: Option<String>,
+}
+
+/// The strict public projection of one native report and one browser gate.
+///
+/// Nothing here carries a command line, a stream capture, a host or
+/// environment value, an absolute path, or an undeclared field: the site is
+/// generated from this projection alone, never from the raw documents.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationSummary {
+    /// The report schema this projection was taken from.
+    pub schema_version: u32,
+    /// Whether the run succeeded and every published metric met its bound.
+    pub succeeded: bool,
+    /// The named stage a failed run failed in.
+    pub failed_stage: Option<String>,
+    /// Every stage the run entered, in order.
+    pub stages: Vec<String>,
+    /// SHA-256 of the game's own canonical semantic report.
     pub semantic_visual_hash: String,
-    pub frames: BTreeMap<String, String>,
-    pub gates: Vec<GateSummary>,
+    /// The render settings the one game camera carried.
+    pub camera: PublicCamera,
+    /// Every SHA-256 the run recorded.
+    pub hashes: PublicHashes,
+    /// Every captured frame, in capture order.
+    pub frames: Vec<PublicFrame>,
+    /// What the headless browser proved, when it ran.
+    pub browser: Option<PublicBrowser>,
+    /// Every published metric value, by name.
     pub metrics: BTreeMap<String, f64>,
+    /// Every published metric that missed its bound.
+    pub metric_failures: Vec<PublicMetricFailure>,
+    /// The named gates this evidence proves, with counts and durations.
+    pub gates: Vec<GateSummary>,
+}
+
+/// A sanitized projection together with the directories its artifacts live in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerificationEvidence {
+    /// The public projection.
+    pub summary: VerificationSummary,
+    /// The verified `--verify-output` directory the frames came from.
+    pub artifacts: PathBuf,
+    /// The browser gate diagnostics directory, when the gate ran.
+    pub browser_artifacts: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,7 +388,9 @@ pub struct SiteInputs {
     pub progress: ProgressDocument,
     pub plan_markdown: String,
     pub reference_manifest: ReferenceManifest,
-    pub verification: Option<VerificationSummary>,
+    pub verification: Option<VerificationEvidence>,
+    /// The screenshot history the previous `pages-live` publication left.
+    pub gallery: Option<GalleryManifest>,
     pub workflow: WorkflowSummary,
     pub repo: RepoFacts,
     pub playable: Option<PlayableBuild>,
@@ -195,14 +447,23 @@ pub struct SiteManifest {
     pub semantic_visual_hash: Option<String>,
 }
 
+/// One accepted point in the published visual history.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GalleryEntry {
+    /// The semantic hash of the canonical report this entry was accepted for.
     pub semantic_visual_hash: String,
+    /// The source commit that produced it.
     pub source_commit: String,
+    /// When that commit was committed.
     pub committed_at: String,
+    /// The task that was current when it was published.
     pub current_task: String,
+    /// The published frames, by stable label.
     pub frames: BTreeMap<String, String>,
+    /// Every published metric value at this point.
+    pub metrics: BTreeMap<String, f64>,
+    /// The change in each metric from the previous entry.
     pub metric_deltas: BTreeMap<String, f64>,
 }
 
@@ -386,20 +647,65 @@ impl fmt::Display for ReferenceError {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum SitegenError {
-    Io { path: PathBuf, message: String },
-    Json { path: PathBuf, message: String },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
+    Json {
+        path: PathBuf,
+        message: String,
+    },
     Progress(Vec<ProgressError>),
     Reference(Vec<ReferenceError>),
-    Markdown { path: PathBuf, message: String },
-    MissingInput { path: PathBuf },
-    UnsafeOutputPath { path: PathBuf },
-    BrokenLocalLink { source: PathBuf, target: PathBuf },
-    MissingAltText { source: PathBuf },
-    InvalidHtml { path: PathBuf, message: String },
-    MissingPreviousArtifact { path: PathBuf },
-    OutputNotEmpty { path: PathBuf },
-    UntrustedPlayablePackage { path: PathBuf },
-    IncompletePlayablePackage { path: PathBuf, missing: Vec<String> },
+    Markdown {
+        path: PathBuf,
+        message: String,
+    },
+    MissingInput {
+        path: PathBuf,
+    },
+    UnsafeOutputPath {
+        path: PathBuf,
+    },
+    BrokenLocalLink {
+        source: PathBuf,
+        target: PathBuf,
+    },
+    MissingAltText {
+        source: PathBuf,
+    },
+    InvalidHtml {
+        path: PathBuf,
+        message: String,
+    },
+    MissingPreviousArtifact {
+        path: PathBuf,
+    },
+    OutputNotEmpty {
+        path: PathBuf,
+    },
+    UntrustedPlayablePackage {
+        path: PathBuf,
+    },
+    IncompletePlayablePackage {
+        path: PathBuf,
+        missing: Vec<String>,
+    },
+    /// A verification artifact left the directory that declared it.
+    UntrustedArtifact {
+        path: PathBuf,
+    },
+    /// A verification artifact is not the image its report says it is.
+    CorruptArtifact {
+        path: PathBuf,
+        message: String,
+    },
+    /// A report's reference hash disagrees with the approved manifest.
+    ReferenceProvenance {
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl fmt::Display for SitegenError {
@@ -483,6 +789,24 @@ impl fmt::Display for SitegenError {
                     missing.join(", ")
                 )
             }
+            Self::UntrustedArtifact { path } => write!(
+                formatter,
+                "verification artifact is not inside its own report directory: {}",
+                path.display()
+            ),
+            Self::CorruptArtifact { path, message } => write!(
+                formatter,
+                "verification artifact {} is unusable: {message}",
+                path.display()
+            ),
+            Self::ReferenceProvenance {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "report records {path} as {actual}; the approved reference is {expected}"
+            ),
         }
     }
 }
@@ -789,6 +1113,479 @@ pub fn validate_reference_manifest(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sanitized projection of the verification evidence
+// ---------------------------------------------------------------------------
+
+impl VerificationEvidence {
+    /// Projects one raw native report, and one optional browser gate summary,
+    /// onto the strict public shape the site is generated from.
+    ///
+    /// Every declared artifact is resolved inside the directory that declared
+    /// it, refused if it is absolute, escapes with `..`, is a symbolic link,
+    /// is missing, or is not the image its own report says it is. The approved
+    /// reference hashes are checked against the repository's own constants, so
+    /// a report that measured a different key art can never be published
+    /// beside it.
+    pub fn project(
+        report: &VerificationReport,
+        artifacts: &Path,
+        browser: Option<(&BrowserGateReport, &Path)>,
+    ) -> Result<Self, SitegenError> {
+        check_reference_provenance(report)?;
+
+        let mut frames = Vec::new();
+        for name in FrameName::ALL {
+            let Some(facts) = report.frames.get(name.file_name()) else {
+                continue;
+            };
+            let path = resolve_artifact(artifacts, &facts.path)?;
+            let dimensions = image_dimensions(&path)?;
+            if dimensions != (facts.width, facts.height) {
+                return Err(SitegenError::CorruptArtifact {
+                    path,
+                    message: format!(
+                        "the report declares {}x{}, the image is {}x{}",
+                        facts.width, facts.height, dimensions.0, dimensions.1
+                    ),
+                });
+            }
+            frames.push(public_frame(name, facts));
+        }
+
+        let browser_artifacts = browser.map(|(_, root)| root.to_path_buf());
+        let browser = match browser {
+            Some((gate, root)) => Some(project_browser(gate, root)?),
+            None => None,
+        };
+        let metrics = collect_metrics(report, &frames, browser.as_ref());
+        let metric_failures = collect_metric_failures(&metrics);
+        let succeeded = report.result == "success" && metric_failures.is_empty();
+        let gates = derive_gates(
+            succeeded,
+            &frames,
+            &metric_failures,
+            report,
+            browser.as_ref(),
+        );
+
+        Ok(Self {
+            summary: VerificationSummary {
+                schema_version: report.schema_version,
+                succeeded,
+                failed_stage: report.failed_stage.clone(),
+                stages: report.stages.clone(),
+                semantic_visual_hash: semantic_hash(&canonical_json(report)),
+                camera: PublicCamera {
+                    tonemapping: report.camera.tonemapping.clone(),
+                    deband_dither: report.camera.deband_dither.clone(),
+                    msaa_samples: report.camera.msaa_samples,
+                    clear_color: report.camera.clear_color.clone(),
+                },
+                hashes: PublicHashes {
+                    assets: report.assets.clone(),
+                    asset_sources: report.asset_sources.clone(),
+                    references: report.references.clone(),
+                    sources: report.sources.clone(),
+                },
+                frames,
+                browser,
+                metrics,
+                metric_failures,
+                gates,
+            },
+            artifacts: artifacts.to_path_buf(),
+            browser_artifacts,
+        })
+    }
+}
+
+fn public_frame(name: FrameName, facts: &FrameFacts) -> PublicFrame {
+    let crop = PixelRect::snap(facts.worker_crop, facts.width, facts.height);
+    PublicFrame {
+        name: name.file_name().to_owned(),
+        artifact: facts.path.clone(),
+        width: facts.width,
+        height: facts.height,
+        stage: facts.stage.clone(),
+        heading: facts.heading.clone(),
+        camera_yaw_degrees: facts.camera_yaw_degrees,
+        camera_settled: facts.camera_settled,
+        hud_status: facts.hud_status.clone(),
+        open_tickets: facts.tickets.len(),
+        rack_states: facts.rack_states.clone(),
+        worker_crop: PublicRect {
+            x: crop.x,
+            y: crop.y,
+            width: crop.width,
+            height: crop.height,
+        },
+        equipment_on_screen: facts.equipment.iter().filter(|prop| prop.on_screen).count(),
+    }
+}
+
+fn project_browser(gate: &BrowserGateReport, root: &Path) -> Result<PublicBrowser, SitegenError> {
+    let screenshot = match resolve_artifact(root, BROWSER_CANVAS_ARTIFACT) {
+        Ok(path) => {
+            image_dimensions(&path)?;
+            Some(BROWSER_CANVAS_ARTIFACT.to_owned())
+        }
+        // A gate that reported without keeping its canvas screenshot is still
+        // publishable evidence; a canvas that is there but unreadable is not.
+        Err(SitegenError::MissingInput { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(PublicBrowser {
+        ready_seconds: gate.ready_seconds,
+        canvas_width: gate.canvas.width,
+        canvas_height: gate.canvas.height,
+        palette_classes: gate.pixels.palette_classes.clone(),
+        unmatched_share: gate.pixels.unmatched_share,
+        sampled_pixels: gate.pixels.sampled_pixels,
+        screenshot,
+    })
+}
+
+/// Refuses a report whose approved-reference hashes are not the ones this
+/// repository vendors and publishes.
+fn check_reference_provenance(report: &VerificationReport) -> Result<(), SitegenError> {
+    for (path, expected) in [
+        (KEY_ART_REFERENCE_PATH, KEY_ART_SHA256),
+        (CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256),
+    ] {
+        let actual = report.references.get(path).map(String::as_str);
+        if actual != Some(expected) {
+            return Err(SitegenError::ReferenceProvenance {
+                path: path.to_owned(),
+                expected: expected.to_owned(),
+                actual: actual.unwrap_or("nothing").to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolves one declared artifact strictly inside the directory that declared
+/// it.
+fn resolve_artifact(root: &Path, relative: &str) -> Result<PathBuf, SitegenError> {
+    let declared = Path::new(relative);
+    let untrusted = || SitegenError::UntrustedArtifact {
+        path: PathBuf::from(relative),
+    };
+    if relative.is_empty()
+        || declared.is_absolute()
+        || relative.contains('\\')
+        || declared
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(untrusted());
+    }
+
+    let candidate = root.join(declared);
+    match fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Err(untrusted()),
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) | Err(_) if !candidate.is_file() => {
+            return Err(SitegenError::MissingInput { path: candidate });
+        }
+        _ => {}
+    }
+
+    // A symbolic link anywhere above the artifact would let a contained
+    // relative path still resolve outside the directory that declared it.
+    let canonical_root = fs::canonicalize(root).map_err(|error| SitegenError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let canonical = fs::canonicalize(&candidate).map_err(|error| SitegenError::Io {
+        path: candidate.clone(),
+        message: error.to_string(),
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(untrusted());
+    }
+    Ok(candidate)
+}
+
+fn image_dimensions(path: &Path) -> Result<(u32, u32), SitegenError> {
+    ImageReader::open(path)
+        .map_err(|error| error.to_string())
+        .and_then(|reader| {
+            reader
+                .with_guessed_format()
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|reader| reader.into_dimensions().map_err(|error| error.to_string()))
+        .map_err(|message| SitegenError::CorruptArtifact {
+            path: path.to_path_buf(),
+            message,
+        })
+}
+
+/// Every published metric value, by name.
+///
+/// The vocabulary is fixed: nothing is copied out of the raw documents by key,
+/// so a field that appears in a future report cannot appear on the site until
+/// it is named here.
+fn collect_metrics(
+    report: &VerificationReport,
+    frames: &[PublicFrame],
+    browser: Option<&PublicBrowser>,
+) -> BTreeMap<String, f64> {
+    let mut metrics = BTreeMap::new();
+    let mut record = |name: &str, value: f64| {
+        metrics.insert(name.to_owned(), value);
+    };
+
+    record("render.frames-captured", frames.len() as f64);
+    record("render.stages", report.stages.len() as f64);
+    record(
+        "render.blueprint-validation-errors",
+        report.blueprint.validation_errors.len() as f64,
+    );
+    record("hall.rack-rows", report.blueprint.rack_rows as f64);
+    record("hall.aisles", report.blueprint.aisles as f64);
+    record("hall.visuals", report.blueprint.visuals as f64);
+    record("hall.colliders", report.blueprint.colliders as f64);
+    record("camera.msaa-samples", f64::from(report.camera.msaa_samples));
+    record(
+        "gameplay.tickets-emitted",
+        report.gameplay.tickets_emitted as f64,
+    );
+    record(
+        "gameplay.capacity-pauses",
+        report.gameplay.capacity_pauses as f64,
+    );
+    record(
+        "gameplay.duplicate-pauses",
+        report.gameplay.duplicate_pauses as f64,
+    );
+    record("gameplay.busy-pauses", report.gameplay.busy_pauses as f64);
+    record(
+        "tickets.peak-open",
+        frames
+            .iter()
+            .map(|frame| frame.open_tickets)
+            .max()
+            .unwrap_or_default() as f64,
+    );
+
+    if let Some(centre) = frames.first() {
+        record("camera.yaw-degrees", centre.camera_yaw_degrees);
+        record(
+            "worker.crop-pixels",
+            f64::from(centre.worker_crop.width) * f64::from(centre.worker_crop.height),
+        );
+        record("worker.crop-width", f64::from(centre.worker_crop.width));
+        record("worker.crop-height", f64::from(centre.worker_crop.height));
+        record("equipment.on-screen", centre.equipment_on_screen as f64);
+    }
+
+    if let Some(browser) = browser {
+        record("browser.ready-seconds", browser.ready_seconds);
+        record("browser.canvas-width", f64::from(browser.canvas_width));
+        record("browser.canvas-height", f64::from(browser.canvas_height));
+        record(
+            "browser.palette-classes",
+            browser.palette_classes.len() as f64,
+        );
+        record("browser.unmatched-share", browser.unmatched_share);
+    }
+    metrics
+}
+
+/// The published bound each published metric has to meet.
+const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
+    (
+        "render.frames-captured",
+        MetricBound::Exactly(14.0),
+        "all fourteen reviewed captures",
+    ),
+    (
+        "render.blueprint-validation-errors",
+        MetricBound::Exactly(0.0),
+        "no blueprint validation errors",
+    ),
+    (
+        "camera.msaa-samples",
+        MetricBound::Exactly(1.0),
+        "multisampling off",
+    ),
+    (
+        "worker.crop-pixels",
+        MetricBound::AtLeast(1.0),
+        "a projected technician crop with area",
+    ),
+    (
+        "browser.palette-classes",
+        MetricBound::AtLeast(3.0),
+        "at least three approved palette classes in the canvas",
+    ),
+    (
+        "browser.canvas-width",
+        MetricBound::AtLeast(1.0),
+        "a canvas with width",
+    ),
+    (
+        "browser.canvas-height",
+        MetricBound::AtLeast(1.0),
+        "a canvas with height",
+    ),
+];
+
+#[derive(Clone, Copy)]
+enum MetricBound {
+    Exactly(f64),
+    AtLeast(f64),
+}
+
+impl MetricBound {
+    fn holds(self, value: f64) -> bool {
+        match self {
+            Self::Exactly(expected) => (value - expected).abs() < f64::EPSILON,
+            Self::AtLeast(minimum) => value >= minimum,
+        }
+    }
+}
+
+fn collect_metric_failures(metrics: &BTreeMap<String, f64>) -> Vec<PublicMetricFailure> {
+    METRIC_BOUNDS
+        .into_iter()
+        .filter_map(|(metric, bound, expected)| {
+            let value = *metrics.get(metric)?;
+            (!bound.holds(value)).then(|| PublicMetricFailure {
+                metric: metric.to_owned(),
+                value,
+                expected: expected.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn derive_gates(
+    succeeded: bool,
+    frames: &[PublicFrame],
+    failures: &[PublicMetricFailure],
+    report: &VerificationReport,
+    browser: Option<&PublicBrowser>,
+) -> Vec<GateSummary> {
+    let status = |passed: bool| {
+        if passed {
+            GateStatus::Passed
+        } else {
+            GateStatus::Failed
+        }
+    };
+    let mut gates = vec![
+        GateSummary {
+            name: "Rendered image contracts".to_owned(),
+            status: status(succeeded),
+            passed: frames.len() as u32,
+            failed: failures.len() as u32,
+            duration_ms: 0,
+            artifact_url: None,
+        },
+        GateSummary {
+            name: "Verification stages".to_owned(),
+            status: status(report.failed_stage.is_none()),
+            passed: report.stages.len() as u32,
+            failed: u32::from(report.failed_stage.is_some()),
+            duration_ms: 0,
+            artifact_url: None,
+        },
+    ];
+    if let Some(browser) = browser {
+        gates.push(GateSummary {
+            name: "Browser readiness".to_owned(),
+            status: GateStatus::Passed,
+            passed: 1,
+            failed: 0,
+            duration_ms: (browser.ready_seconds * 1_000.0).round().max(0.0) as u64,
+            artifact_url: None,
+        });
+        gates.push(GateSummary {
+            name: "Browser canvas palette".to_owned(),
+            status: status(browser.palette_classes.len() >= 3),
+            passed: browser.palette_classes.len() as u32,
+            failed: 0,
+            duration_ms: 0,
+            artifact_url: None,
+        });
+    }
+    gates
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot history
+// ---------------------------------------------------------------------------
+
+/// Decides whether one verified run earns a new point in the visual history.
+///
+/// A run only ever appends: a failed run, a run whose semantic hash matches the
+/// latest entry, and a rerun of a commit that is already recorded all return
+/// the previous history untouched, so a documentation-only push cannot
+/// duplicate a screenshot and a failure cannot erase one.
+pub fn update_gallery(
+    previous: &GalleryManifest,
+    summary: &VerificationSummary,
+    commit: &CommitSummary,
+) -> GalleryManifest {
+    let latest = previous.entries.last();
+    let unchanged =
+        latest.is_some_and(|entry| entry.semantic_visual_hash == summary.semantic_visual_hash);
+    let recorded = previous
+        .entries
+        .iter()
+        .any(|entry| entry.source_commit == commit.sha);
+    if !summary.succeeded || unchanged || recorded {
+        return previous.clone();
+    }
+
+    let short = short_sha(&commit.sha);
+    let mut frames = GALLERY_FRAMES
+        .into_iter()
+        .map(|(label, file)| {
+            (
+                label.to_owned(),
+                format!("{HISTORY_SCREENSHOTS}/{short}/{file}"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    frames.insert(
+        WORKER_FRAME_LABEL.to_owned(),
+        format!("{HISTORY_SCREENSHOTS}/{short}/{WORKER_CROP_FILE}"),
+    );
+
+    let metric_deltas = latest.map_or_else(BTreeMap::new, |entry| {
+        summary
+            .metrics
+            .iter()
+            .filter_map(|(name, value)| {
+                entry
+                    .metrics
+                    .get(name)
+                    .map(|before| (name.clone(), value - before))
+            })
+            .collect()
+    });
+
+    let mut entries = previous.entries.clone();
+    entries.push(GalleryEntry {
+        semantic_visual_hash: summary.semantic_visual_hash.clone(),
+        source_commit: commit.sha.clone(),
+        committed_at: commit.committed_at.clone(),
+        current_task: commit
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "unassigned".to_owned()),
+        frames,
+        metrics: summary.metrics.clone(),
+        metric_deltas,
+    });
+    GalleryManifest { entries }
+}
+
 pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, SitegenError> {
     validate_progress(
         &inputs.progress,
@@ -820,6 +1617,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         .map_or("Unknown", |commit| commit.committed_at.as_str());
     let reference_paths = copy_reference_assets(&inputs.reference_manifest, output)?;
     let playable_files = copy_playable_build(inputs.playable.as_ref(), inputs, output)?;
+    let evidence = publish_verification(inputs, &source_commit, updated_at, current_task, output)?;
 
     let replacements = [
         ("{{PROJECT}}", escape_html(&inputs.progress.project)),
@@ -829,8 +1627,16 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         ),
         ("{{PLAY}}", render_play(inputs.playable.as_ref())),
         (
+            "{{MODE}}",
+            render_mode(inputs.playable.is_some(), evidence.is_some()),
+        ),
+        (
             "{{COMPARISON}}",
-            render_comparison(&inputs.reference_manifest, &reference_paths),
+            render_comparison(
+                &inputs.reference_manifest,
+                &reference_paths,
+                evidence.as_ref(),
+            ),
         ),
         (
             "{{PROGRESS}}",
@@ -838,14 +1644,14 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         ),
         (
             "{{SCREENSHOTS}}",
-            render_screenshots(inputs.verification.as_ref()),
+            render_screenshots(inputs, evidence.as_ref()),
         ),
         ("{{PLAN}}", plan_html),
         (
             "{{CHALLENGES}}",
             render_challenges(&inputs.progress, &inputs.repo),
         ),
-        ("{{TESTS}}", render_tests(inputs)),
+        ("{{TESTS}}", render_tests(inputs, evidence.as_ref())),
         ("{{COMMITS}}", render_commits(&inputs.repo)),
     ];
     let html = render_template(include_str!("../site/templates/index.html"), &replacements);
@@ -871,6 +1677,11 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
     if inputs.playable.is_some() {
         generated_files.push(PathBuf::from("last-green.json"));
     }
+    if let Some(evidence) = &evidence {
+        generated_files.extend(evidence.files.iter().cloned());
+    } else if inputs.verification.is_some() {
+        generated_files.push(PathBuf::from(VERIFICATION_FILE));
+    }
     generated_files.sort();
 
     Ok(SiteManifest {
@@ -884,7 +1695,179 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         semantic_visual_hash: inputs
             .verification
             .as_ref()
-            .map(|report| report.semantic_visual_hash.clone()),
+            .map(|evidence| evidence.summary.semantic_visual_hash.clone()),
+    })
+}
+
+/// What one build actually published from the verified evidence.
+struct PublishedEvidence {
+    /// Every published file, relative to the site output.
+    files: Vec<PathBuf>,
+    /// The history after this publication.
+    gallery: GalleryManifest,
+    /// The current frames, by stable label.
+    current: BTreeMap<String, String>,
+    /// The browser canvas proof, when the gate kept one.
+    browser: Option<String>,
+    /// Whether this build opened a new point in the history.
+    appended: bool,
+}
+
+/// Promotes the current verified frames and updates the visual history.
+///
+/// Only a run that succeeded and met every published bound publishes pixels.
+/// A failed run writes the sanitized projection alone, so `screenshots/` and
+/// `gallery.json` stay absent from the generated tree and assembly retains
+/// whatever the last green publication left there.
+fn publish_verification(
+    inputs: &SiteInputs,
+    source_commit: &str,
+    committed_at: &str,
+    current_task: Option<&ProgressTask>,
+    output: &Path,
+) -> Result<Option<PublishedEvidence>, SitegenError> {
+    let Some(evidence) = inputs.verification.as_ref() else {
+        return Ok(None);
+    };
+    let summary = &evidence.summary;
+    let json = serde_json::to_string_pretty(summary).map_err(|error| SitegenError::Json {
+        path: PathBuf::from(VERIFICATION_FILE),
+        message: error.to_string(),
+    })?;
+    write_file(&output.join(VERIFICATION_FILE), json.as_bytes())?;
+    if !summary.succeeded {
+        return Ok(None);
+    }
+
+    let mut files = vec![PathBuf::from(VERIFICATION_FILE)];
+    let mut current = BTreeMap::new();
+    for frame in &summary.frames {
+        let source = resolve_artifact(&evidence.artifacts, &frame.artifact)?;
+        let relative = Path::new(CURRENT_SCREENSHOTS).join(&frame.name);
+        copy_artifact(&source, &output.join(&relative))?;
+        files.push(relative);
+    }
+    for (label, file) in GALLERY_FRAMES {
+        current.insert(label.to_owned(), format!("{CURRENT_SCREENSHOTS}/{file}"));
+    }
+
+    let centre = summary
+        .frames
+        .first()
+        .ok_or_else(|| SitegenError::MissingInput {
+            path: PathBuf::from(CURRENT_SCREENSHOTS),
+        })?;
+    let crop_relative = Path::new(CURRENT_SCREENSHOTS).join(WORKER_CROP_FILE);
+    write_worker_crop(
+        &output.join(CURRENT_SCREENSHOTS).join(&centre.name),
+        centre.worker_crop,
+        &output.join(&crop_relative),
+    )?;
+    files.push(crop_relative);
+    current.insert(
+        WORKER_FRAME_LABEL.to_owned(),
+        format!("{CURRENT_SCREENSHOTS}/{WORKER_CROP_FILE}"),
+    );
+
+    let browser = match (&evidence.browser_artifacts, summary.browser.as_ref()) {
+        (Some(root), Some(browser)) => match &browser.screenshot {
+            Some(name) => {
+                let source = resolve_artifact(root, name)?;
+                let relative = Path::new(CURRENT_SCREENSHOTS).join(BROWSER_FRAME_FILE);
+                copy_artifact(&source, &output.join(&relative))?;
+                files.push(relative);
+                Some(format!("{CURRENT_SCREENSHOTS}/{BROWSER_FRAME_FILE}"))
+            }
+            None => None,
+        },
+        _ => None,
+    };
+
+    let commit = CommitSummary {
+        sha: source_commit.to_owned(),
+        subject: String::new(),
+        committed_at: committed_at.to_owned(),
+        task_id: current_task.map(|task| task.id.clone()),
+    };
+    let previous = inputs.gallery.clone().unwrap_or_default();
+    let gallery = update_gallery(&previous, summary, &commit);
+    let appended = gallery.entries.len() > previous.entries.len();
+    if appended {
+        let entry = gallery
+            .entries
+            .last()
+            .expect("an appended history always has a latest entry");
+        for (label, published) in &entry.frames {
+            let source = current
+                .get(label)
+                .ok_or_else(|| SitegenError::MissingInput {
+                    path: PathBuf::from(published),
+                })?;
+            let relative = PathBuf::from(published);
+            copy_artifact(&output.join(source), &output.join(&relative))?;
+            files.push(relative);
+        }
+    }
+
+    let manifest = serde_json::to_string_pretty(&gallery).map_err(|error| SitegenError::Json {
+        path: PathBuf::from(GALLERY_FILE),
+        message: error.to_string(),
+    })?;
+    write_file(&output.join(GALLERY_FILE), manifest.as_bytes())?;
+    files.push(PathBuf::from(GALLERY_FILE));
+
+    Ok(Some(PublishedEvidence {
+        files,
+        gallery,
+        current,
+        browser,
+        appended,
+    }))
+}
+
+/// Writes the reported technician rectangle of one published frame.
+fn write_worker_crop(
+    frame: &Path,
+    crop: PublicRect,
+    destination: &Path,
+) -> Result<(), SitegenError> {
+    let image = ImageReader::open(frame)
+        .map_err(|error| error.to_string())
+        .and_then(|reader| {
+            reader
+                .with_guessed_format()
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|reader| reader.decode().map_err(|error| error.to_string()))
+        .map_err(|message| SitegenError::CorruptArtifact {
+            path: frame.to_path_buf(),
+            message,
+        })?
+        .to_rgb8();
+    if crop.width == 0
+        || crop.height == 0
+        || crop.x + crop.width > image.width()
+        || crop.y + crop.height > image.height()
+    {
+        return Err(SitegenError::CorruptArtifact {
+            path: frame.to_path_buf(),
+            message: format!(
+                "the reported worker crop {}x{} at {},{} is not inside the frame",
+                crop.width, crop.height, crop.x, crop.y
+            ),
+        });
+    }
+    let cropped =
+        image::imageops::crop_imm(&image, crop.x, crop.y, crop.width, crop.height).to_image();
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| SitegenError::Io {
+            path: parent.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    }
+    cropped.save(destination).map_err(|error| SitegenError::Io {
+        path: destination.to_path_buf(),
+        message: error.to_string(),
     })
 }
 
@@ -922,6 +1905,11 @@ pub fn assemble_site(
     ) {
         let previous = previous.expect("retention dispositions carry a previous site");
         copy_retained_artifacts(previous, output)?;
+    } else if let Some(previous) = previous {
+        // The visual history is cumulative, so even a complete green
+        // replacement carries the accepted history forward. Only the current
+        // frames and the gallery manifest are replaced wholesale.
+        copy_previous_history(previous, output)?;
     }
 
     copy_site_tree(
@@ -931,6 +1919,20 @@ pub fn assemble_site(
         disposition != BuildDisposition::GreenReplacement,
     )?;
     Ok(disposition)
+}
+
+/// Carries the accepted screenshot history of a previous publication forward.
+fn copy_previous_history(previous: &Path, output: &Path) -> Result<(), SitegenError> {
+    require_directory(previous)?;
+    let source = previous.join(HISTORY_SCREENSHOTS);
+    match fs::symlink_metadata(&source) {
+        Ok(_) => copy_artifact(&source, &output.join(HISTORY_SCREENSHOTS)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SitegenError::Io {
+            path: source,
+            message: error.to_string(),
+        }),
+    }
 }
 
 /// Refuses a green replacement that would publish a broken game or silently
@@ -990,6 +1992,11 @@ pub fn validate_site_output(
         message: error.to_string(),
     })?;
     let document = Html::parse_document(&html);
+    // History images belong to earlier accepted points that assembly carries
+    // forward. The gallery manifest published beside this page is what vouches
+    // for them, so a history link that the manifest does not declare is still
+    // a broken link.
+    let retained = retained_history_targets(output);
 
     if document.select(&selector("main")).count() != 1 {
         return Err(invalid_html(&index_path, "expected exactly one <main>"));
@@ -1028,7 +2035,7 @@ pub fn validate_site_output(
             .value()
             .attr(attribute)
             .expect("the selector guarantees a target");
-        validate_local_target(output, &ids, &index_path, target)?;
+        validate_local_target(output, &ids, &retained, &index_path, target)?;
     }
 
     if html.contains(env!("CARGO_MANIFEST_DIR"))
@@ -1209,7 +2216,7 @@ fn require_directory(path: &Path) -> Result<(), SitegenError> {
 
 fn copy_retained_artifacts(previous: &Path, output: &Path) -> Result<(), SitegenError> {
     require_directory(previous)?;
-    for relative in ["play", "screenshots", "last-green.json"] {
+    for relative in RETAINED_ARTIFACTS {
         let source = previous.join(relative);
         match fs::symlink_metadata(&source) {
             Ok(_) => copy_artifact(&source, &output.join(relative))?,
@@ -1224,6 +2231,9 @@ fn copy_retained_artifacts(previous: &Path, output: &Path) -> Result<(), Sitegen
     }
     Ok(())
 }
+
+/// Everything a failing publication keeps from the last green one.
+const RETAINED_ARTIFACTS: [&str; 4] = ["play", "screenshots", GALLERY_FILE, "last-green.json"];
 
 fn copy_site_tree(
     root: &Path,
@@ -1293,11 +2303,15 @@ fn copy_artifact(source: &Path, destination: &Path) -> Result<(), SitegenError> 
 }
 
 fn is_retained_artifact(relative: &Path) -> bool {
-    matches!(
-        relative.components().next(),
-        Some(std::path::Component::Normal(name))
-            if name == "play" || name == "screenshots" || name == "last-green.json"
-    )
+    relative
+        .components()
+        .next()
+        .is_some_and(|component| match component {
+            std::path::Component::Normal(name) => RETAINED_ARTIFACTS
+                .iter()
+                .any(|retained| name == std::ffi::OsStr::new(retained)),
+            _ => false,
+        })
 }
 
 pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
@@ -1460,7 +2474,7 @@ fn copy_playable_build(
         semantic_visual_hash: inputs
             .verification
             .as_ref()
-            .map(|report| report.semantic_visual_hash.clone()),
+            .map(|evidence| evidence.summary.semantic_visual_hash.clone()),
         game_files: game_files.clone(),
         screenshot_files: Vec::new(),
     };
@@ -1525,6 +2539,23 @@ fn render_play(playable: Option<&PlayableBuild>) -> String {
     )
 }
 
+/// The publication mode badge: what the current page actually carries.
+fn render_mode(playable: bool, verified: bool) -> String {
+    let (mode, detail) = match (playable, verified) {
+        (true, true) => ("Verified", "Playable build and current evidence"),
+        (true, false) => ("Playable", "Browser build without current evidence"),
+        (false, true) => ("Evidence", "Current evidence without a playable build"),
+        (false, false) => ("Status", "Game pending verification"),
+    };
+    format!(
+        r#"<div class="hero-badge" aria-label="Current publication mode">
+          <span>Mode</span>
+          <strong>{mode}</strong>
+          <small>{detail}</small>
+        </div>"#
+    )
+}
+
 fn render_pending_play() -> String {
     r#"<div class="play-frame" role="img" aria-label="Playable Cell Shift game area awaiting its first verified build">
           <div class="empty-state play-empty">
@@ -1544,6 +2575,7 @@ fn render_pending_play() -> String {
 fn render_comparison(
     manifest: &ReferenceManifest,
     reference_paths: &BTreeMap<String, PathBuf>,
+    evidence: Option<&PublishedEvidence>,
 ) -> String {
     let mut assets = manifest.assets.iter();
     let Some(key_art) = assets.next() else {
@@ -1558,31 +2590,74 @@ fn render_comparison(
     let character_path = reference_paths
         .get(&character_sheet.public_path)
         .map_or_else(String::new, |path| path.display().to_string());
+    let current = evidence.and_then(|published| published.current.get("center"));
+    let worker = evidence.and_then(|published| published.current.get(WORKER_FRAME_LABEL));
+
+    let (chip, current_layer, current_note) = match current {
+        Some(path) => (
+            "Current frame verified",
+            format!(
+                r#"<img src="{}" alt="Current verified Cell Shift game frame at the healthy north-east heading">"#,
+                escape_html(path)
+            ),
+            "The approved key art and the current verified game frame are shown under one slider.",
+        ),
+        None => (
+            "Current frame pending",
+            r#"<div class="comparison-pending">No verified current frame</div>"#.to_owned(),
+            "The approved key art is available. The current verified game frame does not exist yet.",
+        ),
+    };
+    let (worker_chip, worker_layer, worker_note) = match worker {
+        Some(path) => (
+            "Worker crop verified",
+            format!(
+                r#"<img src="{}" alt="Current verified technician crop taken from the reported worker rectangle">"#,
+                escape_html(path)
+            ),
+            "The approved character sheet is shown beside the crop the report projected.",
+        ),
+        None => (
+            "Worker pending",
+            r#"<div class="worker-pending">No verified worker crop</div>"#.to_owned(),
+            "The approved character sheet is shown beside a clear placeholder for the future verified worker crop.",
+        ),
+    };
+    let browser = evidence
+        .and_then(|published| published.browser.as_deref())
+        .map(|path| {
+            format!(
+                r#"<figure class="browser-proof"><img src="{}" alt="Canvas region the headless browser captured from the packaged game"><figcaption>Headless browser canvas</figcaption></figure>"#,
+                escape_html(path)
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         r#"<div class="comparison-grid">
           <article class="comparison-card comparison-card-wide">
-            <div class="panel-heading"><span class="eyebrow">Key art / current frame</span><span class="pending-chip">Current frame pending</span></div>
+            <div class="panel-heading"><span class="eyebrow">Key art / current frame</span><span class="pending-chip">{chip}</span></div>
             <div class="comparison-stage" data-comparison style="--comparison: 50%">
               <div class="comparison-layer comparison-reference">
                 <img src="{}" alt="Approved Cel Shift key art reference">
               </div>
               <div class="comparison-layer comparison-current" data-comparison-current>
-                <div class="comparison-pending">No verified current frame</div>
+                {current_layer}
               </div>
-              <input data-compare-control type="range" min="0" max="100" value="50" aria-label="Reveal approved key art versus the pending current frame">
+              <input data-compare-control type="range" min="0" max="100" value="50" aria-label="Reveal approved key art versus the current frame">
             </div>
-            <p class="sr-only">The approved key art is available. The current verified game frame does not exist yet.</p>
+            <p class="sr-only">{current_note}</p>
             {}
           </article>
           <article class="comparison-card">
-            <div class="panel-heading"><span class="eyebrow">Character target</span><span class="pending-chip">Worker pending</span></div>
+            <div class="panel-heading"><span class="eyebrow">Character target</span><span class="pending-chip">{worker_chip}</span></div>
             <div class="character-comparison">
               <img src="{}" alt="Approved Cel Shift technician character sheet">
-              <div class="worker-pending">No verified worker crop</div>
+              {worker_layer}
             </div>
-            <p class="sr-only">The approved character sheet is shown beside a clear placeholder for the future verified worker crop.</p>
+            <p class="sr-only">{worker_note}</p>
             {}
+            {browser}
           </article>
         </div>"#,
         escape_html(&key_path),
@@ -1596,9 +2671,11 @@ fn render_provenance(asset: &ReferenceAsset) -> String {
     format!(
         r#"<dl class="provenance">
           <div><dt>Source</dt><dd><code>{}</code></dd></div>
+          <div><dt>Repository</dt><dd><code>{}</code></dd></div>
           <div><dt>SHA-256</dt><dd><code>{}</code></dd></div>
         </dl>"#,
         escape_html(&asset.source_path),
+        escape_html(&asset.public_path),
         escape_html(&asset.sha256),
     )
 }
@@ -1669,23 +2746,97 @@ fn render_task(task: &ProgressTask, repo: &RepoFacts) -> String {
     )
 }
 
-fn render_screenshots(verification: Option<&VerificationSummary>) -> String {
-    match verification {
-                Some(report) if !report.frames.is_empty() => report
+fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
+    let gallery = evidence
+        .map(|published| &published.gallery)
+        .or(inputs.gallery.as_ref());
+    let Some(gallery) = gallery.filter(|gallery| !gallery.entries.is_empty()) else {
+        return empty_state(
+            "No verified screenshots yet. The timeline starts after the first deterministic render passes.",
+        );
+    };
+
+    // A build only ever links pixels it published itself. The images of older
+    // accepted points are retained by assembly, and the manifest published
+    // beside this page is what vouches for them.
+    let published = evidence.is_some();
+    let latest_hash = gallery
+        .entries
+        .last()
+        .map_or("", |entry| entry.semantic_visual_hash.as_str());
+    gallery
+        .entries
+        .iter()
+        .rev()
+        .map(|entry| {
+            let images = if published {
+                entry
                     .frames
                     .iter()
-                    .map(|(name, path)| {
+                    .map(|(label, path)| {
                         format!(
-                            r#"<article class="screenshot-entry"><div class="timeline-dot"></div><div><span class="eyebrow">{}</span><p>{}</p></div></article>"#,
-                            escape_html(name),
-                            escape_html(path)
+                            r#"<figure><img src="{}" alt="{} frame verified at commit {}" loading="lazy"><figcaption>{}</figcaption></figure>"#,
+                            escape_html(path),
+                            escape_html(label),
+                            escape_html(&short_sha(&entry.source_commit)),
+                            escape_html(label),
                         )
                     })
-                    .collect(),
-                _ => empty_state(
-                    "No verified screenshots yet. The timeline starts after the first deterministic render passes.",
-                ),
-            }
+                    .collect::<String>()
+            } else {
+                String::new()
+            };
+            let gallery_note = if published {
+                String::new()
+            } else {
+                r#"<p class="history-note">Screenshots for this point are retained from the last green publication.</p>"#.to_owned()
+            };
+            let newest = evidence.is_some_and(|value| value.appended)
+                && entry.semantic_visual_hash == latest_hash;
+            let chip = if newest {
+                r#"<span class="pending-chip">New this build</span>"#
+            } else {
+                ""
+            };
+            format!(
+                r#"<article class="screenshot-entry">
+          <div class="timeline-dot"></div>
+          <div>
+            <span class="eyebrow">{} &middot; <time>{}</time></span>{chip}
+            <p>Working on {}</p>
+            <p class="hash"><code>{}</code></p>
+            <div class="screenshot-strip">{images}</div>
+            {}
+            {gallery_note}
+          </div>
+        </article>"#,
+                escape_html(&short_sha(&entry.source_commit)),
+                escape_html(&entry.committed_at),
+                escape_html(&entry.current_task),
+                escape_html(&entry.semantic_visual_hash),
+                render_deltas(&entry.metric_deltas),
+            )
+        })
+        .collect()
+}
+
+/// The metric changes one history entry recorded, largest movement first.
+fn render_deltas(deltas: &BTreeMap<String, f64>) -> String {
+    let moved = deltas
+        .iter()
+        .filter(|(_, delta)| **delta != 0.0)
+        .map(|(name, delta)| {
+            format!(
+                r#"<li><code>{}</code> <strong>{}</strong></li>"#,
+                escape_html(name),
+                escape_html(&format_delta(*delta))
+            )
+        })
+        .collect::<String>();
+    if moved.is_empty() {
+        return r#"<p class="history-note">No published metric moved.</p>"#.to_owned();
+    }
+    format!(r#"<ul class="delta-list">{moved}</ul>"#)
 }
 
 fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
@@ -1744,19 +2895,15 @@ fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
                 .collect()
 }
 
-fn render_tests(inputs: &SiteInputs) -> String {
+fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
+    let summary = inputs.verification.as_ref().map(|value| &value.summary);
     let gates = inputs
         .workflow
         .gates
         .iter()
-        .chain(
-            inputs
-                .verification
-                .iter()
-                .flat_map(|report| report.gates.iter()),
-        )
+        .chain(summary.iter().flat_map(|report| report.gates.iter()))
         .collect::<Vec<_>>();
-    if gates.is_empty() {
+    if gates.is_empty() && summary.is_none() {
         return empty_state("No gate results have been published.");
     }
 
@@ -1780,11 +2927,157 @@ fn render_tests(inputs: &SiteInputs) -> String {
                     )
                 })
                 .collect::<String>();
+    let matrix = if rows.is_empty() {
+        empty_state("No gate results have been published.")
+    } else {
+        format!(
+            r#"<div class="table-wrap"><table><caption>Latest gate matrix</caption><thead><tr><th>Gate</th><th>Status</th><th>Checks</th><th>Duration</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    };
+
+    let baseline = inputs
+        .gallery
+        .as_ref()
+        .and_then(|gallery| gallery.entries.last());
+    let evidence_html = summary
+        .map(|summary| render_verification_evidence(summary, baseline, evidence))
+        .unwrap_or_default();
+
     format!(
-        r#"<div class="table-wrap"><table><thead><tr><th>Gate</th><th>Status</th><th>Checks</th><th>Duration</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>
+        r#"{matrix}
+        {evidence_html}
         <p class="section-link"><a href="{}">Open the workflow run</a></p>"#,
         escape_html(&inputs.workflow.run_url)
     )
+}
+
+/// The published metric table, failure list, and run provenance.
+fn render_verification_evidence(
+    summary: &VerificationSummary,
+    baseline: Option<&GalleryEntry>,
+    evidence: Option<&PublishedEvidence>,
+) -> String {
+    let metrics = summary
+        .metrics
+        .iter()
+        .map(|(name, value)| {
+            let change = baseline
+                .and_then(|entry| entry.metrics.get(name))
+                .map_or_else(
+                    || "&mdash;".to_owned(),
+                    |before| escape_html(&format_delta(value - before)),
+                );
+            format!(
+                r#"<tr><th scope="row"><code>{}</code></th><td>{}</td><td>{change}</td></tr>"#,
+                escape_html(name),
+                escape_html(&format_metric(*value)),
+            )
+        })
+        .collect::<String>();
+
+    let failures = if summary.metric_failures.is_empty() {
+        String::new()
+    } else {
+        let rows = summary
+            .metric_failures
+            .iter()
+            .map(|failure| {
+                format!(
+                    r#"<tr><th scope="row"><code>{}</code></th><td>{}</td><td>{}</td></tr>"#,
+                    escape_html(&failure.metric),
+                    escape_html(&format_metric(failure.value)),
+                    escape_html(&failure.expected),
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<div class="table-wrap"><table><caption>Failed metrics</caption><thead><tr><th>Metric</th><th>Measured</th><th>Required</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    };
+
+    let stage = summary
+        .failed_stage
+        .as_deref()
+        .map(|stage| {
+            format!(
+                r#"<p class="failure-stage">Verification stopped in stage <code>{}</code>. The full log stays in the workflow run.</p>"#,
+                escape_html(stage)
+            )
+        })
+        .unwrap_or_default();
+    let report_link = evidence
+        .map(|_| VERIFICATION_FILE)
+        .unwrap_or(VERIFICATION_FILE);
+
+    format!(
+        r#"{stage}
+        <div class="table-wrap"><table><caption>Published metrics</caption><thead><tr><th>Metric</th><th>Value</th><th>Change</th></tr></thead><tbody>{metrics}</tbody></table></div>
+        {failures}
+        {}
+        <p class="section-link"><a href="{report_link}">Open the sanitized verification report</a></p>"#,
+        render_run_provenance(summary),
+    )
+}
+
+/// The exact source paths and hashes the verified run measured.
+fn render_run_provenance(summary: &VerificationSummary) -> String {
+    let groups = [
+        ("Verification sources", &summary.hashes.sources),
+        ("Generated assets", &summary.hashes.assets),
+        ("Asset sources", &summary.hashes.asset_sources),
+        ("Approved references", &summary.hashes.references),
+    ]
+    .into_iter()
+    .filter(|(_, hashes)| !hashes.is_empty())
+    .map(|(title, hashes)| {
+        let rows = hashes
+            .iter()
+            .map(|(path, hash)| {
+                format!(
+                    r#"<tr><th scope="row"><code>{}</code></th><td><code>{}</code></td></tr>"#,
+                    escape_html(path),
+                    escape_html(hash)
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<div class="table-wrap"><table><caption>{}</caption><thead><tr><th>Path</th><th>SHA-256</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+            escape_html(title)
+        )
+    })
+    .collect::<String>();
+
+    format!(
+        r#"<dl class="provenance">
+          <div><dt>Semantic hash</dt><dd><code>{}</code></dd></div>
+          <div><dt>Camera</dt><dd><code>{} / {} / MSAA {}</code></dd></div>
+        </dl>
+        {groups}"#,
+        escape_html(&summary.semantic_visual_hash),
+        escape_html(&summary.camera.tonemapping),
+        escape_html(&summary.camera.deband_dither),
+        summary.camera.msaa_samples,
+    )
+}
+
+/// A published metric value, without trailing noise on whole numbers.
+fn format_metric(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1.0e15 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+/// A published metric change, always signed so direction is unambiguous.
+fn format_delta(delta: f64) -> String {
+    if delta == 0.0 {
+        "no change".to_owned()
+    } else if delta.fract() == 0.0 && delta.abs() < 1.0e15 {
+        format!("{delta:+.0}")
+    } else {
+        format!("{delta:+.3}")
+    }
 }
 
 fn render_commits(repo: &RepoFacts) -> String {
@@ -1920,6 +3213,7 @@ fn heading_tag(level: HeadingLevel) -> &'static str {
 fn validate_local_target(
     output: &Path,
     ids: &BTreeSet<String>,
+    retained: &BTreeSet<String>,
     source: &Path,
     target: &str,
 ) -> Result<(), SitegenError> {
@@ -1947,7 +3241,7 @@ fn validate_local_target(
         .next()
         .map(PathBuf::from)
         .unwrap_or_default();
-    if output.join(&path).is_file() {
+    if output.join(&path).is_file() || retained.contains(target) {
         Ok(())
     } else {
         Err(SitegenError::BrokenLocalLink {
@@ -1955,6 +3249,23 @@ fn validate_local_target(
             target: path,
         })
     }
+}
+
+/// Every history frame the published gallery manifest vouches for.
+fn retained_history_targets(output: &Path) -> BTreeSet<String> {
+    let Ok(json) = fs::read_to_string(output.join(GALLERY_FILE)) else {
+        return BTreeSet::new();
+    };
+    serde_json::from_str::<GalleryManifest>(&json)
+        .map(|gallery| {
+            gallery
+                .entries
+                .into_iter()
+                .flat_map(|entry| entry.frames.into_values())
+                .filter(|path| path.starts_with(HISTORY_SCREENSHOTS))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn selector(value: &str) -> Selector {
