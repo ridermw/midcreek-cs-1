@@ -7,7 +7,7 @@ use std::{
 };
 
 use bevy::{
-    asset::{AssetPlugin as BevyAssetPlugin, RecursiveDependencyLoadState},
+    asset::AssetPlugin as BevyAssetPlugin,
     camera::ScalingMode,
     color::palettes::css::BLACK,
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
@@ -31,8 +31,8 @@ use midcreek_cs_1::{
         PrimitiveSource, RigSource, TECHNICIAN_BONES, generate_glb, load_source,
     },
     assets::{
-        AssetLoadReport, AssetLoadState, GENERATED_ASSET_DIRECTORY, GeneratedAssets, RenderAssets,
-        generated_modules, module_for,
+        AssetLoadReport, AssetLoadState, AssetReadyProof, GENERATED_ASSET_DIRECTORY,
+        GeneratedAssets, RenderAssets, generated_modules, module_for,
     },
     camera::{
         CAMERA_DISTANCE, CEL_SHIFT_DEBAND_DITHER, CEL_SHIFT_TONEMAPPING, CameraHeading,
@@ -1298,19 +1298,23 @@ fn hall_asset_plugin_becomes_ready_only_after_every_generated_module_loads() {
             .is_empty()
     );
 
-    let server = app.world().resource::<AssetServer>().clone();
+    // The evidence that every tracked handle was loaded is the proof recorded
+    // in the frame that decided Ready, not a later re-query of the live server:
+    // Bevy keeps re-emitting sub-asset load events after the latch, so live
+    // state is not the snapshot that caused Ready.
+    let proof = app
+        .world()
+        .get_resource::<AssetReadyProof>()
+        .expect("Ready must publish the proof that caused it")
+        .clone();
     let generated = app.world().resource::<GeneratedAssets>();
     assert_eq!(generated.documents().len(), ASSET_NAMES.len());
     assert_eq!(generated.scenes().len(), generated_modules().len());
-    for handle in generated.handle_ids() {
-        assert!(
-            matches!(
-                server.get_recursive_dependency_load_state(handle),
-                Some(RecursiveDependencyLoadState::Loaded)
-            ),
-            "every tracked handle must be loaded before Ready"
-        );
-    }
+    assert_eq!(
+        proof.gaps(generated),
+        Vec::<String>::new(),
+        "every tracked handle must be proven loaded before Ready"
+    );
 
     let gltfs = app.world().resource::<Assets<Gltf>>();
     for (asset, modules) in ASSET_MODULES {
@@ -1345,6 +1349,170 @@ fn hall_asset_plugin_becomes_ready_only_after_every_generated_module_loads() {
             module_for(kind).is_some()
         );
     }
+}
+
+#[test]
+fn hall_asset_ready_proof_names_every_generated_document_scene_and_module_binding() {
+    let mut app = hall_app(&repo_assets());
+    assert!(
+        app.world().get_resource::<AssetReadyProof>().is_none(),
+        "no readiness proof may exist while the load is still resolving"
+    );
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+
+    let proof = app
+        .world()
+        .get_resource::<AssetReadyProof>()
+        .expect("Ready must publish the proof that caused it")
+        .clone();
+    let generated = app.world().resource::<GeneratedAssets>();
+
+    assert_eq!(proof.documents().len(), ASSET_NAMES.len());
+    for (asset, handle) in generated.documents() {
+        let proven = proof
+            .documents()
+            .iter()
+            .find(|proven| proven.asset == *asset)
+            .unwrap_or_else(|| panic!("{asset} must be named by the readiness proof"));
+        assert_eq!(
+            proven.path,
+            format!("{GENERATED_ASSET_DIRECTORY}/{asset}.glb")
+        );
+        assert_eq!(proven.handle, handle.id().untyped());
+    }
+
+    let modules = generated_modules();
+    assert_eq!(proof.modules().len(), modules.len());
+    for module in modules {
+        let proven = proof
+            .modules()
+            .iter()
+            .find(|proven| proven.module == module)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} must be named by the readiness proof",
+                    module.scene_path()
+                )
+            });
+        assert_eq!(proven.module.module, module.module);
+        assert_eq!(proven.module.scene_index, module.scene_index);
+        assert_eq!(proven.scene_path, module.scene_path());
+
+        let spawned = generated
+            .scene(module.asset, module.module)
+            .unwrap_or_else(|| panic!("{} must be tracked", module.scene_path()))
+            .id()
+            .untyped();
+        assert_eq!(
+            proven.handle, spawned,
+            "the proof must record the handle the hall spawns"
+        );
+        assert_eq!(
+            proven.named_scene, spawned,
+            "the proof must record that the declared name resolved to that handle"
+        );
+        assert_eq!(
+            proven.indexed_scene, spawned,
+            "the proof must record that scene {} resolved to that handle",
+            module.scene_index
+        );
+    }
+
+    assert_eq!(proof.gaps(generated), Vec::<String>::new());
+}
+
+#[test]
+fn hall_asset_failure_publishes_no_readiness_proof() {
+    let assets = temp_assets("unproven", |generated| {
+        fs::remove_file(generated.join("rack.glb")).expect("fixture asset should be removable");
+    });
+    let mut app = hall_app(assets.path());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Failed);
+    assert!(
+        app.world().get_resource::<AssetReadyProof>().is_none(),
+        "a failed load must leave no readiness proof behind"
+    );
+    pump(&mut app, 4);
+    assert!(app.world().get_resource::<AssetReadyProof>().is_none());
+}
+
+/// The proof a Ready hall published, plus the assets it must account for.
+/// Handle identity outlives the app that produced it, so the mutation
+/// contracts below run without re-loading anything.
+fn ready_proof() -> (AssetReadyProof, GeneratedAssets) {
+    let mut app = hall_app(&repo_assets());
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+    let proof = app
+        .world()
+        .get_resource::<AssetReadyProof>()
+        .expect("Ready must publish the proof that caused it")
+        .clone();
+    let generated = app.world().resource::<GeneratedAssets>().clone();
+    (proof, generated)
+}
+
+#[test]
+fn asset_ready_proof_rejects_a_skipped_module_handle() {
+    let (proof, generated) = ready_proof();
+    let mut modules = proof.modules().to_vec();
+    let skipped = modules.remove(2);
+    let incomplete = AssetReadyProof::new(proof.documents().to_vec(), modules);
+
+    let gaps = incomplete.gaps(&generated);
+    assert!(
+        gaps.iter().any(|gap| gap.contains(&skipped.scene_path)),
+        "a proof that skips {} cannot satisfy Ready, got {gaps:?}",
+        skipped.scene_path
+    );
+}
+
+#[test]
+fn asset_ready_proof_rejects_a_skipped_document_handle() {
+    let (proof, generated) = ready_proof();
+    let mut documents = proof.documents().to_vec();
+    let skipped = documents.remove(0);
+    let incomplete = AssetReadyProof::new(documents, proof.modules().to_vec());
+
+    let gaps = incomplete.gaps(&generated);
+    assert!(
+        gaps.iter().any(|gap| gap.contains(&skipped.path)),
+        "a proof that skips {} cannot satisfy Ready, got {gaps:?}",
+        skipped.path
+    );
+}
+
+#[test]
+fn asset_ready_proof_rejects_a_module_proven_with_another_modules_handle() {
+    let (proof, generated) = ready_proof();
+    let mut modules = proof.modules().to_vec();
+    assert!(modules.len() >= 2);
+    modules[0].handle = modules[1].handle;
+    let swapped = AssetReadyProof::new(proof.documents().to_vec(), modules.clone());
+
+    let gaps = swapped.gaps(&generated);
+    assert!(
+        gaps.iter().any(|gap| gap.contains(&modules[0].scene_path)),
+        "a proof recording the wrong handle for {} cannot satisfy Ready, got {gaps:?}",
+        modules[0].scene_path
+    );
+}
+
+#[test]
+fn asset_ready_proof_rejects_a_module_whose_name_and_index_never_agreed() {
+    let (proof, generated) = ready_proof();
+    let mut modules = proof.modules().to_vec();
+    assert!(modules.len() >= 2);
+    modules[0].named_scene = modules[1].named_scene;
+    let unbound = AssetReadyProof::new(proof.documents().to_vec(), modules.clone());
+
+    let gaps = unbound.gaps(&generated);
+    assert!(
+        gaps.iter().any(|gap| gap.contains(&modules[0].scene_path)),
+        "a proof without a matching name and index binding for {} cannot satisfy Ready, got {gaps:?}",
+        modules[0].scene_path
+    );
 }
 
 #[test]
