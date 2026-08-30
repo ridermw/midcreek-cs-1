@@ -1,5 +1,5 @@
 //! The clamped four-way isometric camera: heading, eased orbit, and the follow
-//! clamp that keeps the ground footprint inside the authored room.
+//! clamp that keeps the ground footprint inside the rendered coverage apron.
 //!
 //! ```text
 //! current interpolated yaw + fixed ortho rectangle
@@ -11,11 +11,22 @@
 //! ground quadrilateral -> X/Z extents
 //!                      |
 //!                      v
-//! room bounds minus extents = legal target rectangle
+//! RENDER_COVERAGE_SIZE minus extents = legal target rectangle
+//!         (which contains the whole 40 m walkable room)
 //!                      |
 //!                      v
 //! clamp followed player -> derive camera transform
 //! ```
+//!
+//! The walkable room and the rendered coverage are two different squares. The
+//! technician may only ever stand inside the 40 m room the perimeter walls
+//! enclose; the camera may overhang that room freely, because the 72 m visual
+//! apron beneath it is what actually gets rendered out there. The clamp is
+//! therefore against [`RENDER_COVERAGE_SIZE`], not
+//! [`ROOM_SIZE`](crate::design::ROOM_SIZE), and because
+//! `72 / 2 - hypot(13, 8.71916) = 20.3468` m exceeds the room's 20 m half
+//! extent, every legal player position is followed exactly, at every yaw. The
+//! clamp only ever engages for a position the technician cannot reach.
 //!
 //! ```text
 //! ButtonInput<KeyCode>
@@ -55,7 +66,7 @@ use crate::{
     CellShiftSet,
     design::{
         CAMERA_ELEVATION_DEGREES, CAMERA_ORBIT_DURATION_SECONDS, INITIAL_CAMERA_YAW_DEGREES,
-        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, ROOM_SIZE,
+        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, RENDER_COVERAGE_SIZE,
     },
     player::{Technician, ViewBasis},
 };
@@ -345,11 +356,24 @@ pub fn ground_footprint_extents(yaw_radians: f32) -> Vec2 {
         .fold(Vec2::ZERO, |extents, corner| extents.max(corner.abs()))
 }
 
-/// The legal follow-target rectangle: room bounds minus the ground footprint.
-/// `None` when the footprint is wider than the room on either axis.
-pub fn camera_target_bounds(room: Vec2, yaw_radians: f32) -> Option<(Vec2, Vec2)> {
-    let remaining = room * 0.5 - ground_footprint_extents(yaw_radians);
+/// The legal follow-target rectangle: rendered coverage minus the ground
+/// footprint. `None` when the footprint is wider than the coverage on either
+/// axis.
+///
+/// `coverage` is the square the camera is allowed to render — the visual apron,
+/// not the walkable room. Clamping against the room instead would push the
+/// camera off any technician standing near a wall.
+pub fn camera_target_bounds(coverage: Vec2, yaw_radians: f32) -> Option<(Vec2, Vec2)> {
+    let remaining = coverage * 0.5 - ground_footprint_extents(yaw_radians);
     (remaining.min_element() >= 0.0).then_some((-remaining, remaining))
+}
+
+/// Whether every legal position in a walkable `room` is also a legal follow
+/// target under `coverage` at `yaw_radians`, so the camera never has to stop
+/// tracking the technician.
+pub fn coverage_holds_room(room: Vec2, coverage: Vec2, yaw_radians: f32) -> bool {
+    camera_target_bounds(coverage, yaw_radians)
+        .is_some_and(|(_, max)| max.x >= room.x * 0.5 && max.y >= room.y * 0.5)
 }
 
 /// The two yaws at which the ground footprint is widest, one per world axis.
@@ -364,11 +388,12 @@ pub fn widest_footprint_yaws() -> [f32; 2] {
     [peak, std::f32::consts::FRAC_PI_2 - peak]
 }
 
-/// Clamps the followed player into the legal rectangle. A room too small for
-/// the footprint has no legal target at all, so the camera holds the room
-/// centre rather than tracking a player it cannot frame without leaking.
-pub fn clamp_follow_target(player: Vec2, room: Vec2, yaw_radians: f32) -> Vec2 {
-    match camera_target_bounds(room, yaw_radians) {
+/// Clamps the followed player into the legal rectangle. Coverage too small for
+/// the footprint has no legal target at all, so the camera holds the centre
+/// rather than tracking a player it cannot follow without leaking past the
+/// rendered apron.
+pub fn clamp_follow_target(player: Vec2, coverage: Vec2, yaw_radians: f32) -> Vec2 {
+    match camera_target_bounds(coverage, yaw_radians) {
         Some((min, max)) => player.clamp(min, max),
         None => Vec2::ZERO,
     }
@@ -471,7 +496,7 @@ fn follow_player(
         .map(|transform| Vec2::new(transform.translation.x, transform.translation.z))
         .unwrap_or(Vec2::ZERO);
     let yaw = orbit.yaw_radians();
-    let target = clamp_follow_target(followed, ROOM_SIZE, yaw);
+    let target = clamp_follow_target(followed, RENDER_COVERAGE_SIZE, yaw);
     for mut transform in &mut cameras {
         *transform = camera_transform(yaw, target);
     }
@@ -480,7 +505,7 @@ fn follow_player(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::design::{CAMERA_OFFSET_DIRECTION, PLAYER_RADIUS};
+    use crate::design::{CAMERA_OFFSET_DIRECTION, PLAYER_RADIUS, ROOM_SIZE};
 
     const YAW_TOLERANCE_DEGREES: f32 = 1.0e-3;
 
@@ -1021,44 +1046,101 @@ mod tests {
     }
 
     #[test]
-    fn camera_target_bounds_stay_nonempty_at_every_yaw_of_the_authored_room() {
+    fn camera_target_bounds_hold_the_whole_walkable_room_at_every_yaw() {
+        let half_room = ROOM_SIZE * 0.5;
         for step in 0..720 {
             let degrees = step as f32 * 0.5;
-            let bounds = camera_target_bounds(ROOM_SIZE, degrees.to_radians());
+            let yaw = degrees.to_radians();
+            let bounds = camera_target_bounds(RENDER_COVERAGE_SIZE, yaw);
             let (min, max) = bounds
                 .unwrap_or_else(|| panic!("yaw {degrees} must have a legal target rectangle"));
             assert_eq!(min, -max);
             assert!(
-                max.min_element() > 0.0,
-                "yaw {degrees} legal rectangle {min:?}..{max:?} collapsed"
+                max.x >= half_room.x && max.y >= half_room.y,
+                "yaw {degrees} legal rectangle {max:?} does not hold the walkable room {half_room:?}"
+            );
+            assert!(
+                coverage_holds_room(ROOM_SIZE, RENDER_COVERAGE_SIZE, yaw),
+                "yaw {degrees} cannot follow the technician everywhere in the room"
             );
         }
 
-        let diagonal = camera_target_bounds(ROOM_SIZE, CameraHeading::NorthEast.yaw_radians())
-            .expect("the reviewed initial view must have a legal rectangle");
+        let diagonal =
+            camera_target_bounds(RENDER_COVERAGE_SIZE, CameraHeading::NorthEast.yaw_radians())
+                .expect("the reviewed initial view must have a legal rectangle");
         assert!(
-            (diagonal.1 - Vec2::splat(4.642_2)).abs().max_element() < 1.0e-3,
-            "the diagonal legal rectangle should reach 4.6422 m, got {:?}",
+            (diagonal.1 - Vec2::splat(20.641_6)).abs().max_element() < 1.0e-3,
+            "the diagonal legal rectangle should reach 20.6416 m, got {:?}",
             diagonal.1
         );
-        let tightest =
-            ROOM_SIZE * 0.5 - Vec2::splat(ground_half_width().hypot(ground_half_depth()));
+
+        // The tightest legal rectangle of a whole orbit still contains the
+        // 20 m room half extent, with 0.3468 m of authored slack to spare.
+        let tightest = RENDER_COVERAGE_SIZE * 0.5
+            - Vec2::splat(ground_half_width().hypot(ground_half_depth()));
         assert!(
-            (tightest - Vec2::splat(4.346_8)).abs().max_element() < 1.0e-3,
-            "the tightest legal rectangle of a whole orbit should reach 4.3468 m, got {tightest:?}"
+            (tightest - Vec2::splat(20.346_8)).abs().max_element() < 1.0e-3,
+            "the tightest legal rectangle of a whole orbit should reach 20.3468 m, got {tightest:?}"
         );
+        assert!(
+            ((tightest - half_room) - Vec2::splat(0.346_8))
+                .abs()
+                .max_element()
+                < 1.0e-3,
+            "the worst-case coverage slack should be 0.3468 m, got {:?}",
+            tightest - half_room
+        );
+
+        // Coverage narrower than the footprint still has no legal target.
         assert_eq!(
             camera_target_bounds(Vec2::splat(30.0), CameraHeading::NorthEast.yaw_radians()),
             None
         );
-        assert_eq!(camera_target_bounds(Vec2::new(25.0, 40.0), 0.0), None);
+        assert_eq!(camera_target_bounds(Vec2::new(25.0, 72.0), 0.0), None);
+
+        // Clamping against the 40 m room instead of the apron is exactly the
+        // rejected design: it cannot follow the technician to a wall.
+        assert!(
+            !coverage_holds_room(ROOM_SIZE, ROOM_SIZE, CameraHeading::NorthEast.yaw_radians()),
+            "the walkable room is far too small to be its own rendered coverage"
+        );
+    }
+
+    #[test]
+    fn camera_follows_every_legal_player_position_without_clamping() {
+        let reachable = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
+        let wall = ROOM_SIZE * 0.5;
+        for step in 0..360 {
+            let yaw = (step as f32).to_radians();
+            for player in [
+                Vec2::ZERO,
+                reachable,
+                -reachable,
+                Vec2::new(reachable.x, -reachable.y),
+                Vec2::new(-reachable.x, reachable.y),
+                wall,
+                -wall,
+                Vec2::new(wall.x, -wall.y),
+                Vec2::new(-wall.x, wall.y),
+                Vec2::new(0.0, wall.y),
+                Vec2::new(wall.x, 0.0),
+            ] {
+                assert_eq!(
+                    clamp_follow_target(player, RENDER_COVERAGE_SIZE, yaw),
+                    player,
+                    "yaw {} must follow {player:?} exactly, not clamp it",
+                    yaw.to_degrees()
+                );
+            }
+        }
     }
 
     #[test]
     fn camera_clamp_is_the_identity_inside_the_legal_rectangle() {
         for heading in CameraHeading::ALL {
             let yaw = heading.yaw_radians();
-            let (min, max) = camera_target_bounds(ROOM_SIZE, yaw).expect("legal rectangle");
+            let (min, max) =
+                camera_target_bounds(RENDER_COVERAGE_SIZE, yaw).expect("legal rectangle");
             for player in [
                 Vec2::ZERO,
                 min,
@@ -1068,7 +1150,7 @@ mod tests {
                 max * 0.5,
             ] {
                 assert_eq!(
-                    clamp_follow_target(player, ROOM_SIZE, yaw),
+                    clamp_follow_target(player, RENDER_COVERAGE_SIZE, yaw),
                     player,
                     "{heading:?} must follow {player:?} exactly"
                 );
@@ -1077,9 +1159,9 @@ mod tests {
     }
 
     #[test]
-    fn camera_clamp_keeps_the_ground_quadrilateral_inside_the_room_everywhere() {
-        let half = ROOM_SIZE * 0.5;
-        let reachable = half - Vec2::splat(PLAYER_RADIUS);
+    fn camera_clamp_keeps_the_ground_quadrilateral_inside_the_rendered_coverage_everywhere() {
+        let half = RENDER_COVERAGE_SIZE * 0.5;
+        let reachable = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
         for step in 0..72 {
             let yaw = (step as f32 * 5.0).to_radians();
             for player in [
@@ -1092,11 +1174,11 @@ mod tests {
                 Vec2::new(reachable.x, 0.0),
                 Vec2::new(6.0, -11.0),
             ] {
-                let target = clamp_follow_target(player, ROOM_SIZE, yaw);
+                let target = clamp_follow_target(player, RENDER_COVERAGE_SIZE, yaw);
                 for corner in ground_quadrilateral(yaw, target) {
                     assert!(
                         corner.x.abs() <= half.x + 1.0e-3 && corner.y.abs() <= half.y + 1.0e-3,
-                        "yaw {} following {player:?} put a ground corner at {corner:?}, outside {half:?}",
+                        "yaw {} following {player:?} put a ground corner at {corner:?}, outside the {half:?} apron",
                         yaw.to_degrees()
                     );
                 }
@@ -1105,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_clamp_without_a_legal_rectangle_holds_the_room_centre() {
+    fn camera_clamp_without_a_legal_rectangle_holds_the_coverage_centre() {
         let yaw = CameraHeading::NorthEast.yaw_radians();
         assert_eq!(
             clamp_follow_target(Vec2::new(9.0, 9.0), Vec2::splat(30.0), yaw),

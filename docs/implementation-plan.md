@@ -182,12 +182,13 @@ Each plugin registers systems into these shared sets. Startup and update orderin
 ## Fixed Product Contract
 
 - **Window:** 1280x720 default; 960x540 verification resize.
-- **Room:** 40m x 40m, polished light concrete, low perimeter walls.
+- **Walkable room:** 40m x 40m, polished light concrete, low perimeter walls. This is the only ground the technician may stand on and the only ground colliders enclose.
+- **Rendered coverage:** a 72m x 72m non-playable visual apron of building shell, centred on the walkable room, drawn beneath it in a cel-shift shadow role with no collider and a small downward offset so the coplanar 40m square never z-fights. It exists only so the camera never renders the void; it is background, not a second room.
 - **Layout:** four parallel rack rows, three traversable aisles, cooling units, overhead trays, black hose drops, yellow floor markings, red cart, yellow stool.
 - **Projection:** orthographic 26m x 14.625m, 57-degree elevation, four headings separated by 90 degrees, initial yaw 45 degrees.
 - **Camera offset direction:** normalized `(1, 2.1776979, 1)` because `sqrt(2) * tan(57 degrees) = 2.1776979`.
 - **Camera orbit:** Q counter-clockwise, E clockwise, 0.30-second smoothstep quarter turn; opposite keys on one frame cancel.
-- **Camera follow:** fixed zoom/elevation, clamped from the current yaw's ground-plane frustum footprint.
+- **Camera follow:** fixed zoom/elevation; the camera follows the technician anywhere in the walkable room, overhanging it freely, and is clamped only so the current yaw's ground-plane frustum footprint stays inside the 72m rendered coverage.
 - **Movement:** arrow keys, screen-relative to the live interpolated camera basis, normalized diagonals, no wall/equipment penetration.
 - **Interaction:** Space starts repair only for the highest-priority in-range ticket within 1.5m.
 - **Fault queue:** deterministic seed, maximum three active tickets, no duplicate active ticket per rack.
@@ -412,11 +413,18 @@ cast viewport corners onto Y=0
 ground quadrilateral -> X/Z extents
                      |
                      v
-room bounds minus extents = legal target rectangle
+RENDER_COVERAGE_SIZE minus extents = legal target rectangle
+        (which contains the whole 40m walkable room)
                      |
                      v
 clamp followed player -> derive camera transform
 ```
+
+The walkable room and the rendered coverage are two different squares. The
+clamp is against the 72m coverage, never the 40m room, so every legal player
+position is followed exactly: `72/2 - hypot(13, 8.71916) = 20.3468m` exceeds
+the room's 20m half extent by 0.3468m at the worst yaw. The clamp therefore
+only ever engages for a position the technician cannot reach.
 
 ### Verification state machine
 
@@ -502,7 +510,7 @@ No gate may require a person to play, resize, inspect, score, or approve anythin
 | Every aisle is usable | Grid flood-fill plus real-arrow-key waypoint traversal through all three aisles. |
 | Controls remain screen-relative | Real `ButtonInput<KeyCode>` table across all four headings and mid-orbit samples. |
 | Orbit is correct | Heading/tween math, duration, cancellation, current-basis movement, and all-view screenshots. |
-| Camera never leaks outside | Frustum math plus magenta sentinel ratio at corners and mid-orbit. |
+| Camera never leaks outside | Frustum math proving the ground quadrilateral stays inside the 72m rendered coverage at every player position, heading, and tween sample, plus the magenta sentinel ratio at corners and mid-orbit. |
 | Ticket queue is deterministic | Fixed seed produces exact rack/severity/tick sequence. |
 | Multi-ticket behavior works | Capacity, no duplicates, priority order, resolve/cooldown/recurrence tests. |
 | Repair interaction works | Out-of-range Space is rejected; in-range Space locks movement, plays Repair, resolves automatically. |
@@ -630,8 +638,8 @@ Commit: `feat: generate rigged cell shift assets autonomously`
 
 1. Add `AssetPlugin` with explicit `Loading`, `Ready`, and `Failed` states; no procedural fallback on load failure.
 2. Add `RenderAssets` caching one unit primitive mesh per shape and one material per `PaletteRole`.
-3. Define the fixed 40m square hall with four rack rows, three aisles, cooling units, trays, hoses, markings, cart, and stool.
-4. Keep visual and collider lists separate by selected design; validate their stable IDs before spawning.
+3. Define the fixed 40m square walkable hall with four rack rows, three aisles, cooling units, trays, hoses, markings, cart, and stool, and the 72m non-playable visual apron beneath and outside it.
+4. Keep visual and collider lists separate by selected design; validate their stable IDs before spawning. The apron is visual-only and must never carry a collider.
 5. Extract collider rectangles once into a cached resource.
 6. Spawn generated GLB modules only after all handles are loaded.
 7. Add a grid flood-fill proving all aisle checkpoints and the player spawn share one walkable component.
@@ -677,15 +685,15 @@ Commit: `feat: add rigged camera-relative technician movement`
 
 ## Task 5: Add clamped four-way camera orbit
 
-**Files:** `src/camera.rs`, `src/lib.rs`, `tests/app_contract.rs`.
+**Files:** `src/camera.rs`, `src/design.rs`, `src/world.rs`, `src/lib.rs`, `tests/app_contract.rs`.
 
 1. Implement `CameraHeading::{NorthEast, SouthEast, SouthWest, NorthWest}`.
 2. Read actual Q/E `just_pressed`; simultaneous Q+E cancels.
 3. Retarget desired heading immediately and interpolate current yaw with smoothstep over 0.30 seconds.
 4. Use current interpolated camera basis for movement throughout the tween.
-5. Compute ground footprint and legal follow target from current yaw every frame; keep zoom, elevation, and roll fixed.
+5. Compute ground footprint and legal follow target from current yaw every frame; keep zoom, elevation, and roll fixed. Clamp against the 72m rendered coverage, not the walkable room, so the camera may overhang the room.
 6. Test four settled headings, both directions, wraparound, simultaneous cancellation, rapid retarget, exact duration, midpoint, and final angle.
-7. For center/four corners at all headings and tween midpoints, assert player viewport margin >=32px and nonempty target bounds.
+7. For center/four room corners at all headings and tween midpoints, assert player viewport margin >=32px, that the follow target is unclamped, and that the full ground quadrilateral stays inside the 72m rendered coverage.
 
 Run:
 
@@ -775,7 +783,7 @@ artifact.
    - resolved NE;
    - settled SE, SW, NW;
    - Q/E tween midpoint;
-   - one clamped corner for each heading;
+   - the technician in one room corner for each heading;
    - 960x540 three-ticket layout.
 6. Write canonical `report.json`: sorted maps, relative paths, no wall-clock/host fields, floats rounded to 1e-6, exact source/reference hashes, asset hashes, gameplay results, camera states, ticket histories, UI rectangles, and frame paths.
 7. Hash canonical JSON and prove equal output for semantically identical runs in different temp directories.
@@ -783,7 +791,7 @@ artifact.
 9. Implement single-pass `FrameMetrics` per image and one cached reference metric record.
 10. Enforce mandatory frame contracts:
     - exact dimensions and artifact names;
-    - <=0.1% magenta sentinel at settled corners and tween midpoint;
+    - <=0.1% magenta sentinel at settled corners and tween midpoint, which is the rendered-coverage gate: any clear color on screen means the ground quadrilateral left the 72m apron;
     - mean linear luminance `[0.48, 0.88]`, within 0.18 of key art;
     - >=60% pixels within RGB distance 24 of approved palette;
     - floor >=20%, rack base/shadow >=6%, yellow >=0.5%, ink/hose 3%-35%;
@@ -890,7 +898,7 @@ No `TODOS.md` is created. The user directed every proposed valuable follow-on—
 
 - `cargo run` loads only generated, repository-owned GLBs and presents the cel-shift hall.
 - Arrow keys move the rigged worker correctly at every settled heading and during orbit.
-- Q/E animate deterministic quarter-turns and the camera remains clamped throughout.
+- Q/E animate deterministic quarter-turns; the camera follows the technician anywhere in the walkable room and its footprint stays inside the rendered coverage throughout.
 - Up to three seeded prioritized tickets recur; Space repairs only an in-range ticket; repair animation/state/HUD complete correctly.
 - All three aisles are reachable and walls/equipment remain impassable.
 - The no-Blender asset generator reproduces committed GLBs byte-for-byte.

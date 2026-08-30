@@ -67,10 +67,13 @@ handles; `src/world.rs` spawns the hall from the validated blueprint in
 - Generated static detail stays merged inside its module, so no server slot,
   status light, or tray rung becomes a runtime entity.
 
-The fixed 40 m square hall contains 29 authored visuals and 13 colliders:
+The fixed 40 m square walkable hall contains 30 authored visuals and 13
+colliders. Only the visual apron lies outside the room; everything else is
+inside it:
 
 | Category | Count | Placement |
 |---|---|---|
+| Rendered-coverage apron | 1 | 72 m x 72 m building shell, 0.05 m below the floor, visual only |
 | Floor | 1 | 40 m x 40 m polished light concrete |
 | Low perimeter walls | 4 | flush outside the play area, 1.2 m high |
 | Rack rows | 4 | x = -9, -3, 3, 9 |
@@ -189,13 +192,23 @@ node when the replacement is incomplete.
 - The interpolated basis is published in `UpdateOrbitIntent`, before
   `MovePlayer` reads it, so the technician walks along the camera it can see on
   that frame rather than the one from the frame before.
+- The walkable room and the rendered coverage are two different squares. The
+  technician may only ever stand inside the 40 m room the perimeter walls
+  enclose; the camera may overhang that room freely, because a 72 m visual
+  apron of building shell is authored beneath and outside it. The apron uses
+  the cel-shift floor-shadow role, sits 0.05 m below the floor so the coplanar
+  40 m square never z-fights, carries no collider, and is never walkable.
 - Every frame the ground quadrilateral is cast from the current yaw, its
-  axis-aligned extents are subtracted from the room, and the followed
-  technician is clamped into what is left before the transform is derived. The
-  footprint is widest between headings, not at one, so the tightest legal
-  rectangle of a whole orbit -- 4.3468 m, at yaw 33.851 degrees -- is a state
-  only a mid-tween frame reaches. The blueprint validator now checks those two
-  extremal yaws as well as the eight sampled ones.
+  axis-aligned extents are subtracted from `RENDER_COVERAGE_SIZE`, and the
+  followed technician is clamped into what is left before the transform is
+  derived. Because `72 / 2 - hypot(13, 8.71916) = 20.3468` m exceeds the room's
+  20 m half extent, every legal player position is followed exactly, at every
+  yaw; the clamp only ever engages for a position the technician cannot reach.
+  The footprint is widest between headings, not at one, so the tightest legal
+  rectangle of a whole orbit -- 20.3468 m, at yaw 33.851 degrees, with 0.3468 m
+  of slack -- is a state only a mid-tween frame reaches. The blueprint
+  validator checks those two extremal yaws as well as the eight sampled ones,
+  and rejects any coverage that cannot follow the whole walkable room.
 
 Camera gates:
 
@@ -210,18 +223,22 @@ camera entity: its heading quadrant, fixed distance, elevation, and roll, its
 recovered ground target, and its projected framing through Bevy's real
 `Camera::world_to_viewport`. Framing is asserted at the room centre, the
 authored player spawn, all three aisle centre lines end to end, and all four
-corners of the legal follow rectangle, at four settled headings and three tween
-samples each.
+room corners, at four settled headings and three tween samples each.
 
-**Known gap.** A camera whose footprint never leaves the room cannot also
-centre a technician standing in the room's corner. Because the view rectangle
-is rotated relative to the room, a cornered technician ends up
-`ORTHOGRAPHIC_WIDTH / 2 - PLAYER_RADIUS * sqrt(2)` = 12.505 m beyond the far
-ground edge, 516 px off screen, and the room size cancels out of that
-expression entirely. Containment is treated as the load-bearing property and
-the blind spot is recorded as an executable contract,
-`camera_orbit_room_corner_framing_is_impossible_under_the_fixed_contract`,
-rather than left silent. See the published challenge for the four ways out.
+**Room corners.** `camera_orbit_frames_every_room_corner_with_the_reviewed_margin`
+drives the running app to all four corners of the walkable room at all four
+settled headings and two tween samples each, asserts each tween sample really
+lies between headings, and requires both the reachable corner and the wall
+corner itself to keep at least 32 logical pixels of margin. The followed corner
+is centred to within half a pixel and keeps the full 360 px half-viewport,
+because the apron lets the camera go there.
+`camera_orbit_holds_the_rendered_apron_instead_of_leaking_past_it` then proves
+the follow target is never clamped at a corner, that the whole ground
+quadrilateral stays inside the 72 m coverage, and that it genuinely does
+overhang the 40 m room -- so the apron is load bearing rather than decorative.
+An earlier revision of the plan asked for corner framing *and* containment
+inside the 40 m room, which is impossible for any room size; the published
+challenge records how the two squares were separated.
 
 ## Foundation gates
 

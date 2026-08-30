@@ -513,7 +513,7 @@ mod progress_contract {
                     "camera-orbit",
                     ProgressStatus::Done,
                     &["technician-movement"][..],
-                    "Spawned the one orthographic game camera with the reviewed fixed 26 m by 14.625 m rectangle, 57-degree elevation, zero roll, and the initial NorthEast 45-degree yaw, which is all the authored unlit hall needs to be visible. Real Q and E just_pressed frames retarget the desired heading immediately, opposite keys on one frame cancel exactly, and the yaw eases with smoothstep at a constant 90 degrees per 0.30 seconds, so a retarget mid-tween starts at the interpolated yaw and its duration scales with the shortest remaining angle instead of restarting a fixed clock. CameraPlugin is now the sole runtime updater of ViewBasis and publishes the live interpolated basis in UpdateOrbitIntent, before MovePlayer reads it, so the technician walks along the camera it can actually see mid-orbit. Every frame the ground quadrilateral is cast from the current yaw, its axis-aligned extents are subtracted from the room, and the followed technician is clamped into what remains before the transform is derived, which holds the whole view inside the 40 m room at every heading, at every tween midpoint, and at every room corner while zoom, elevation, and roll stay fixed.",
+                    "Spawned the one orthographic game camera with the reviewed fixed 26 m by 14.625 m rectangle, 57-degree elevation, zero roll, and the initial NorthEast 45-degree yaw, which is all the authored unlit hall needs to be visible. Real Q and E just_pressed frames retarget the desired heading immediately, opposite keys on one frame cancel exactly, and the yaw eases with smoothstep at a constant 90 degrees per 0.30 seconds, so a retarget mid-tween starts at the interpolated yaw and its duration scales with the shortest remaining angle instead of restarting a fixed clock. CameraPlugin is now the sole runtime updater of ViewBasis and publishes the live interpolated basis in UpdateOrbitIntent, before MovePlayer reads it, so the technician walks along the camera it can actually see mid-orbit. Every frame the ground quadrilateral is cast from the current yaw, its axis-aligned extents are subtracted from the 72 m rendered coverage, and the followed technician is clamped into what remains before the transform is derived. The walkable room stays exactly 40 m, but the camera is clamped against the rendered coverage the new visual apron fills, so it overhangs the room freely and follows every legal player position exactly: every room corner is centred with the full 360 px of margin at every heading and at every tween midpoint, while the whole view stays inside the apron and zoom, elevation, and roll stay fixed.",
                     Some("HEAD"),
                 ),
                 (
@@ -626,8 +626,8 @@ mod progress_contract {
                     .filter(|challenge| challenge.status != ChallengeStatus::Resolved)
                     .map(|challenge| challenge.id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["clamped-orbit-cannot-frame-a-room-corner"],
-                "the corner-framing gap is the only open challenge"
+                Vec::<&str>::new(),
+                "the corner-framing gap was resolved by the rendered-coverage apron, so no challenge is open"
             );
         }
 
@@ -636,7 +636,7 @@ mod progress_contract {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             assert_eq!(
                 sha256(root.join("docs/implementation-plan.md")),
-                "8768ec95bf6596bfd91cf4b36d53a2df849e3cc70765f75dc60e3dc9c0185e1d"
+                "567400415c0a6296ba765de2cfae0a3f0575170a4f754a320f50ef69202ff49a"
             );
         }
 

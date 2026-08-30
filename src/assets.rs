@@ -104,7 +104,9 @@ pub fn module_for(kind: AssetKind) -> Option<GeneratedModule> {
         AssetKind::HoseDrop => "hose-drop",
         AssetKind::UtilityCart => "utility-cart",
         AssetKind::StepStool => "step-stool",
-        AssetKind::Floor | AssetKind::Wall | AssetKind::FloorMarking => return None,
+        AssetKind::RenderApron | AssetKind::Floor | AssetKind::Wall | AssetKind::FloorMarking => {
+            return None;
+        }
     };
     generated_modules()
         .into_iter()

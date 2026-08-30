@@ -11,7 +11,27 @@ pub const DEFAULT_WINDOW_HEIGHT: u32 = 720;
 pub const VERIFICATION_WINDOW_WIDTH: u32 = 960;
 pub const VERIFICATION_WINDOW_HEIGHT: u32 = 540;
 
+/// The walkable room: the only ground the technician may stand on, the ground
+/// the perimeter walls and every collider enclose, and the ground gameplay is
+/// authored against. It is not a bound on what the camera may render.
 pub const ROOM_SIZE: Vec2 = Vec2::new(40.0, 40.0);
+
+/// The square of building shell the camera is allowed to render, centred on
+/// the walkable room and covered by the non-playable visual apron.
+///
+/// The camera follows the technician anywhere in the walkable room, so its
+/// widest ground footprint may overhang the room by
+/// `hypot(13, 8.71916) = 15.6532` m on either side. Covering that needs
+/// `2 * (20 + 15.6532) = 71.3065` m; 72 m is the next whole metre and leaves
+/// 0.3468 m of slack on every edge.
+pub const RENDER_COVERAGE_SIZE: Vec2 = Vec2::new(72.0, 72.0);
+
+/// How far below the walkable floor the visual apron sits, in metres. The
+/// apron and the floor are coplanar quads of different sizes, so without this
+/// drop the overlapping 40 m square would z-fight; 0.05 m is far below the
+/// 0.01 m the painted floor markings are lifted by, so nothing else moves.
+pub const RENDER_APRON_DROP: f32 = 0.05;
+
 /// Height of the low perimeter wall that frames the hall.
 pub const WALL_HEIGHT: f32 = 1.2;
 /// Thickness of the low perimeter wall. Walls sit immediately outside the play
@@ -224,6 +244,9 @@ impl PrimitiveShape {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum AssetKind {
+    /// The non-playable visual apron: building shell and background outside the
+    /// walkable room. It is rendered, never collided with, and never stood on.
+    RenderApron,
     Floor,
     Wall,
     RackRow,
@@ -237,7 +260,8 @@ pub enum AssetKind {
 
 impl AssetKind {
     /// Every asset kind, in stable order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
+        Self::RenderApron,
         Self::Floor,
         Self::Wall,
         Self::RackRow,
@@ -254,6 +278,7 @@ impl AssetKind {
     /// sets are disjoint and jointly exhaustive.
     pub const fn primitive(self) -> Option<(PrimitiveShape, PaletteRole)> {
         match self {
+            Self::RenderApron => Some((PrimitiveShape::Quad, PaletteRole::FloorShadow)),
             Self::Floor => Some((PrimitiveShape::Quad, PaletteRole::FloorLight)),
             Self::Wall => Some((PrimitiveShape::Cuboid, PaletteRole::FloorShadow)),
             Self::FloorMarking => Some((PrimitiveShape::Quad, PaletteRole::SignatureYellow)),
@@ -331,7 +356,12 @@ pub struct AisleSpec {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoomSpec {
+    /// The walkable, collidable room. Nothing may stand outside it.
     pub size: Vec2,
+    /// The square of building shell the camera may render, covered by the
+    /// visual apron. Strictly larger than [`RoomSpec::size`]; it carries no
+    /// collider and is never a legal standing position.
+    pub coverage: Vec2,
 }
 
 impl RoomSpec {
@@ -365,11 +395,39 @@ pub enum SceneValidationError {
     ColliderOutsideRoom(PropId),
     PlayerSpawnOutsideRoom,
     PlayerSpawnInsideCollider(PropId),
-    RackRowCount { expected: usize, actual: usize },
-    AisleCount { expected: usize, actual: usize },
-    BlockedAisle { index: usize },
-    InsufficientAisleClearance { index: usize },
-    EmptyCameraTargetInterval { yaw_degrees: u16 },
+    RackRowCount {
+        expected: usize,
+        actual: usize,
+    },
+    AisleCount {
+        expected: usize,
+        actual: usize,
+    },
+    BlockedAisle {
+        index: usize,
+    },
+    InsufficientAisleClearance {
+        index: usize,
+    },
+    /// The rendered-coverage apron is too small to hold the camera's ground
+    /// footprint at this yaw, so there is no legal follow target at all.
+    EmptyCameraCoverageInterval {
+        yaw_degrees: u16,
+    },
+    /// Some legal player position in the walkable room is not a legal follow
+    /// target at this yaw, so following the technician there would push the
+    /// ground footprint outside the rendered coverage.
+    RoomOutsideCameraCoverage {
+        yaw_degrees: u16,
+    },
+    /// The blueprint declares rendered coverage but authors no apron to fill it.
+    MissingRenderApron,
+    /// The authored apron does not cover the declared rendered coverage, or is
+    /// not centred on the room, or does not sit below the walkable floor.
+    RenderApronDoesNotCoverRenderedArea,
+    /// The apron is building shell, not a second room: it must never carry a
+    /// collider or be marked as requiring one.
+    RenderApronHasCollider(PropId),
 }
 
 /// One aisle centreline sample that the walkability flood fill must reach from
@@ -418,9 +476,28 @@ impl SceneBlueprint {
     /// perimeter walls, four rack rows separated by three traversable aisles,
     /// four cooling units, overhead trays with hose drops, painted yellow
     /// markings, the red service cart, and the yellow step stool.
+    ///
+    /// Beneath and outside all of it lies the 72 m visual apron. The apron is
+    /// non-playable building shell that only exists so the camera, which is
+    /// free to overhang the walkable room while following the technician, never
+    /// renders the void. It carries no collider and is never walkable.
     pub fn v0() -> Self {
         let mut visuals = Vec::new();
         let mut colliders = Vec::new();
+
+        visuals.push(
+            VisualSpec::new(
+                "render-apron",
+                AssetKind::RenderApron,
+                Vec3::new(0.0, -RENDER_APRON_DROP, 0.0),
+                false,
+            )
+            .with_scale(Vec3::new(
+                RENDER_COVERAGE_SIZE.x,
+                1.0,
+                RENDER_COVERAGE_SIZE.y,
+            )),
+        );
 
         visuals.push(
             VisualSpec::new("floor", AssetKind::Floor, Vec3::ZERO, false).with_scale(Vec3::new(
@@ -569,7 +646,10 @@ impl SceneBlueprint {
         }
 
         Self {
-            room: RoomSpec { size: ROOM_SIZE },
+            room: RoomSpec {
+                size: ROOM_SIZE,
+                coverage: RENDER_COVERAGE_SIZE,
+            },
             visuals,
             colliders,
             aisles: AISLE_CENTER_X
@@ -781,10 +861,68 @@ impl SceneBlueprint {
         }
 
         for yaw in camera_validation_yaws() {
-            if camera_target_interval(self.room, yaw).is_none() {
-                errors.push(SceneValidationError::EmptyCameraTargetInterval {
-                    yaw_degrees: (yaw.round() as i64).rem_euclid(360) as u16,
-                });
+            let yaw_degrees = (yaw.round() as i64).rem_euclid(360) as u16;
+            match camera_target_bounds(self.room, yaw) {
+                None => {
+                    errors.push(SceneValidationError::EmptyCameraCoverageInterval { yaw_degrees })
+                }
+                Some((_, max)) => {
+                    // The camera must follow every legal player position, so
+                    // the legal follow rectangle has to contain the whole
+                    // walkable room rather than merely be non-empty.
+                    let half_room = self.room.size * 0.5;
+                    if max.x + COVERAGE_TOLERANCE < half_room.x
+                        || max.y + COVERAGE_TOLERANCE < half_room.y
+                    {
+                        errors
+                            .push(SceneValidationError::RoomOutsideCameraCoverage { yaw_degrees });
+                    }
+                }
+            }
+        }
+
+        errors.extend(self.render_apron_errors());
+
+        errors
+    }
+
+    /// The apron must exist, cover the declared rendered coverage from beneath
+    /// the walkable floor, and stay visual-only.
+    fn render_apron_errors(&self) -> Vec<SceneValidationError> {
+        let mut errors = Vec::new();
+        let aprons = self
+            .visuals
+            .iter()
+            .filter(|visual| visual.asset == AssetKind::RenderApron)
+            .collect::<Vec<_>>();
+
+        if aprons.is_empty() {
+            errors.push(SceneValidationError::MissingRenderApron);
+            return errors;
+        }
+
+        let covered = aprons.iter().any(|apron| {
+            let transform = &apron.transform;
+            transform.translation.x == 0.0
+                && transform.translation.z == 0.0
+                && transform.translation.y < 0.0
+                && transform.scale.x + COVERAGE_TOLERANCE >= self.room.coverage.x
+                && transform.scale.z + COVERAGE_TOLERANCE >= self.room.coverage.y
+        });
+        if !covered {
+            errors.push(SceneValidationError::RenderApronDoesNotCoverRenderedArea);
+        }
+
+        for apron in aprons {
+            if apron.collision_required
+                || self
+                    .colliders
+                    .iter()
+                    .any(|collider| collider.id == apron.id)
+            {
+                errors.push(SceneValidationError::RenderApronHasCollider(
+                    apron.id.clone(),
+                ));
             }
         }
 
@@ -998,10 +1136,10 @@ fn grid_neighbors(
     neighbors.into_iter().take(count)
 }
 
-/// Every yaw the room must be able to frame: the four settled headings, the
-/// four half-way yaws a tween passes through, and the two yaws at which the
-/// ground footprint is widest. The widest yaws lie between headings, so a
-/// sampled-headings-only check would accept a room the camera cannot hold
+/// Every yaw the rendered coverage must be able to hold: the four settled
+/// headings, the four half-way yaws a tween passes through, and the two yaws at
+/// which the ground footprint is widest. The widest yaws lie between headings,
+/// so a sampled-headings-only check would accept an apron the camera overruns
 /// halfway through a real orbit.
 fn camera_validation_yaws() -> Vec<f32> {
     let mut yaws = vec![45.0_f32, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0, 0.0];
@@ -1011,6 +1149,10 @@ fn camera_validation_yaws() -> Vec<f32> {
     yaws
 }
 
-fn camera_target_interval(room: RoomSpec, yaw_degrees: f32) -> Option<(Vec2, Vec2)> {
-    crate::camera::camera_target_bounds(room.size, yaw_degrees.to_radians())
+/// Slack allowed when comparing authored metres against derived metres, so a
+/// blueprint sized exactly to the closed form is not rejected by float noise.
+const COVERAGE_TOLERANCE: f32 = 1.0e-3;
+
+fn camera_target_bounds(room: RoomSpec, yaw_degrees: f32) -> Option<(Vec2, Vec2)> {
+    crate::camera::camera_target_bounds(room.coverage, yaw_degrees.to_radians())
 }

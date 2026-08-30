@@ -232,7 +232,8 @@ mod tests {
     use super::*;
     use crate::assets::module_for;
     use crate::design::{
-        AISLE_CENTER_X, PLAYER_RADIUS, PaletteRole, PrimitiveShape, RACK_ROW_X, ROOM_SIZE,
+        AISLE_CENTER_X, FLOOR_MARKING_HEIGHT, PLAYER_RADIUS, PaletteRole, PrimitiveShape,
+        RACK_ROW_X, RENDER_APRON_DROP, RENDER_COVERAGE_SIZE, ROOM_SIZE,
     };
 
     fn colliders() -> HallColliders {
@@ -327,7 +328,7 @@ mod tests {
             .count();
 
         assert_eq!(primitives + modules, blueprint.visuals.len());
-        assert_eq!(primitives, 13);
+        assert_eq!(primitives, 14);
         assert_eq!(modules, 16);
         assert_eq!(
             blueprint
@@ -335,6 +336,66 @@ mod tests {
                 .map(|visual| visual.asset.primitive()),
             Some(Some((PrimitiveShape::Quad, PaletteRole::FloorLight)))
         );
+        assert_eq!(
+            blueprint
+                .visual("render-apron")
+                .map(|visual| visual.asset.primitive()),
+            Some(Some((PrimitiveShape::Quad, PaletteRole::FloorShadow)))
+        );
+    }
+
+    #[test]
+    fn hall_world_spawns_the_render_apron_as_a_visual_only_background() {
+        let blueprint = SceneBlueprint::v0();
+        let apron = blueprint
+            .visual("render-apron")
+            .expect("the authored blueprint must carry the rendered-coverage apron");
+
+        assert_eq!(apron.asset, AssetKind::RenderApron);
+        assert!(
+            !apron.collision_required,
+            "the apron is building shell, not a room the technician can hit"
+        );
+        assert_eq!(blueprint.collider("render-apron"), None);
+        assert_eq!(
+            blueprint.count_of(AssetKind::RenderApron),
+            1,
+            "exactly one apron covers the rendered area"
+        );
+
+        // Exactly 72 m square, centred on the room, and dropped clear of the
+        // coplanar 40 m floor so the shared square never z-fights.
+        assert_eq!(
+            apron.transform.scale,
+            Vec3::new(RENDER_COVERAGE_SIZE.x, 1.0, RENDER_COVERAGE_SIZE.y)
+        );
+        assert_eq!(
+            apron.transform.translation,
+            Vec3::new(0.0, -RENDER_APRON_DROP, 0.0)
+        );
+        let floor = blueprint.visual("floor").expect("authored floor");
+        assert!(
+            apron.transform.translation.y < floor.transform.translation.y,
+            "the apron must sit below the walkable floor"
+        );
+        assert!(
+            apron.transform.translation.y < -FLOOR_MARKING_HEIGHT,
+            "the apron must also sit below the painted floor markings"
+        );
+
+        // It is drawn before everything it sits behind.
+        assert_eq!(blueprint.visuals[0].id.as_str(), "render-apron");
+
+        // The apron is strictly larger than the walkable room on both axes, and
+        // the walkable room is unchanged.
+        assert_eq!(blueprint.room.size, ROOM_SIZE);
+        assert_eq!(blueprint.room.coverage, RENDER_COVERAGE_SIZE);
+        assert!(
+            blueprint.room.coverage.x > blueprint.room.size.x
+                && blueprint.room.coverage.y > blueprint.room.size.y,
+            "the apron must be strictly larger than the walkable room"
+        );
+        assert_eq!(blueprint.validate(), Vec::<SceneValidationError>::new());
     }
 
     #[test]

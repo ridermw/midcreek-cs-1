@@ -29,7 +29,7 @@ use midcreek_cs_1::{
     },
     camera::{
         CAMERA_DISTANCE, CameraHeading, CameraOrbit, CellShiftCamera, camera_target_bounds,
-        clamp_follow_target, ground_half_depth, ground_quadrilateral,
+        clamp_follow_target, coverage_holds_room, ground_half_depth, ground_quadrilateral,
     },
     design::{
         AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
@@ -41,11 +41,11 @@ use midcreek_cs_1::{
         INK, KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, MAX_ACTIVE_TICKETS, MIN_AISLE_CLEARANCE,
         ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, OVERHEAD_TRAY_HEIGHT, PLAYER_RADIUS, PaletteRole,
         PrimitiveShape, PropId, RACK_COOLDOWN_SECONDS, RACK_ROW_X, RACK_SHADOW, RACK_WHITE,
-        REPAIR_DURATION_SECONDS, REPAIR_INTERACTION_RANGE, RESOLVED_DISPLAY_SECONDS, ROOM_SIZE,
-        SIGNATURE_YELLOW, SKY_BOUNCE_BLUE, SceneBlueprint, SceneValidationError, TEAL_ACCENT,
-        VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WALKABLE_CELL_SIZE,
-        WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT, WORKER_HI_VIS, WORKER_SKIN,
-        WORKER_SLATE, WORKER_TROUSERS,
+        RENDER_APRON_DROP, RENDER_COVERAGE_SIZE, REPAIR_DURATION_SECONDS, REPAIR_INTERACTION_RANGE,
+        RESOLVED_DISPLAY_SECONDS, ROOM_SIZE, SIGNATURE_YELLOW, SKY_BOUNCE_BLUE, SceneBlueprint,
+        SceneValidationError, TEAL_ACCENT, VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
+        VisualSpec, WALKABLE_CELL_SIZE, WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT,
+        WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS,
     },
     player::{
         PLAYER_MAX_MOVE_DELTA, PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip,
@@ -187,6 +187,7 @@ fn design_v0_blueprint_lists_the_authored_hall_in_reviewed_order() {
     let scene = SceneBlueprint::v0();
 
     assert_eq!(scene.room.size, ROOM_SIZE);
+    assert_eq!(scene.room.coverage, RENDER_COVERAGE_SIZE);
     assert_eq!(scene.player_spawn, Vec2::new(-6.0, -11.0));
     assert_eq!(
         scene
@@ -195,6 +196,7 @@ fn design_v0_blueprint_lists_the_authored_hall_in_reviewed_order() {
             .map(|visual| visual.id.as_str())
             .collect::<Vec<_>>(),
         [
+            "render-apron",
             "floor",
             "wall-north",
             "wall-south",
@@ -257,6 +259,7 @@ fn design_v0_blueprint_counts_every_authored_category() {
 
     assert_eq!(scene.rack_row_count(), 4);
     assert_eq!(scene.aisles.len(), 3);
+    assert_eq!(scene.count_of(AssetKind::RenderApron), 1);
     assert_eq!(scene.count_of(AssetKind::Floor), 1);
     assert_eq!(scene.count_of(AssetKind::Wall), 4);
     assert_eq!(scene.count_of(AssetKind::RackRow), 4);
@@ -266,7 +269,7 @@ fn design_v0_blueprint_counts_every_authored_category() {
     assert_eq!(scene.count_of(AssetKind::UtilityCart), 1);
     assert_eq!(scene.count_of(AssetKind::StepStool), 1);
     assert_eq!(scene.count_of(AssetKind::FloorMarking), 8);
-    assert_eq!(scene.visuals.len(), 29);
+    assert_eq!(scene.visuals.len(), 30);
     assert_eq!(scene.colliders.len(), 13);
 }
 
@@ -415,7 +418,7 @@ fn design_v0_blueprint_places_the_room_shell_and_equipment_exactly() {
 
 #[test]
 fn design_every_asset_kind_is_either_a_generated_module_or_a_unit_primitive() {
-    assert_eq!(AssetKind::ALL.len(), 9);
+    assert_eq!(AssetKind::ALL.len(), 10);
     for kind in AssetKind::ALL {
         let primitive = kind.primitive();
         let module = module_for(kind);
@@ -996,25 +999,126 @@ fn design_validator_reports_blocked_aisle_topology() {
 }
 
 #[test]
-fn design_validator_reports_empty_camera_target_intervals() {
+fn design_validator_reports_empty_camera_coverage_intervals() {
     let errors = validation_errors(|scene| {
-        scene.room.size = Vec2::splat(30.0);
+        scene.room.coverage = Vec2::splat(30.0);
     });
 
-    assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 45 }));
-    assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 135 }));
-    assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 225 }));
-    assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 315 }));
+    for yaw_degrees in [45, 135, 225, 315] {
+        assert!(
+            errors.contains(&SceneValidationError::EmptyCameraCoverageInterval { yaw_degrees }),
+            "coverage narrower than the footprint must be reported at yaw {yaw_degrees}"
+        );
+    }
 }
 
 #[test]
-fn design_validator_checks_mid_orbit_camera_target_intervals() {
+fn design_validator_checks_mid_orbit_camera_coverage_intervals() {
     let errors = validation_errors(|scene| {
-        scene.room.size = Vec2::new(25.0, 40.0);
+        scene.room.coverage = Vec2::new(25.0, 72.0);
     });
 
-    assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 0 }));
-    assert!(errors.contains(&SceneValidationError::EmptyCameraTargetInterval { yaw_degrees: 180 }));
+    assert!(errors.contains(&SceneValidationError::EmptyCameraCoverageInterval { yaw_degrees: 0 }));
+    assert!(
+        errors.contains(&SceneValidationError::EmptyCameraCoverageInterval { yaw_degrees: 180 })
+    );
+}
+
+#[test]
+fn design_validator_rejects_coverage_that_cannot_follow_the_whole_walkable_room() {
+    // 60 m of coverage still holds the footprint at every yaw, so it passes the
+    // old non-empty test, but it cannot follow a technician standing against a
+    // wall of the 40 m room. That is the property the rule now enforces.
+    let errors = validation_errors(|scene| {
+        scene.room.coverage = Vec2::splat(60.0);
+    });
+
+    for yaw_degrees in [0, 45, 90, 135, 180, 225, 270, 315] {
+        assert!(
+            camera_target_bounds(Vec2::splat(60.0), (yaw_degrees as f32).to_radians()).is_some(),
+            "60 m of coverage still has a non-empty legal rectangle at yaw {yaw_degrees}"
+        );
+        assert!(
+            errors.contains(&SceneValidationError::RoomOutsideCameraCoverage { yaw_degrees }),
+            "yaw {yaw_degrees} must report the room falling outside the coverage"
+        );
+    }
+    assert!(
+        !errors.iter().any(|error| matches!(
+            error,
+            SceneValidationError::EmptyCameraCoverageInterval { .. }
+        )),
+        "60 m of coverage is not empty, it is merely too small to follow the room"
+    );
+}
+
+#[test]
+fn design_validator_rejects_a_room_that_outgrows_the_authored_coverage() {
+    let errors = validation_errors(|scene| {
+        scene.room.size = Vec2::splat(60.0);
+    });
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            SceneValidationError::RoomOutsideCameraCoverage { .. }
+        )),
+        "a room grown past the 72 m apron must be reported, got {errors:?}"
+    );
+}
+
+#[test]
+fn design_validator_requires_a_visual_only_apron_over_the_rendered_area() {
+    let missing = validation_errors(|scene| {
+        scene
+            .visuals
+            .retain(|visual| visual.asset != AssetKind::RenderApron);
+    });
+    assert_eq!(missing, [SceneValidationError::MissingRenderApron]);
+
+    let too_small = validation_errors(|scene| {
+        for visual in &mut scene.visuals {
+            if visual.asset == AssetKind::RenderApron {
+                visual.transform.scale = Vec3::new(ROOM_SIZE.x, 1.0, ROOM_SIZE.y);
+            }
+        }
+    });
+    assert_eq!(
+        too_small,
+        [SceneValidationError::RenderApronDoesNotCoverRenderedArea]
+    );
+
+    let coplanar = validation_errors(|scene| {
+        for visual in &mut scene.visuals {
+            if visual.asset == AssetKind::RenderApron {
+                visual.transform.translation.y = 0.0;
+            }
+        }
+    });
+    assert_eq!(
+        coplanar,
+        [SceneValidationError::RenderApronDoesNotCoverRenderedArea],
+        "an apron coplanar with the floor would z-fight, so it is not a legal apron"
+    );
+
+    let collidable = validation_errors(|scene| {
+        for visual in &mut scene.visuals {
+            if visual.asset == AssetKind::RenderApron {
+                visual.collision_required = true;
+            }
+        }
+        scene.colliders.push(ColliderSpec {
+            id: prop("render-apron"),
+            center: Vec2::ZERO,
+            half_extents: RENDER_COVERAGE_SIZE * 0.5,
+        });
+    });
+    assert!(
+        collidable.contains(&SceneValidationError::RenderApronHasCollider(prop(
+            "render-apron"
+        ))),
+        "the apron is background, not a second room: {collidable:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,7 +1549,7 @@ fn hall_spawns_unit_primitives_with_cached_meshes_and_palette_materials() {
         .filter(|visual| visual.asset.primitive().is_some())
         .collect::<Vec<_>>();
     assert_eq!(spawned.len(), primitives.len());
-    assert_eq!(primitives.len(), 13);
+    assert_eq!(primitives.len(), 14);
 
     for visual in primitives {
         let (shape, role) = visual.asset.primitive().expect("primitive kind");
@@ -2825,12 +2929,12 @@ fn camera_orbit_projects_the_authored_metre_scale_onto_the_real_viewport() {
     );
 
     // Every authored prop centre is inside the room, and the camera holds the
-    // whole ground footprint inside it.
+    // whole ground footprint inside the rendered-coverage apron.
+    let coverage = RENDER_COVERAGE_SIZE * 0.5;
     for corner in ground_quadrilateral(orbit(&app).yaw_radians(), focus) {
         assert!(
-            corner.x.abs() <= ROOM_SIZE.x * 0.5 + 1.0e-3
-                && corner.y.abs() <= ROOM_SIZE.y * 0.5 + 1.0e-3,
-            "the initial view already leaks past the room at {corner:?}"
+            corner.x.abs() <= coverage.x + 1.0e-3 && corner.y.abs() <= coverage.y + 1.0e-3,
+            "the initial view already leaks past the rendered apron at {corner:?}"
         );
     }
 }
@@ -3050,19 +3154,35 @@ fn camera_orbit_moves_the_technician_along_the_live_mid_tween_basis() {
     assert_eq!(orbit(&app).heading(), CameraHeading::SouthEast);
 }
 
-/// Ground positions the camera must frame: the room centre, the authored
-/// player spawn, every aisle end, and the corners of the legal rectangle.
-fn framing_samples(yaw_radians: f32) -> Vec<Vec2> {
+/// Ground positions the camera must frame. The technician can stand anywhere in
+/// the walkable room, so this is the room centre, the authored player spawn,
+/// every aisle end, and every room corner as close as a technician of
+/// [`PLAYER_RADIUS`] can actually stand to it. Movement clamps the technician
+/// off the wall itself, so the wall corner is not a legal standing position.
+fn framing_samples() -> Vec<Vec2> {
     let mut samples = vec![Vec2::ZERO, SceneBlueprint::v0().player_spawn];
     for center_x in AISLE_CENTER_X {
         samples.push(Vec2::new(center_x, AISLE_Z_MIN));
         samples.push(Vec2::new(center_x, AISLE_Z_MAX));
         samples.push(Vec2::new(center_x, 0.0));
     }
-    let (min, max) = camera_target_bounds(ROOM_SIZE, yaw_radians)
-        .expect("the authored room must always have a legal rectangle");
-    samples.extend([min, max, Vec2::new(min.x, max.y), Vec2::new(max.x, min.y)]);
+    samples.extend(reachable_room_corners());
     samples
+}
+
+/// The four corners of a rectangle given its half extents, in a stable order.
+fn room_corners(half: Vec2) -> [Vec2; 4] {
+    [
+        half,
+        -half,
+        Vec2::new(half.x, -half.y),
+        Vec2::new(-half.x, half.y),
+    ]
+}
+
+/// The closest a technician can stand to each corner of the walkable room.
+fn reachable_room_corners() -> [Vec2; 4] {
+    room_corners(ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS))
 }
 
 /// Drives the camera to `yaw` by settling the nearest heading and then running
@@ -3080,39 +3200,46 @@ fn orbit_to(app: &mut App, heading: CameraHeading, frames: usize) {
 #[test]
 fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
     let mut app = walking_hall(&repo_assets());
-    let half = ROOM_SIZE * 0.5;
+    let coverage = RENDER_COVERAGE_SIZE * 0.5;
+    let half_room = ROOM_SIZE * 0.5;
 
     for heading in CameraHeading::ALL {
         // A settled heading, then the exact midpoint of the turn that leaves it.
         for frames in [0, QUARTER_TURN_FRAMES / 2, QUARTER_TURN_FRAMES / 4] {
             orbit_to(&mut app, heading, frames);
             let yaw = orbit(&app).yaw_radians();
-            let bounds = camera_target_bounds(ROOM_SIZE, yaw);
+            let bounds = camera_target_bounds(RENDER_COVERAGE_SIZE, yaw);
             let (min, max) = bounds.unwrap_or_else(|| {
                 panic!("yaw {} has no legal target rectangle", yaw.to_degrees())
             });
             assert!(
-                max.min_element() > 0.0,
-                "yaw {} collapsed the legal rectangle to {min:?}..{max:?}",
+                max.x >= half_room.x && max.y >= half_room.y,
+                "yaw {} shrank the legal rectangle to {min:?}..{max:?}, which no longer holds the {half_room:?} room",
                 yaw.to_degrees()
             );
 
-            for sample in framing_samples(yaw) {
+            for sample in framing_samples() {
                 place_player(&mut app, sample);
                 app.update();
                 let yaw = orbit(&app).yaw_radians();
                 let target = camera_ground_target(&mut app);
-                let expected = clamp_follow_target(sample, ROOM_SIZE, yaw);
+                let expected = clamp_follow_target(sample, RENDER_COVERAGE_SIZE, yaw);
                 assert!(
                     (target - expected).abs().max_element() < 1.0e-3,
                     "yaw {} following {sample:?} settled on {target:?}, expected {expected:?}",
                     yaw.to_degrees()
                 );
+                assert!(
+                    (target - sample).abs().max_element() < 1.0e-3,
+                    "yaw {} must follow the legal position {sample:?} exactly, got {target:?}",
+                    yaw.to_degrees()
+                );
 
                 for corner in ground_quadrilateral(yaw, target) {
                     assert!(
-                        corner.x.abs() <= half.x + 1.0e-3 && corner.y.abs() <= half.y + 1.0e-3,
-                        "yaw {} following {sample:?} pushed a ground corner to {corner:?}",
+                        corner.x.abs() <= coverage.x + 1.0e-3
+                            && corner.y.abs() <= coverage.y + 1.0e-3,
+                        "yaw {} following {sample:?} pushed a ground corner to {corner:?}, outside the rendered apron",
                         yaw.to_degrees()
                     );
                 }
@@ -3129,106 +3256,176 @@ fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
 }
 
 #[test]
-fn camera_orbit_holds_the_room_edge_instead_of_leaking_past_it() {
+fn camera_orbit_frames_every_room_corner_with_the_reviewed_margin() {
     let mut app = walking_hall(&repo_assets());
-    let reachable = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
-    let half = ROOM_SIZE * 0.5;
+    let size = viewport_size(&mut app);
+    let centre_margin = size.x.min(size.y) * 0.5;
 
-    // Every room corner, at every heading and at the tween midpoints between
-    // them. The clamp is a hard containment guarantee: the camera stops at the
-    // room edge rather than following the technician out of it.
-    for heading in CameraHeading::ALL {
-        for frames in [0, QUARTER_TURN_FRAMES / 2] {
-            orbit_to(&mut app, heading, frames);
-            for corner in [
-                reachable,
-                -reachable,
-                Vec2::new(reachable.x, -reachable.y),
-                Vec2::new(-reachable.x, reachable.y),
-            ] {
+    // Requirement 7, positively: every corner of the walkable room, at every
+    // settled heading and at two tween samples of the turn that leaves it,
+    // framed with at least 32 logical pixels of viewport margin. Movement keeps
+    // the technician a radius off the wall, so the followed position is the
+    // reachable corner and the wall corner itself is checked as a framed point.
+    for (corner, wall) in reachable_room_corners()
+        .into_iter()
+        .zip(room_corners(ROOM_SIZE * 0.5))
+    {
+        for heading in CameraHeading::ALL {
+            for frames in [0, QUARTER_TURN_FRAMES / 2, QUARTER_TURN_FRAMES / 4] {
                 place_player(&mut app, corner);
-                app.update();
+                orbit_to(&mut app, heading, frames);
                 let yaw = orbit(&app).yaw_radians();
-                let (_, max) = camera_target_bounds(ROOM_SIZE, yaw).expect("legal rectangle");
-                let target = camera_ground_target(&mut app);
-
-                assert!(
-                    (target.abs() - max).abs().max_element() < 1.0e-3,
-                    "yaw {} at corner {corner:?} should sit on the legal edge {max:?}, got {target:?}",
-                    yaw.to_degrees()
-                );
-                for ground in ground_quadrilateral(yaw, target) {
-                    assert!(
-                        ground.x.abs() <= half.x + 1.0e-3 && ground.y.abs() <= half.y + 1.0e-3,
-                        "yaw {} at corner {corner:?} leaked to {ground:?}",
+                let settled = CameraHeading::from_yaw_degrees(yaw.to_degrees());
+                if frames == 0 {
+                    assert_eq!(
+                        settled,
+                        Some(heading),
+                        "frames 0 must be the settled {heading:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        settled,
+                        None,
+                        "frames {frames} must sample a yaw between headings, got {} degrees",
                         yaw.to_degrees()
                     );
                 }
+
+                for point in [corner, wall] {
+                    let margin = framing_margin(&mut app, point);
+                    assert!(
+                        margin >= FRAMING_MARGIN_PIXELS,
+                        "yaw {} framed room corner {point:?} with only {margin} px of margin",
+                        yaw.to_degrees()
+                    );
+                }
+
+                // The apron makes the corner reachable by the camera itself, so
+                // the technician is not merely on screen: it is centred, with
+                // the full half-viewport of margin a followed point gets.
+                let projected = viewport_of(&mut app, corner);
+                assert!(
+                    (projected - size * 0.5).abs().max_element() < 0.5,
+                    "yaw {} should centre room corner {corner:?}, projected to {projected:?}",
+                    yaw.to_degrees()
+                );
+                let margin = framing_margin(&mut app, corner);
+                assert!(
+                    (margin - centre_margin).abs() < 1.0,
+                    "a centred corner should keep the full {centre_margin} px of margin, got {margin}"
+                );
             }
         }
     }
 }
 
 #[test]
-fn camera_orbit_room_corner_framing_is_impossible_under_the_fixed_contract() {
-    // Recorded plan defect. Task 5 asks for both a camera that never shows
-    // anything outside the room and a technician framed at every room corner.
-    // At a diagonal heading the two cannot hold together for any room size.
-    //
-    // At yaw 45 the whole diagonal footprint separates the legal target from
-    // the corner, so the technician sits
-    // `ORTHOGRAPHIC_WIDTH / 2 - PLAYER_RADIUS * sqrt(2)` metres beyond the far
-    // ground edge. The room size cancels out of that expression: framing a
-    // corner would need `ORTHOGRAPHIC_WIDTH <= 2 * PLAYER_RADIUS * sqrt(2)`,
-    // which is 0.99 m rather than the reviewed 26 m.
+fn camera_orbit_holds_the_rendered_apron_instead_of_leaking_past_it() {
     let mut app = walking_hall(&repo_assets());
-    let corner = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
-    orbit_to(&mut app, CameraHeading::NorthEast, 0);
-    place_player(&mut app, corner);
-    app.update();
+    let coverage = RENDER_COVERAGE_SIZE * 0.5;
+    let half_room = ROOM_SIZE * 0.5;
+    let mut overhung_the_room = false;
 
-    let yaw = orbit(&app).yaw_radians();
-    let basis = ViewBasis::from_yaw_radians(yaw);
-    let target = camera_ground_target(&mut app);
-    let behind = (corner - target).dot(basis.forward());
-    let half_depth = ground_half_depth();
-    let overshoot = -behind - half_depth;
+    // Containment is now measured against the rendered coverage the apron
+    // covers, not the walkable room. The camera is free to overhang the room --
+    // it must, to centre a corner -- but never the apron.
+    for heading in CameraHeading::ALL {
+        for frames in [0, QUARTER_TURN_FRAMES / 2, QUARTER_TURN_FRAMES / 4] {
+            for corner in room_corners(ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS)) {
+                place_player(&mut app, corner);
+                orbit_to(&mut app, heading, frames);
+                let yaw = orbit(&app).yaw_radians();
+                let target = camera_ground_target(&mut app);
 
-    let closed_form = ORTHOGRAPHIC_WIDTH * 0.5 - PLAYER_RADIUS * std::f32::consts::SQRT_2;
+                assert!(
+                    (target - corner).abs().max_element() < 1.0e-3,
+                    "yaw {} at corner {corner:?} should follow it exactly, got {target:?}",
+                    yaw.to_degrees()
+                );
+                for ground in ground_quadrilateral(yaw, target) {
+                    assert!(
+                        ground.x.abs() <= coverage.x + 1.0e-3
+                            && ground.y.abs() <= coverage.y + 1.0e-3,
+                        "yaw {} at corner {corner:?} leaked past the apron to {ground:?}",
+                        yaw.to_degrees()
+                    );
+                    overhung_the_room |=
+                        ground.x.abs() > half_room.x || ground.y.abs() > half_room.y;
+                }
+            }
+        }
+    }
+
     assert!(
-        (overshoot - closed_form).abs() < 1.0e-3 && (overshoot - 12.505).abs() < 1.0e-2,
-        "the corner technician should fall 12.505 m past the far edge, got {overshoot}"
+        overhung_the_room,
+        "the apron is load bearing: a cornered technician must put ground outside the 40 m room on screen"
     );
-    let off_screen_pixels = overshoot * CAMERA_ELEVATION_DEGREES.to_radians().sin()
-        / ORTHOGRAPHIC_HEIGHT
-        * DEFAULT_WINDOW_HEIGHT as f32;
     assert!(
-        (off_screen_pixels - 516.3).abs() < 1.0,
-        "the corner technician should be 516 px off screen, got {off_screen_pixels}"
+        coverage_holds_room(ROOM_SIZE, RENDER_COVERAGE_SIZE, 0.0),
+        "the authored apron must hold the whole walkable room"
     );
-    assert!(
-        framing_margin(&mut app, corner) < 0.0,
-        "the recorded defect requires the corner technician to be off screen"
+}
+
+#[test]
+fn camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach() {
+    // The apron is the thing that makes the relaxed containment rule sound: the
+    // whole ground quadrilateral, at every legal player position and every yaw,
+    // must land on authored apron geometry rather than on the clear colour.
+    let scene = SceneBlueprint::v0();
+    let apron = scene
+        .visual("render-apron")
+        .expect("the authored blueprint must carry the rendered-coverage apron");
+    let apron_half = Vec2::new(apron.transform.scale.x, apron.transform.scale.z) * 0.5;
+    assert!(apron_half.x >= RENDER_COVERAGE_SIZE.x * 0.5);
+    assert!(apron_half.y >= RENDER_COVERAGE_SIZE.y * 0.5);
+    assert!(scene.collider("render-apron").is_none());
+    assert!(!apron.collision_required);
+    assert_eq!(
+        apron.transform.translation,
+        Vec3::new(0.0, -RENDER_APRON_DROP, 0.0)
     );
 
-    // The algebra, not the authored room, is what makes this unreachable.
-    let widest_framable_view = 2.0 * PLAYER_RADIUS * std::f32::consts::SQRT_2;
+    let reachable = ROOM_SIZE * 0.5;
+    // The apron size is not arbitrary. Following a technician standing at a
+    // room corner overhangs the room by up to `hypot(13, 8.71916)` m, so the
+    // rendered coverage has to be at least `2 * (20 + 15.6532)` m.
+    let widest = (ORTHOGRAPHIC_WIDTH * 0.5).hypot(ground_half_depth());
     assert!(
-        (widest_framable_view - 0.9899).abs() < 1.0e-3,
-        "the widest corner-framing view should be 0.99 m, got {widest_framable_view}"
+        (widest - 15.653_2).abs() < 1.0e-3,
+        "the widest camera overhang should be 15.6532 m, got {widest}"
+    );
+    let required = 2.0 * (ROOM_SIZE.x * 0.5 + widest);
+    assert!(
+        (required - 71.306_5).abs() < 1.0e-2,
+        "the rendered coverage must be at least 71.3065 m, got {required}"
     );
     assert!(
-        ORTHOGRAPHIC_WIDTH > widest_framable_view,
-        "the reviewed 26 m view is far wider than any corner-framing view"
+        RENDER_COVERAGE_SIZE.x >= required && RENDER_COVERAGE_SIZE.y >= required,
+        "the authored {RENDER_COVERAGE_SIZE:?} apron must cover {required} m"
     );
-    for room in [40.0_f32, 60.0, 120.0] {
-        let size = Vec2::splat(room);
-        let reachable = size * 0.5 - Vec2::splat(PLAYER_RADIUS);
-        let target = clamp_follow_target(reachable, size, yaw);
-        let behind = -(reachable - target).dot(basis.forward());
-        assert!(
-            behind > half_depth,
-            "a {room} m room still cannot frame its corner: {behind} m of {half_depth} m"
-        );
+
+    for step in 0..720 {
+        let yaw = (step as f32 * 0.5).to_radians();
+        for player in framing_samples()
+            .into_iter()
+            .chain(room_corners(reachable))
+            .chain([Vec2::new(0.0, reachable.y), Vec2::new(reachable.x, 0.0)])
+        {
+            let target = clamp_follow_target(player, RENDER_COVERAGE_SIZE, yaw);
+            assert_eq!(
+                target,
+                player,
+                "yaw {} must follow the legal position {player:?}",
+                yaw.to_degrees()
+            );
+            for ground in ground_quadrilateral(yaw, target) {
+                assert!(
+                    ground.x.abs() <= apron_half.x + 1.0e-3
+                        && ground.y.abs() <= apron_half.y + 1.0e-3,
+                    "yaw {} at {player:?} put ground {ground:?} outside the authored apron",
+                    yaw.to_degrees()
+                );
+            }
+        }
     }
 }
