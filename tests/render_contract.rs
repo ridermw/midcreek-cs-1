@@ -3322,6 +3322,91 @@ struct Banned {
     identities: Vec<String>,
 }
 
+/// The authority of one value, when the value really has one.
+///
+/// Split out so the host is read from a parsed position rather than found by
+/// searching, which is the whole difference between this and a substring test.
+#[derive(Debug, Eq, PartialEq)]
+struct Authority<'a> {
+    /// The user half of any `user@host` or `user:secret@host` prefix.
+    userinfo: Option<&'a str>,
+    /// The host itself, with any port removed and any IPv6 brackets stripped.
+    host: &'a str,
+}
+
+/// Reads the authority out of a URL or a bare `host:port`, or reports that
+/// this value has neither.
+///
+/// The refusal is as important as the parse. A relative path has no authority,
+/// and treating its first segment as one would put `assets` back in the firing
+/// line for a login of `assets` — the exact false positive the identity rules
+/// exist to avoid. So a value is only read as an authority when it carries one
+/// of the three markers that can mean nothing else: a scheme, an `@`, or a
+/// numeric port. `rack-row-01:segment-3` has a colon and no port, and is not
+/// an authority.
+///
+/// IPv6 literals are bracketed precisely because their colons are not port
+/// separators, so the brackets are consumed before any port is looked for;
+/// `[::1]:443` is host `::1` on port 443, and `[::1]` is host `::1`.
+fn authority_of(value: &str) -> Option<Authority<'_>> {
+    let after_scheme = match value.split_once("://") {
+        Some((scheme, rest))
+            if !scheme.is_empty()
+                && scheme.chars().all(|char| {
+                    char.is_ascii_alphanumeric() || matches!(char, '+' | '-' | '.')
+                }) =>
+        {
+            Some(rest)
+        }
+        _ => None,
+    };
+    let candidate = after_scheme
+        .unwrap_or(value)
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|segment| !segment.is_empty())?;
+
+    let (userinfo, host_port) = match candidate.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, candidate),
+    };
+
+    let (host, ported) = if let Some(rest) = host_port.strip_prefix('[') {
+        // A bracketed literal: everything to the closing bracket is the host,
+        // and only what follows it may be a port.
+        let (inside, after) = rest.split_once(']')?;
+        match after.strip_prefix(':') {
+            Some(port) if port.chars().all(|char| char.is_ascii_digit()) && !port.is_empty() => {
+                (inside, true)
+            }
+            Some(_) => return None,
+            None if after.is_empty() => (inside, true),
+            None => return None,
+        }
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((host, port))
+                if !port.is_empty() && port.chars().all(|char| char.is_ascii_digit()) =>
+            {
+                (host, true)
+            }
+            // A colon that is not a port means this was never an authority.
+            Some(_) => return None,
+            None => (host_port, false),
+        }
+    };
+
+    // Without a scheme, a bare word is just a path segment. It only becomes an
+    // authority once it carries userinfo or a port.
+    if after_scheme.is_none() && userinfo.is_none() && !ported {
+        return None;
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some(Authority { userinfo, host })
+}
+
 /// Whether one string value leaks `identity` — the login or the machine name —
 /// in a place where the match actually means something.
 ///
@@ -3336,11 +3421,21 @@ struct Banned {
 /// A leak is the identity standing where an identity stands:
 ///
 /// * as the entire value, which is a bare login or machine name and can be
-///   nothing else; or
+///   nothing else;
 /// * as the component directly beneath a home or user root —
 ///   `home/asset/frames`, `Users/asset/frames` — which is the shape a home
 ///   directory takes when it reaches the document with its leading separator
-///   stripped.
+///   stripped; or
+/// * as the host, one label of the host, or the user of an endpoint —
+///   `https://build-host/api`, `build-host:443`,
+///   `wss://build-host:443/socket`, `https://ci@build-host/queue`. A machine
+///   name reaches a document as an endpoint at least as often as it reaches
+///   one as a directory, and none of those spellings puts the host where
+///   either of the rules above would look.
+///
+/// The host is read from a parsed authority, never searched for, so
+/// `https://cdn.example.com/frame.png` does not leak a host called `png` and
+/// `assets/generated/hall.glb` is not an endpoint at all.
 ///
 /// Absolute paths are refused outright elsewhere, so this only has to catch
 /// the relative spellings that survive that check.
@@ -3355,9 +3450,23 @@ fn leaks_identity(value: &str, identity: &str) -> bool {
         return true;
     }
     let components = value.split(['/', '\\']).collect::<Vec<_>>();
-    components
+    if components
         .windows(2)
         .any(|pair| USER_ROOTS.contains(&pair[0]) && pair[1] == identity)
+    {
+        return true;
+    }
+    let Some(authority) = authority_of(value) else {
+        return false;
+    };
+    if authority
+        .userinfo
+        .and_then(|user| user.split(':').next())
+        .is_some_and(|user| user == identity)
+    {
+        return true;
+    }
+    authority.host == identity || authority.host.split('.').any(|label| label == identity)
 }
 
 /// Whether one string value is an absolute path in any form the report might
@@ -3552,6 +3661,86 @@ fn the_privacy_scan_reads_paths_and_keys_rather_than_bare_words() {
     }
 }
 
+/// The authority parser reads a host from a parsed position, and refuses
+/// values that have no authority at all.
+///
+/// This is the boundary the endpoint rule rests on. If a relative path could
+/// be read as an authority then a login of `assets` would condemn every
+/// generated asset path again, so the refusals matter at least as much as the
+/// parses.
+#[test]
+fn the_authority_parser_finds_hosts_and_refuses_everything_else() {
+    let host = |value: &str| authority_of(value).map(|authority| authority.host.to_owned());
+    let user = |value: &str| {
+        authority_of(value).and_then(|authority| authority.userinfo.map(str::to_owned))
+    };
+
+    // Schemes, ports, and userinfo in every combination the report might see.
+    assert_eq!(
+        host("https://build-host/api").as_deref(),
+        Some("build-host")
+    );
+    assert_eq!(host("http://build-host").as_deref(), Some("build-host"));
+    assert_eq!(host("build-host:443").as_deref(), Some("build-host"));
+    assert_eq!(
+        host("wss://build-host:443/socket").as_deref(),
+        Some("build-host")
+    );
+    assert_eq!(
+        host("https://build-host.corp.example.com/queue?job=1#top").as_deref(),
+        Some("build-host.corp.example.com")
+    );
+    assert_eq!(
+        host("https://ci@build-host/queue").as_deref(),
+        Some("build-host")
+    );
+    assert_eq!(user("https://ci@build-host/queue").as_deref(), Some("ci"));
+    assert_eq!(
+        user("https://ci:secret@build-host/queue").as_deref(),
+        Some("ci:secret")
+    );
+    assert_eq!(host("ci@build-host").as_deref(), Some("build-host"));
+
+    // Bracketed IPv6: the colons inside the brackets are not port separators,
+    // and the brackets are not part of the host.
+    assert_eq!(host("https://[::1]:443/x").as_deref(), Some("::1"));
+    assert_eq!(host("https://[::1]/x").as_deref(), Some("::1"));
+    assert_eq!(
+        host("https://[2001:db8::1]:8443/frames").as_deref(),
+        Some("2001:db8::1")
+    );
+    assert_eq!(
+        host("https://ci@[2001:db8::1]:8443/frames").as_deref(),
+        Some("2001:db8::1")
+    );
+    assert_eq!(host("[::1]:443").as_deref(), Some("::1"));
+    // An unterminated or malformed bracket is not an authority rather than a
+    // panic or a half-read host.
+    assert_eq!(host("https://[::1/x"), None);
+    assert_eq!(host("https://[::1]443/x"), None);
+
+    // Everything the report actually carries has no authority at all.
+    for ordinary in [
+        "assets/generated/hall.glb",
+        "assets",
+        "src/verification.rs",
+        "01-healthy-center-ne.png",
+        "midcreek-cs-1",
+        "begin-repair",
+        "0xce115a1fda7ace01",
+        // A colon with a non-numeric right-hand side is not a port.
+        "rack-row-01:segment-3",
+        "C:\\Users\\someone",
+        "",
+    ] {
+        assert_eq!(
+            authority_of(ordinary),
+            None,
+            "{ordinary:?} has no authority and must not be read as one"
+        );
+    }
+}
+
 /// A login or a machine name is an ordinary word, and the report is full of
 /// ordinary words.
 ///
@@ -3584,6 +3773,19 @@ fn a_short_login_or_host_name_does_not_condemn_the_paths_that_contain_it() {
             document("\"rack-row-01\""),
             document("\"midcreek-cs-1\""),
             "{\"repaired_rack\": 1}".to_owned(),
+            // The identity inside a longer word, and inside a host label that
+            // merely contains it. A parsed host is compared whole, so a
+            // neighbouring label never counts.
+            document(&format!("\"{identity}s/generated/hall.glb\"")),
+            document(&format!("\"https://{identity}s.example.com/api\"")),
+            document(&format!("\"https://build-{identity}-mirror.example.com/\"")),
+            // The identity in the path or query of an endpoint, never in its
+            // authority.
+            document(&format!("\"https://build.example.com/{identity}/frames\"")),
+            document(&format!("\"https://build.example.com/api?who={identity}\"")),
+            // A colon that is not a port, so this was never an authority.
+            document(&format!("\"{identity}:segment-3\"")),
+            document("\"rack-row-01:segment-3\""),
         ] {
             let found = scan_violations(&innocent, &banned);
             assert!(
@@ -3598,6 +3800,17 @@ fn a_short_login_or_host_name_does_not_condemn_the_paths_that_contain_it() {
             document(&format!("\"home/{identity}/frames\"")),
             document(&format!("\"home/{identity}/work/midcreek/report.json\"")),
             document(&format!("\"Users\\\\{identity}\\\\frames\"")),
+            // Endpoint forms. A machine name reaches a document as a URL at
+            // least as often as it reaches one as a directory, and none of
+            // these puts the host anywhere the path rules would look.
+            document(&format!("\"https://{identity}/api\"")),
+            document(&format!("\"http://{identity}\"")),
+            document(&format!("\"{identity}:443\"")),
+            document(&format!("\"wss://{identity}:443/socket\"")),
+            document(&format!("\"https://{identity}.corp.example.com/queue\"")),
+            document(&format!("\"https://ci@{identity}/queue\"")),
+            document(&format!("\"https://{identity}@build.example.com/queue\"")),
+            document(&format!("\"https://{identity}:secret@build.example.com/\"")),
         ] {
             let found = scan_violations(&leak, &banned);
             assert!(
