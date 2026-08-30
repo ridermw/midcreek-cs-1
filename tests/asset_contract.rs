@@ -8,9 +8,10 @@ use std::{
 use midcreek_cs_1::{
     assetgen::{
         ASSET_MODULES, ASSET_NAMES, AssetGenError, GENERATED_DIR, GENERATOR_NAME,
-        MAX_PRIMITIVES_PER_MESH, MAX_TRIANGLES_PER_ASSET, MAX_VERTICES_PER_PRIMITIVE, SOURCE_DIR,
-        TECHNICIAN_BONES, TECHNICIAN_CLIPS, check_assets, generate_assets, generated_path,
-        load_source, parse_source, source_path, write_assets,
+        MAX_BONES_PER_RIG, MAX_PRIMITIVES_PER_MESH, MAX_TRIANGLES_PER_ASSET,
+        MAX_VERTICES_PER_PRIMITIVE, SOURCE_DIR, TECHNICIAN_BONES, TECHNICIAN_CLIPS, check_assets,
+        generate_assets, generate_glb, generated_path, load_source, parse_source, source_path,
+        write_assets,
     },
     design::PaletteRole,
 };
@@ -174,6 +175,11 @@ fn invariant_violations_report_the_offending_field() {
         ("duplicate-module.ron", "modules", "rack-row"),
         ("degenerate-box.ron", "half_extents", "half extent"),
         ("unsorted-keys.ron", "keys", "ascending"),
+        (
+            "duplicate-clip-name.ron",
+            "clips[0].name",
+            "document scoped",
+        ),
     ];
 
     for (fixture_name, expected_field, expected_message) in cases {
@@ -202,6 +208,68 @@ fn invariant_violations_report_the_offending_field() {
 
 fn fixture(name: &str) -> PathBuf {
     repo_root().join("tests/fixtures/assetgen").join(name)
+}
+
+#[test]
+fn generation_rejects_a_source_over_the_triangle_budget() {
+    let text = fs::read_to_string(fixture("over-triangle-budget.ron"))
+        .expect("fixture should be readable");
+    let path = "assets/source/over-triangle-budget.ron";
+    let source = parse_source(&text, path).expect("the fixture is schema valid");
+
+    let error = generate_glb(&source, path).expect_err("generation must enforce the budget");
+    let AssetGenError::Invalid {
+        path: reported,
+        field,
+        message,
+    } = &error
+    else {
+        panic!("expected an invariant error, got {error:?}");
+    };
+    assert_eq!(reported, path);
+    assert!(
+        field.contains("shapes"),
+        "field {field} should name the shapes"
+    );
+    assert!(
+        message.contains("triangle") && message.contains(&MAX_TRIANGLES_PER_ASSET.to_string()),
+        "message {message} should name the triangle budget"
+    );
+}
+
+#[test]
+fn a_rig_may_not_exceed_the_joint_byte_encoding() {
+    let mut bones = String::new();
+    for index in 0..=MAX_BONES_PER_RIG {
+        let parent = if index == 0 {
+            "None".to_owned()
+        } else {
+            format!("Some(\"bone-{}\")", index - 1)
+        };
+        bones.push_str(&format!(
+            "(name: \"bone-{index}\", parent: {parent}, translation: (0.0, 0.01, 0.0)),\n"
+        ));
+    }
+    let text = format!(
+        "(asset: \"too-many-bones\", modules: [(name: \"too-many-bones\", \
+         rig: Some((skin_node: \"too-many-bones-skin\", bones: [{bones}], clips: [])), \
+         shapes: [(name: \"body\", role: WorkerSlate, bone: Some(\"bone-0\"), \
+         primitive: Box(center: (0.0, 0.5, 0.0), half_extents: (0.1, 0.1, 0.1)))])])"
+    );
+    let path = "assets/source/too-many-bones.ron";
+
+    let error = parse_source(&text, path).expect_err("a 257 bone rig must be rejected");
+    let AssetGenError::Invalid { field, message, .. } = &error else {
+        panic!("expected an invariant error, got {error:?}");
+    };
+    assert!(
+        field.contains("bones"),
+        "field {field} should name the bones"
+    );
+    assert!(
+        message.contains(&MAX_BONES_PER_RIG.to_string()),
+        "message {message} should name the {MAX_BONES_PER_RIG} bone budget"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -672,10 +740,290 @@ fn technician_declares_the_three_required_clips() {
     }
 }
 
+/// Column major 4x4, matching the layout the `gltf` crate returns.
+type Mat4 = [[f32; 4]; 4];
+/// Translation, rotation (xyzw), scale.
+type Trs = ([f32; 3], [f32; 4], [f32; 3]);
+
+const IDENTITY: Mat4 = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+fn mat_mul(left: Mat4, right: Mat4) -> Mat4 {
+    let mut out = [[0.0f32; 4]; 4];
+    for (column, target) in out.iter_mut().enumerate() {
+        for (row, cell) in target.iter_mut().enumerate() {
+            *cell = (0..4).map(|k| left[k][row] * right[column][k]).sum();
+        }
+    }
+    out
+}
+
+fn mat_from_trs((translation, rotation, scale): Trs) -> Mat4 {
+    let [x, y, z, w] = rotation;
+    let columns = [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y + z * w),
+            2.0 * (x * z - y * w),
+        ],
+        [
+            2.0 * (x * y - z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z + x * w),
+        ],
+        [
+            2.0 * (x * z + y * w),
+            2.0 * (y * z - x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ];
+    [
+        [
+            columns[0][0] * scale[0],
+            columns[0][1] * scale[0],
+            columns[0][2] * scale[0],
+            0.0,
+        ],
+        [
+            columns[1][0] * scale[1],
+            columns[1][1] * scale[1],
+            columns[1][2] * scale[1],
+            0.0,
+        ],
+        [
+            columns[2][0] * scale[2],
+            columns[2][1] * scale[2],
+            columns[2][2] * scale[2],
+            0.0,
+        ],
+        [translation[0], translation[1], translation[2], 1.0],
+    ]
+}
+
+fn transform_point(matrix: Mat4, point: [f32; 3]) -> [f32; 3] {
+    let mut out = [0.0f32; 3];
+    for (row, value) in out.iter_mut().enumerate() {
+        *value = matrix[0][row] * point[0]
+            + matrix[1][row] * point[1]
+            + matrix[2][row] * point[2]
+            + matrix[3][row];
+    }
+    out
+}
+
+fn rest_pose(loaded: &Loaded) -> BTreeMap<usize, Trs> {
+    loaded
+        .document
+        .nodes()
+        .map(|node| (node.index(), node.transform().decomposed()))
+        .collect()
+}
+
+/// Locates `time` inside a sampler input list, returning the bracketing key
+/// indices and the normalized position between them.
+fn segment(inputs: &[f32], time: f32) -> (usize, usize, f32) {
+    let last = inputs.len() - 1;
+    if time <= inputs[0] {
+        return (0, 0, 0.0);
+    }
+    if time >= inputs[last] {
+        return (last, last, 0.0);
+    }
+    let mut lower = 0usize;
+    while lower + 1 < last && inputs[lower + 1] <= time {
+        lower += 1;
+    }
+    let upper = lower + 1;
+    let span = inputs[upper] - inputs[lower];
+    let fraction = if span > 0.0 {
+        (time - inputs[lower]) / span
+    } else {
+        0.0
+    };
+    (lower, upper, fraction)
+}
+
+fn sample_vec3(inputs: &[f32], outputs: &[[f32; 3]], time: f32) -> [f32; 3] {
+    let (lower, upper, fraction) = segment(inputs, time);
+    let mut out = [0.0f32; 3];
+    for (axis, value) in out.iter_mut().enumerate() {
+        *value = outputs[lower][axis] + (outputs[upper][axis] - outputs[lower][axis]) * fraction;
+    }
+    out
+}
+
+/// Spherical linear interpolation, which is what glTF `LINEAR` means for a
+/// rotation channel.
+fn sample_quaternion(inputs: &[f32], outputs: &[[f32; 4]], time: f32) -> [f32; 4] {
+    let (lower, upper, fraction) = segment(inputs, time);
+    let start = outputs[lower];
+    let mut end = outputs[upper];
+    let mut dot = (0..4).map(|i| start[i] * end[i]).sum::<f32>();
+    if dot < 0.0 {
+        for component in &mut end {
+            *component = -*component;
+        }
+        dot = -dot;
+    }
+    let (start_weight, end_weight) = if dot > 0.999_5 {
+        (1.0 - fraction, fraction)
+    } else {
+        let angle = dot.clamp(-1.0, 1.0).acos();
+        let sine = angle.sin();
+        (
+            ((1.0 - fraction) * angle).sin() / sine,
+            (fraction * angle).sin() / sine,
+        )
+    };
+    let mut out = [0.0f32; 4];
+    for (index, value) in out.iter_mut().enumerate() {
+        *value = start[index] * start_weight + end[index] * end_weight;
+    }
+    let length = out.iter().map(|value| value * value).sum::<f32>().sqrt();
+    assert!(length > 0.0, "interpolated quaternion collapsed to zero");
+    for value in &mut out {
+        *value /= length;
+    }
+    out
+}
+
+/// Evaluates one named clip at `time`, exactly as a conformant renderer does:
+/// every animated node's TRS is replaced, everything else keeps its rest value.
+fn sample_pose(loaded: &Loaded, clip: &str, time: f32) -> BTreeMap<usize, Trs> {
+    let mut pose = rest_pose(loaded);
+    let animation = loaded
+        .document
+        .animations()
+        .find(|animation| animation.name() == Some(clip))
+        .unwrap_or_else(|| panic!("expected an animation named {clip}"));
+
+    for channel in animation.channels() {
+        let reader = channel.reader(|buffer| Some(&loaded.buffers[buffer.index()]));
+        let inputs = reader
+            .read_inputs()
+            .expect("sampler inputs")
+            .collect::<Vec<_>>();
+        let target = channel.target().node().index();
+        let entry = pose
+            .get_mut(&target)
+            .expect("animation channel must target a document node");
+        match reader.read_outputs().expect("sampler outputs") {
+            gltf::animation::util::ReadOutputs::Translations(values) => {
+                let values = values.collect::<Vec<_>>();
+                entry.0 = sample_vec3(&inputs, &values, time);
+            }
+            gltf::animation::util::ReadOutputs::Rotations(values) => {
+                let values = values.into_f32().collect::<Vec<_>>();
+                entry.1 = sample_quaternion(&inputs, &values, time);
+            }
+            gltf::animation::util::ReadOutputs::Scales(values) => {
+                let values = values.collect::<Vec<_>>();
+                entry.2 = sample_vec3(&inputs, &values, time);
+            }
+            gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => {
+                panic!("{clip} animates morph targets, which the pipeline never emits")
+            }
+        }
+    }
+    pose
+}
+
+fn global_transforms(loaded: &Loaded, pose: &BTreeMap<usize, Trs>) -> BTreeMap<usize, Mat4> {
+    fn visit(
+        node: &gltf::Node<'_>,
+        parent: Mat4,
+        pose: &BTreeMap<usize, Trs>,
+        out: &mut BTreeMap<usize, Mat4>,
+    ) {
+        let local = mat_from_trs(pose[&node.index()]);
+        let global = mat_mul(parent, local);
+        out.insert(node.index(), global);
+        for child in node.children() {
+            visit(&child, global, pose, out);
+        }
+    }
+
+    let scene = loaded
+        .document
+        .default_scene()
+        .or_else(|| loaded.document.scenes().next())
+        .expect("document must declare a scene");
+    let mut out = BTreeMap::new();
+    for node in scene.nodes() {
+        visit(&node, IDENTITY, pose, &mut out);
+    }
+    out
+}
+
+/// Computes the bounds a conformant glTF renderer produces for the skinned
+/// technician: for every vertex, the weighted sum over its influences of
+/// `global joint transform * inverse bind matrix * POSITION`.
+fn technician_skinned_bounds(loaded: &Loaded, pose: &BTreeMap<usize, Trs>) -> ([f32; 3], [f32; 3]) {
+    let globals = global_transforms(loaded, pose);
+    let skin_node = node_by_name(loaded, "technician-skin");
+    let skin = skin_node.skin().expect("technician-skin must carry a skin");
+    let inverse_bind = skin
+        .reader(|buffer| Some(&loaded.buffers[buffer.index()]))
+        .read_inverse_bind_matrices()
+        .expect("inverse bind matrices are required")
+        .collect::<Vec<Mat4>>();
+    let joint_matrices = skin
+        .joints()
+        .zip(&inverse_bind)
+        .map(|(joint, matrix)| {
+            mat_mul(
+                *globals
+                    .get(&joint.index())
+                    .expect("every joint must be reachable from the scene"),
+                *matrix,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for primitive in skin_node.mesh().expect("mesh").primitives() {
+        let reader = primitive.reader(|buffer| Some(&loaded.buffers[buffer.index()]));
+        let joints = reader
+            .read_joints(0)
+            .expect("JOINTS_0 is required")
+            .into_u16()
+            .collect::<Vec<_>>();
+        let weights = reader
+            .read_weights(0)
+            .expect("WEIGHTS_0 is required")
+            .into_f32()
+            .collect::<Vec<_>>();
+        for (index, position) in reader.read_positions().expect("positions").enumerate() {
+            let mut skinned = [0.0f32; 3];
+            for influence in 0..4 {
+                let weight = weights[index][influence];
+                if weight == 0.0 {
+                    continue;
+                }
+                let matrix = joint_matrices[joints[index][influence] as usize];
+                let moved = transform_point(matrix, position);
+                for axis in 0..3 {
+                    skinned[axis] += weight * moved[axis];
+                }
+            }
+            for axis in 0..3 {
+                min[axis] = min[axis].min(skinned[axis]);
+                max[axis] = max[axis].max(skinned[axis]);
+            }
+        }
+    }
+    (min, max)
+}
+
 #[test]
 fn technician_has_adult_proportions_and_authored_palette() {
     let loaded = asset("technician");
-    let (min, max) = technician_rest_bounds(&loaded);
+    let (min, max) = technician_skinned_bounds(&loaded, &rest_pose(&loaded));
 
     let height = max[1] - min[1];
     assert!(
@@ -715,39 +1063,84 @@ fn technician_has_adult_proportions_and_authored_palette() {
     }
 }
 
-/// Rebuilds model space bounds for the skinned technician. Vertices are stored
-/// relative to their bone, so the rest pose is the stored position plus the
-/// bone origin recovered from the inverse bind matrix.
-fn technician_rest_bounds(loaded: &Loaded) -> ([f32; 3], [f32; 3]) {
-    let skin_node = node_by_name(loaded, "technician-skin");
-    let skin = skin_node.skin().expect("skin");
-    let origins = skin
-        .reader(|buffer| Some(&loaded.buffers[buffer.index()]))
-        .read_inverse_bind_matrices()
-        .expect("inverse bind matrices")
-        .map(|matrix| [-matrix[3][0], -matrix[3][1], -matrix[3][2]])
-        .collect::<Vec<_>>();
+#[test]
+fn technician_stays_coherent_through_every_clip() {
+    let loaded = asset("technician");
 
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for primitive in skin_node.mesh().expect("mesh").primitives() {
-        let reader = primitive.reader(|buffer| Some(&loaded.buffers[buffer.index()]));
-        let positions = reader.read_positions().expect("positions");
-        let joints = reader
-            .read_joints(0)
-            .expect("joints")
-            .into_u16()
-            .collect::<Vec<_>>();
-        for (index, position) in positions.enumerate() {
-            let origin = origins[joints[index][0] as usize];
-            for axis in 0..3 {
-                let value = position[axis] + origin[axis];
-                min[axis] = min[axis].min(value);
-                max[axis] = max[axis].max(value);
-            }
+    let mut samples = vec![("rest".to_owned(), rest_pose(&loaded))];
+    for animation in loaded.document.animations() {
+        let name = animation.name().expect("clips must be named").to_owned();
+        let duration = animation
+            .channels()
+            .flat_map(|channel| {
+                channel
+                    .reader(|buffer| Some(&loaded.buffers[buffer.index()]))
+                    .read_inputs()
+                    .expect("sampler inputs")
+                    .collect::<Vec<_>>()
+            })
+            .fold(0.0f32, f32::max);
+        assert!(duration > 0.0, "{name} has no duration");
+        for fraction in [0.0, 0.5, 1.0] {
+            let time = duration * fraction;
+            samples.push((
+                format!("{name}@{time:.3}s"),
+                sample_pose(&loaded, &name, time),
+            ));
         }
     }
-    (min, max)
+    let sampled = samples
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect::<Vec<_>>();
+    for required in ["rest", "Walk@0.500s", "Repair@1.000s"] {
+        assert!(
+            sampled.iter().any(|label| label == required),
+            "{required} was not sampled, got {sampled:?}"
+        );
+    }
+
+    for (label, pose) in &samples {
+        let (min, max) = technician_skinned_bounds(&loaded, pose);
+        for axis in 0..3 {
+            assert!(
+                min[axis].is_finite() && max[axis].is_finite(),
+                "{label} produced a non-finite bound"
+            );
+            assert!(
+                min[axis] >= -1.5 && max[axis] <= 2.2,
+                "{label} throws geometry to [{}, {}] on axis {axis}",
+                min[axis],
+                max[axis]
+            );
+        }
+
+        let height = max[1] - min[1];
+        assert!(
+            (1.20..=2.20).contains(&height),
+            "{label} height {height} is implausible for an adult figure"
+        );
+        let width = max[0] - min[0];
+        assert!(
+            (0.30..=1.40).contains(&width),
+            "{label} width {width} is implausible"
+        );
+        let depth = max[2] - min[2];
+        assert!(
+            (0.15..=1.40).contains(&depth),
+            "{label} depth {depth} is implausible"
+        );
+        assert!(
+            (-0.30..=0.25).contains(&min[1]),
+            "{label} loses its floor relationship, lowest point {}",
+            min[1]
+        );
+        assert!(
+            max[1] >= 1.40,
+            "{label} collapses, highest point {}",
+            max[1]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

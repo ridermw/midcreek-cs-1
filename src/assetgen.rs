@@ -77,12 +77,19 @@ pub const MAX_TRIANGLES_PER_ASSET: usize = 24_000;
 /// Vertex budget for a single merged primitive; keeps 16-bit indices valid.
 pub const MAX_VERTICES_PER_PRIMITIVE: usize = 60_000;
 
+/// `JOINTS_0` is written as unsigned bytes, so a rig may declare at most 256
+/// bones. Exceeding this is rejected at validation rather than truncated.
+pub const MAX_BONES_PER_RIG: usize = 256;
+
 const MAX_INSTANCES_PER_SHAPE: usize = 4_096;
 const MAX_REPEAT_COUNT: u32 = 1_024;
 const QUANTIZATION_SCALE: f64 = 1.0e6;
 const MIN_CYLINDER_SEGMENTS: u32 = 3;
 const MAX_CYLINDER_SEGMENTS: u32 = 64;
 const RIGID_WEIGHTS: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+/// Joint slot written for unrigged modules, whose `JOINTS_0` accessor is never
+/// emitted. It is a structural placeholder, not a fallback for a missing bone.
+const UNSKINNED_JOINT: u16 = 0;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -393,6 +400,15 @@ pub fn load_source(root: &Path, name: &str) -> Result<AssetSource, AssetGenError
     Ok(source)
 }
 
+/// Build one binary glTF document from a parsed source.
+///
+/// `path` is used for diagnostics only and never reaches an output file. This
+/// is the same code path [`generate_assets`] uses, exposed so budget and rig
+/// invariants can be exercised against a single document.
+pub fn generate_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError> {
+    build_glb(source, path)
+}
+
 /// Generate every asset in memory, in [`ASSET_NAMES`] order.
 pub fn generate_assets(root: &Path) -> Result<Vec<GeneratedAsset>, AssetGenError> {
     let mut generated = Vec::with_capacity(ASSET_NAMES.len());
@@ -560,6 +576,9 @@ fn validate_source(source: &AssetSource, path: &str) -> Result<(), AssetGenError
     )?;
 
     let mut module_names = BTreeSet::new();
+    // glTF animations live on the document, not on a skin, so clip names must be
+    // unique across every rigged module in one source.
+    let mut animation_names = BTreeSet::new();
     for (module_index, module) in source.modules.iter().enumerate() {
         let module_field = format!("modules[{module_index}]");
         validator.require(
@@ -579,7 +598,7 @@ fn validate_source(source: &AssetSource, path: &str) -> Result<(), AssetGenError
         )?;
 
         let bone_names = match &module.rig {
-            Some(rig) => validate_rig(&validator, rig, &module_field)?,
+            Some(rig) => validate_rig(&validator, rig, &module_field, &mut animation_names)?,
             None => BTreeSet::new(),
         };
 
@@ -709,6 +728,7 @@ fn validate_rig(
     validator: &Validator<'_>,
     rig: &RigSource,
     module_field: &str,
+    animation_names: &mut BTreeSet<String>,
 ) -> Result<BTreeSet<String>, AssetGenError> {
     let rig_field = format!("{module_field}.rig");
     validator.require(
@@ -720,6 +740,15 @@ fn validate_rig(
         !rig.bones.is_empty(),
         format!("{rig_field}.bones"),
         "at least one bone is required",
+    )?;
+    validator.require(
+        rig.bones.len() <= MAX_BONES_PER_RIG,
+        format!("{rig_field}.bones"),
+        format!(
+            "{} bones exceed the {MAX_BONES_PER_RIG} bone budget of the unsigned byte JOINTS_0 \
+             encoding",
+            rig.bones.len()
+        ),
     )?;
 
     let mut names = BTreeSet::new();
@@ -764,6 +793,15 @@ fn validate_rig(
             clip_names.insert(clip.name.clone()),
             format!("{clip_field}.name"),
             format!("duplicate clip name {}", clip.name),
+        )?;
+        validator.require(
+            animation_names.insert(clip.name.clone()),
+            format!("{clip_field}.name"),
+            format!(
+                "duplicate animation name {} across rigged modules; glTF animation names are \
+                 document scoped",
+                clip.name
+            ),
         )?;
         validator.require(
             clip.duration.is_finite() && clip.duration > 0.0,
@@ -1107,8 +1145,7 @@ struct ModuleGeometry {
 
 fn build_module_geometry(
     module: &ModuleSource,
-    bone_origins: &BTreeMap<String, [f64; 3]>,
-    bone_order: &BTreeMap<String, u16>,
+    layout: Option<&RigLayout>,
     path: &str,
     module_field: &str,
 ) -> Result<ModuleGeometry, AssetGenError> {
@@ -1116,23 +1153,34 @@ fn build_module_geometry(
 
     for (shape_index, shape) in module.shapes.iter().enumerate() {
         let field = format!("{module_field}.shapes[{shape_index}]");
-        let joint = shape
-            .bone
-            .as_ref()
-            .and_then(|bone| bone_order.get(bone).copied())
-            .unwrap_or(0);
-        let origin = shape
-            .bone
-            .as_ref()
-            .and_then(|bone| bone_origins.get(bone).copied())
-            .unwrap_or([0.0, 0.0, 0.0]);
+        let invalid = |message: String| AssetGenError::Invalid {
+            path: path.to_owned(),
+            field: format!("{field}.bone"),
+            message,
+        };
+        // Authored positions stay in model space: glTF skinning multiplies each
+        // vertex by `global joint transform * inverse bind matrix`, which is the
+        // identity in the rest pose. Rebasing here would collapse the figure.
+        let joint = match (layout, &shape.bone) {
+            (Some(layout), Some(bone)) => layout
+                .order
+                .get(bone)
+                .copied()
+                .ok_or_else(|| invalid(format!("unknown bone {bone}")))?,
+            (None, None) => UNSKINNED_JOINT,
+            (Some(_), None) => {
+                return Err(invalid(
+                    "a rigged module requires every shape to declare a bone".to_owned(),
+                ));
+            }
+            (None, Some(bone)) => {
+                return Err(invalid(format!(
+                    "shape declares bone {bone} but the module has no rig"
+                )));
+            }
+        };
 
-        for offset in instance_offsets(&shape.repeat) {
-            let translation = [
-                offset[0] - origin[0],
-                offset[1] - origin[1],
-                offset[2] - origin[2],
-            ];
+        for translation in instance_offsets(&shape.repeat) {
             emit_shape(&mut roles, shape, translation, joint, 0.0, shape.role).map_err(
                 |message| AssetGenError::Invalid {
                     path: path.to_owned(),
@@ -1322,13 +1370,14 @@ fn index_bytes(values: &[u16]) -> Vec<u8> {
     bytes
 }
 
-fn joint_bytes(values: &[u16]) -> Vec<u8> {
+fn joint_bytes(values: &[u16]) -> Result<Vec<u8>, u16> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for value in values {
-        bytes.push(u8::try_from(*value).unwrap_or(u8::MAX));
+        let slot = u8::try_from(*value).map_err(|_| *value)?;
+        bytes.push(slot);
         bytes.extend_from_slice(&[0, 0, 0]);
     }
-    bytes
+    Ok(bytes)
 }
 
 fn matrix_bytes(values: &[[f32; 16]]) -> Vec<u8> {
@@ -1378,15 +1427,30 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
     builder.root.extensions_used = vec!["KHR_materials_unlit".to_owned()];
 
     let mut materials: BTreeMap<usize, json::Index<json::Material>> = BTreeMap::new();
+    let mut total_triangles = 0usize;
 
     for (module_index, module) in source.modules.iter().enumerate() {
         let module_field = format!("modules[{module_index}]");
-        let (bone_origins, bone_order) = match &module.rig {
-            Some(rig) => rig_layout(rig),
-            None => (BTreeMap::new(), BTreeMap::new()),
+        let layout = match &module.rig {
+            Some(rig) => Some(rig_layout(rig, path, &module_field)?),
+            None => None,
         };
-        let geometry =
-            build_module_geometry(module, &bone_origins, &bone_order, path, &module_field)?;
+        let geometry = build_module_geometry(module, layout.as_ref(), path, &module_field)?;
+        total_triangles += geometry
+            .roles
+            .values()
+            .map(|role| role.indices.len() / 3)
+            .sum::<usize>();
+        if total_triangles > MAX_TRIANGLES_PER_ASSET {
+            return Err(AssetGenError::Invalid {
+                path: path.to_owned(),
+                field: format!("{module_field}.shapes"),
+                message: format!(
+                    "{total_triangles} triangles exceed the {MAX_TRIANGLES_PER_ASSET} triangle \
+                     budget for one asset"
+                ),
+            });
+        }
         let skinned = module.rig.is_some();
         let mesh = push_mesh(
             &mut builder,
@@ -1394,13 +1458,15 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
             &geometry,
             &format!("{}-mesh", module.name),
             skinned,
-        );
+            path,
+            &module_field,
+        )?;
 
         let root_index = builder.root.nodes.len();
         builder.root.nodes.push(json::Node::default());
         let mut children = Vec::new();
 
-        if let Some(rig) = &module.rig {
+        if let (Some(rig), Some(layout)) = (&module.rig, layout.as_ref()) {
             let skin_index = json::Index::push(
                 &mut builder.root.nodes,
                 json::Node {
@@ -1423,7 +1489,8 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
                 let Some(parent) = &bone.parent else {
                     continue;
                 };
-                let parent_index = bone_order
+                let parent_index = layout
+                    .order
                     .get(parent)
                     .copied()
                     .expect("validation guarantees the parent bone exists")
@@ -1444,8 +1511,19 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
             let matrices = rig
                 .bones
                 .iter()
-                .map(|bone| inverse_bind_matrix(bone_origins[&bone.name]))
-                .collect::<Vec<_>>();
+                .map(|bone| {
+                    layout
+                        .origins
+                        .get(&bone.name)
+                        .copied()
+                        .map(inverse_bind_matrix)
+                        .ok_or_else(|| AssetGenError::Invalid {
+                            path: path.to_owned(),
+                            field: format!("{module_field}.rig.bones"),
+                            message: format!("bone {} has no resolved bind origin", bone.name),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let inverse_bind = builder.push_accessor(AccessorRequest {
                 bytes: &matrix_bytes(&matrices),
                 target: None,
@@ -1508,15 +1586,29 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
     Ok(glb_container(&json_bytes, &builder.bin))
 }
 
-fn rig_layout(rig: &RigSource) -> (BTreeMap<String, [f64; 3]>, BTreeMap<String, u16>) {
+/// Resolved rest-pose data for one rig: each bone's global bind origin and its
+/// joint index.
+struct RigLayout {
+    origins: BTreeMap<String, [f64; 3]>,
+    order: BTreeMap<String, u16>,
+}
+
+fn rig_layout(rig: &RigSource, path: &str, module_field: &str) -> Result<RigLayout, AssetGenError> {
+    let rig_field = format!("{module_field}.rig");
     let mut origins = BTreeMap::new();
     let mut order = BTreeMap::new();
     for (index, bone) in rig.bones.iter().enumerate() {
-        let parent_origin = bone
-            .parent
-            .as_ref()
-            .and_then(|parent| origins.get(parent).copied())
-            .unwrap_or([0.0, 0.0, 0.0]);
+        let parent_origin = match &bone.parent {
+            None => [0.0, 0.0, 0.0],
+            Some(parent) => origins
+                .get(parent)
+                .copied()
+                .ok_or_else(|| AssetGenError::Invalid {
+                    path: path.to_owned(),
+                    field: format!("{rig_field}.bones[{index}].parent"),
+                    message: format!("unknown or forward referenced parent bone {parent}"),
+                })?,
+        };
         origins.insert(
             bone.name.clone(),
             [
@@ -1525,9 +1617,17 @@ fn rig_layout(rig: &RigSource) -> (BTreeMap<String, [f64; 3]>, BTreeMap<String, 
                 parent_origin[2] + bone.translation[2],
             ],
         );
-        order.insert(bone.name.clone(), index as u16);
+        let slot = u16::try_from(index).map_err(|_| AssetGenError::Invalid {
+            path: path.to_owned(),
+            field: format!("{rig_field}.bones"),
+            message: format!(
+                "{} bones exceed the {MAX_BONES_PER_RIG} bone budget",
+                rig.bones.len()
+            ),
+        })?;
+        order.insert(bone.name.clone(), slot);
     }
-    (origins, order)
+    Ok(RigLayout { origins, order })
 }
 
 fn inverse_bind_matrix(origin: [f64; 3]) -> [f32; 16] {
@@ -1557,7 +1657,9 @@ fn push_mesh(
     geometry: &ModuleGeometry,
     mesh_name: &str,
     skinned: bool,
-) -> json::Index<json::Mesh> {
+    path: &str,
+    module_field: &str,
+) -> Result<json::Index<json::Mesh>, AssetGenError> {
     let mut primitives = Vec::with_capacity(geometry.roles.len());
     for (role_slot, role_geometry) in &geometry.roles {
         let role = PaletteRole::ALL[*role_slot];
@@ -1631,8 +1733,17 @@ fn push_mesh(
         attributes.insert(Checked::Valid(json::mesh::Semantic::Normals), normal);
 
         if skinned {
+            let joint_data =
+                joint_bytes(&role_geometry.joints).map_err(|joint| AssetGenError::Invalid {
+                    path: path.to_owned(),
+                    field: format!("{module_field}.rig.bones"),
+                    message: format!(
+                        "joint index {joint} does not fit the unsigned byte JOINTS_0 encoding; a \
+                         rig may declare at most {MAX_BONES_PER_RIG} bones"
+                    ),
+                })?;
             let joints = builder.push_accessor(AccessorRequest {
-                bytes: &joint_bytes(&role_geometry.joints),
+                bytes: &joint_data,
                 target: Some(json::buffer::Target::ArrayBuffer),
                 count: role_geometry.joints.len(),
                 component_type: json::accessor::ComponentType::U8,
@@ -1665,7 +1776,7 @@ fn push_mesh(
         });
     }
 
-    json::Index::push(
+    Ok(json::Index::push(
         &mut builder.root.meshes,
         json::Mesh {
             extensions: None,
@@ -1674,7 +1785,7 @@ fn push_mesh(
             primitives,
             weights: None,
         },
-    )
+    ))
 }
 
 fn push_animations(builder: &mut Builder, rig: &RigSource, bone_base: usize) {

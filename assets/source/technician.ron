@@ -1,7 +1,8 @@
 // Cell Shift technician: an adult silhouette built entirely from authored
 // primitives, rigidly skinned to an eleven bone rig, with Idle, Walk and Repair
-// clips. Shape coordinates are model space in the rest pose; the generator
-// rebases them onto their bone.
+// clips. Shape coordinates are model space in the rest pose and are written to
+// POSITION unchanged; the inverse bind matrices carry the bind origins, so a
+// conformant renderer reproduces this pose exactly.
 (
     asset: "technician",
     modules: [

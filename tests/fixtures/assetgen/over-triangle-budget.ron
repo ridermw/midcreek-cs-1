@@ -1,0 +1,23 @@
+// 2048 repeated boxes tessellate to 24 576 triangles, above the 24 000
+// triangle budget for one asset. Generation must reject this, not just tests.
+(
+    asset: "over-triangle-budget",
+    modules: [
+        (
+            name: "slab-wall",
+            rig: None,
+            shapes: [
+                (
+                    name: "slab",
+                    role: RackWhite,
+                    bone: None,
+                    primitive: Box(center: (0.0, 0.05, 0.0), half_extents: (0.02, 0.02, 0.02)),
+                    repeat: [
+                        (count: 1024, step: (0.05, 0.0, 0.0)),
+                        (count: 2, step: (0.0, 0.0, 0.05)),
+                    ],
+                ),
+            ],
+        ),
+    ],
+)

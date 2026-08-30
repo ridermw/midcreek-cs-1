@@ -39,6 +39,14 @@ written float quantized to a 1e-6 grid with negative zero normalized away, a
 constant generator string, and no timestamp, host, user, or path data in any
 output.
 
+Rig convention: skinned `POSITION` values stay in model space, and each inverse
+bind matrix is the standard `T(-global_bind_origin)`, so a conformant renderer
+computing `global joint transform * inverse bind matrix * POSITION` reproduces
+the authored rest pose exactly. Budgets are enforced during generation, not only
+in tests: at most 256 bones per rig, 24 000 triangles per asset, and clip names
+unique across every rigged module because glTF animation names are document
+scoped.
+
 ## Foundation gates
 
 ```bash
