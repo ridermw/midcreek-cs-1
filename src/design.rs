@@ -1059,6 +1059,7 @@ fn point_inside_collider(point: Vec2, collider: &ColliderSpec, padding: f32) -> 
 /// from here to there" for the single authored hall.
 pub struct WalkableGrid {
     origin: Vec2,
+    max: Vec2,
     columns: usize,
     rows: usize,
     open: Vec<bool>,
@@ -1086,6 +1087,7 @@ impl WalkableGrid {
 
         Self {
             origin,
+            max: half_size,
             columns,
             rows,
             open,
@@ -1108,6 +1110,15 @@ impl WalkableGrid {
 
     /// Index of the grid node nearest `point`, whether open or blocked.
     fn index(&self, point: Vec2) -> Option<usize> {
+        if !point.x.is_finite()
+            || !point.y.is_finite()
+            || point.x < self.origin.x
+            || point.y < self.origin.y
+            || point.x > self.max.x
+            || point.y > self.max.y
+        {
+            return None;
+        }
         let offset = (point - self.origin) / WALKABLE_CELL_SIZE;
         let column = offset.x.round();
         let row = offset.y.round();
@@ -1123,6 +1134,9 @@ impl WalkableGrid {
 
     /// Index of the grid row nearest `z`, when it lies inside the room.
     fn row(&self, z: f32) -> Option<usize> {
+        if !z.is_finite() || z < self.origin.y || z > self.max.y {
+            return None;
+        }
         let row = ((z - self.origin.y) / WALKABLE_CELL_SIZE).round();
         (row >= 0.0 && (row as usize) < self.rows).then_some(row as usize)
     }
@@ -1137,6 +1151,14 @@ impl WalkableGrid {
     /// standing position and a run of `n` adjacent nodes spans `(n - 1)` cells;
     /// a lone open node has zero width. The player diameter is not added again.
     pub fn widest_open_run(&self, z: f32, center_x: f32, half_width: f32) -> Option<f32> {
+        if !center_x.is_finite()
+            || center_x < self.origin.x
+            || center_x > self.max.x
+            || !half_width.is_finite()
+            || half_width < 0.0
+        {
+            return None;
+        }
         let row = self.row(z)?;
         let tolerance = WALKABLE_CELL_SIZE * 1.0e-3;
 

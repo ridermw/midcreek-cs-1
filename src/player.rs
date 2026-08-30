@@ -44,7 +44,9 @@
 //! public screen-to-world interface, so the orbit task can retarget the basis
 //! without touching a single movement rule.
 
-use bevy::{ecs::system::SystemParam, prelude::*, world_serialization::WorldInstance};
+use bevy::{
+    animation::AnimatedBy, ecs::system::SystemParam, prelude::*, world_serialization::WorldInstance,
+};
 
 use crate::{
     CellShiftSet,
@@ -325,6 +327,12 @@ pub enum PlayerRigError {
     MissingTechnicianDocument,
     /// The spawned technician exposes no `AnimationPlayer`.
     MissingAnimationPlayer,
+    /// Descendant animation players exist, but none is linked through
+    /// [`AnimatedBy`] to every required rig target.
+    UnlinkedAnimationPlayer {
+        /// Number of descendant animation players inspected.
+        found: usize,
+    },
     /// The generated technician document lacks a declared clip.
     MissingAnimationClip {
         /// Declared clip name.
@@ -650,6 +658,7 @@ fn bind_technician_rig(
     children: Query<&Children>,
     named: Query<(&Name, &Transform)>,
     players: Query<Entity, With<AnimationPlayer>>,
+    animated_by: Query<&AnimatedBy>,
     parts: Option<Res<PlayerParts>>,
     animations: Option<Res<PlayerAnimations>>,
     generated: Res<GeneratedAssets>,
@@ -687,9 +696,14 @@ fn bind_technician_rig(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let animation_player_is_live = animations
-        .as_deref()
-        .is_some_and(|animations| players.contains(animations.player));
+    let animation_player_is_live = animations.as_deref().is_some_and(|animations| {
+        players.contains(animations.player)
+            && parts.as_deref().is_some_and(|parts| {
+                parts.all().iter().all(|part| {
+                    animated_by.get(part.entity).map(|link| link.0) == Ok(animations.player)
+                })
+            })
+    });
     if parts.is_some() && stale.is_empty() && animation_player_is_live && report.is_healthy() {
         return;
     }
@@ -728,20 +742,35 @@ fn bind_technician_rig(
         }
     };
 
-    let animation_player = parts.as_ref().and_then(|_| {
+    let animation_players = parts.as_ref().map_or_else(Vec::new, |_| {
+        let mut found = Vec::new();
         let mut stack = vec![root];
         while let Some(entity) = stack.pop() {
             if players.contains(entity) {
-                return Some(entity);
+                found.push(entity);
             }
             if let Ok(kids) = children.get(entity) {
                 stack.extend(kids.iter());
             }
         }
-        None
+        found
+    });
+    let animation_player = parts.as_ref().and_then(|parts| {
+        animation_players.iter().copied().find(|player| {
+            parts
+                .all()
+                .iter()
+                .all(|part| animated_by.get(part.entity).map(|link| link.0) == Ok(*player))
+        })
     });
     if parts.is_some() && animation_player.is_none() {
-        errors.push(PlayerRigError::MissingAnimationPlayer);
+        errors.push(if animation_players.is_empty() {
+            PlayerRigError::MissingAnimationPlayer
+        } else {
+            PlayerRigError::UnlinkedAnimationPlayer {
+                found: animation_players.len(),
+            }
+        });
     }
 
     let document = generated

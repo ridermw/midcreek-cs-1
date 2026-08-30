@@ -7,6 +7,7 @@ use std::{
 };
 
 use bevy::{
+    animation::AnimatedBy,
     asset::AssetPlugin as BevyAssetPlugin,
     camera::ScalingMode,
     color::palettes::css::BLACK,
@@ -652,6 +653,22 @@ fn design_clearance_measures_center_space_runs_without_double_counting_the_playe
         None,
         "out-of-grid is distinct from a blocked in-grid node"
     );
+
+    let half = ROOM_SIZE * 0.5;
+    let epsilon = 1.0e-3;
+    assert_eq!(grid.is_open(Vec2::new(half.x, 0.0)), Some(false));
+    assert_eq!(grid.is_open(Vec2::new(half.x + epsilon, 0.0)), None);
+    assert_eq!(grid.is_open(Vec2::new(-half.x - epsilon, 0.0)), None);
+    assert_eq!(grid.is_open(Vec2::new(f32::NAN, 0.0)), None);
+    assert_eq!(grid.is_open(Vec2::new(0.0, f32::NAN)), None);
+
+    assert_eq!(grid.widest_open_run(half.y, 0.0, 1.0), Some(0.0));
+    assert_eq!(grid.widest_open_run(half.y + epsilon, 0.0, 1.0), None);
+    assert_eq!(grid.widest_open_run(-half.y - epsilon, 0.0, 1.0), None);
+    assert_eq!(grid.widest_open_run(f32::NAN, 0.0, 1.0), None);
+    assert_eq!(grid.widest_open_run(0.0, f32::NAN, 1.0), None);
+    assert_eq!(grid.widest_open_run(0.0, 0.0, f32::NAN), None);
+    assert_eq!(grid.widest_open_run(0.0, half.x + epsilon, 1.0), None);
 }
 
 #[test]
@@ -2218,6 +2235,7 @@ fn respawn_rig_instance(app: &mut App, names: &[&str]) {
         app.world_mut().spawn((
             Name::new((*name).to_owned()),
             Transform::IDENTITY,
+            AnimatedBy(holder),
             ChildOf(holder),
         ));
     }
@@ -2840,13 +2858,50 @@ fn technician_rig_revalidates_the_bound_animation_player_handle() {
         .id();
     app.update();
 
-    let animations = app.world().resource::<PlayerAnimations>();
+    assert_eq!(
+        rig_report(&app).errors(),
+        [PlayerRigError::UnlinkedAnimationPlayer { found: 1 }],
+        "a descendant AnimationPlayer with no AnimatedBy targets must fail"
+    );
+    assert!(!rig_report(&app).is_healthy());
+    app.update();
+    assert_eq!(rig_state(&app), PlayerRigState::Failed);
+
+    let parts = app.world().resource::<PlayerParts>().clone();
+    for part in parts.all() {
+        app.world_mut()
+            .entity_mut(part.entity)
+            .insert(AnimatedBy(replacement));
+    }
+    pump(&mut app, 2);
+
+    let animations = app.world().resource::<PlayerAnimations>().clone();
     assert_eq!(
         animations.player, replacement,
-        "the rig must rebind when its AnimationPlayer handle goes stale"
+        "the rig must rebind only after the replacement drives every required target"
     );
     assert!(rig_report(&app).is_healthy());
     assert_eq!(rig_state(&app), PlayerRigState::Ready);
+
+    let bone = parts.entity("bone-leg-left").expect("required leg bone");
+    let rest = parts.get("bone-leg-left").expect("required leg bone").rest;
+    hold(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight]);
+    let mut animated = false;
+    for _ in 0..60 {
+        app.update();
+        let current = *app
+            .world()
+            .get::<Transform>(bone)
+            .expect("linked required bone keeps its transform");
+        if current != rest {
+            animated = true;
+            break;
+        }
+    }
+    assert!(
+        animated,
+        "the correctly linked replacement must animate a required bone"
+    );
 }
 
 #[test]
@@ -7051,16 +7106,38 @@ fn operations_hud_rejects_multiple_game_cameras() {
 }
 
 #[test]
-fn operations_hud_reports_a_marked_node_that_lost_its_style_components() {
-    let mut app = hud_app(&repo_assets());
-    let status = hud_single::<HudStatusChip>(&mut app);
-    app.world_mut().entity_mut(status).remove::<Node>();
-    app.update();
-
+fn operations_hud_reports_each_required_style_component_loss() {
+    let mut missing_node = hud_app(&repo_assets());
+    let status = hud_single::<HudStatusChip>(&mut missing_node);
+    missing_node.world_mut().entity_mut(status).remove::<Node>();
+    missing_node.update();
     assert!(
-        hud_report(&app)
+        hud_report(&missing_node)
             .errors
             .contains(&HudError::MissingStyle { entity: status })
+    );
+
+    let mut missing_text = hud_app(&repo_assets());
+    let label = hud_single::<HudStatusLabel>(&mut missing_text);
+    missing_text.world_mut().entity_mut(label).remove::<Text>();
+    missing_text.update();
+    assert!(
+        hud_report(&missing_text)
+            .errors
+            .contains(&HudError::MissingStyle { entity: label })
+    );
+
+    let mut missing_color = hud_app(&repo_assets());
+    let label = hud_single::<HudStatusLabel>(&mut missing_color);
+    missing_color
+        .world_mut()
+        .entity_mut(label)
+        .remove::<TextColor>();
+    missing_color.update();
+    assert!(
+        hud_report(&missing_color)
+            .errors
+            .contains(&HudError::MissingStyle { entity: label })
     );
 }
 

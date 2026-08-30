@@ -1406,9 +1406,10 @@ type HudStyle = (
     &'static mut Node,
     &'static mut BackgroundColor,
     &'static mut UiTransform,
-    Option<&'static mut Text>,
-    Option<&'static mut TextColor>,
 );
+
+/// Every required text component on a HUD label.
+type HudTextStyle = (&'static mut Text, &'static mut TextColor);
 
 /// Every presentation node the HUD writes.
 ///
@@ -1431,6 +1432,7 @@ struct HudNodes<'w, 's> {
     badge_labels: Query<'w, 's, (Entity, &'static RackBadgeLabel)>,
     leaders: Query<'w, 's, (Entity, &'static RackLeaderLine)>,
     style: Query<'w, 's, HudStyle>,
+    text_style: Query<'w, 's, HudTextStyle>,
 }
 
 impl HudNodes<'_, '_> {
@@ -1450,6 +1452,15 @@ impl HudNodes<'_, '_> {
             .chain(self.badge_labels.iter().map(|(entity, _)| entity))
             .chain(self.leaders.iter().map(|(entity, _)| entity))
             .filter(|entity| !self.style.contains(*entity))
+            .for_each(|entity| errors.push(HudError::MissingStyle { entity }));
+
+        self.header
+            .iter()
+            .chain(self.row_labels.iter().map(|(entity, _)| entity))
+            .chain(self.status_label.iter())
+            .chain(self.cap_labels.iter().map(|(entity, _)| entity))
+            .chain(self.badge_labels.iter().map(|(entity, _)| entity))
+            .filter(|entity| !self.text_style.contains(*entity))
             .for_each(|entity| errors.push(HudError::MissingStyle { entity }));
     }
     fn row_entity(&self, slot: usize) -> Option<Entity> {
@@ -1547,18 +1558,16 @@ impl HudNodes<'_, '_> {
     }
 
     fn set_label(&mut self, entity: Entity, value: &str, color: Option<Color>) {
-        let Ok((_, _, _, text, text_color)) = self.style.get_mut(entity) else {
+        let Ok((mut text, mut text_color)) = self.text_style.get_mut(entity) else {
             return;
         };
-        if let Some(mut text) = text
-            && text.0 != value
-        {
+        if text.0 != value {
             text.0 = value.to_owned();
         }
-        if let (Some(mut current), Some(color)) = (text_color, color) {
+        if let Some(color) = color {
             let updated = TextColor(color);
-            if *current != updated {
-                *current = updated;
+            if *text_color != updated {
+                *text_color = updated;
             }
         }
     }
