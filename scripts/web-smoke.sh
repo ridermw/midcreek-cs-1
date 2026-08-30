@@ -179,6 +179,7 @@ fi
   --disable-background-networking \
   --disable-sync \
   --hide-scrollbars=false \
+  --disable-smooth-scrolling \
   --window-size=1280,1024 \
   --use-gl=angle \
   --use-angle=swiftshader \

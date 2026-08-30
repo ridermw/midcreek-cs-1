@@ -95,6 +95,39 @@ body {
   margin-top: 0;
 }
 
+.scroll-probe {
+  padding: 0.75rem 1rem;
+  border: solid var(--ink);
+  border-width: 0 3px 3px;
+  background: var(--rack-white);
+  font-weight: 600;
+}
+
+.scroll-probe:focus-visible {
+  outline: 4px solid var(--teal);
+  outline-offset: -4px;
+}
+
+.scroll-reserve {
+  /* The browser gate's positive control needs somewhere to scroll, and how
+     much room the header, stage, and notes leave over depends on the viewport
+     and on whichever fonts the runner happens to have. The reserve is
+     therefore stated as a whole viewport plus an absolute floor, so the
+     document is always taller than the window by at least
+     SCROLL_RESERVE_PIXELS no matter where the page is rendered. */
+  min-height: calc(100vh + 720px);
+  padding: 1.25rem;
+  border: var(--outline);
+  border-top-width: 0;
+  background: var(--floor-light);
+  line-height: 1.6;
+}
+
+.scroll-reserve p {
+  margin: 0;
+  max-width: 44rem;
+}
+
 kbd {
   padding: 0.1rem 0.4rem;
   border: 2px solid var(--ink);

@@ -1253,6 +1253,168 @@ mod web_source_contract {
     }
 
     #[test]
+    fn the_play_page_carries_a_neutral_scroll_probe_outside_the_canvas() {
+        let html = source("site/templates/play.html");
+
+        let probe = html
+            .find("data-scroll-probe")
+            .expect("the play page must carry a [data-scroll-probe] focus target");
+        let canvas_end = html
+            .find("</canvas>")
+            .expect("the play page must close the canvas element");
+        let stage_end = canvas_end
+            + html[canvas_end..]
+                .find("</div>")
+                .expect("the canvas stage must close");
+        assert!(
+            probe > stage_end,
+            "the scroll probe must live outside the canvas stage so focusing it \
+             really proves the page scrolls with the canvas unfocused"
+        );
+
+        let opened = html[..probe]
+            .rfind('<')
+            .expect("the scroll probe must sit inside an element");
+        let element_end = opened
+            + html[opened..]
+                .find('>')
+                .expect("the scroll probe element must close its start tag");
+        let element = &html[opened..element_end];
+        let tag: String = element[1..]
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        assert_eq!(
+            tag, "div",
+            "the probe must be neutral: a button, link, or input would swallow \
+             Space itself and the positive control could never prove it scrolls"
+        );
+        assert!(
+            element.contains(r#"tabindex="0""#),
+            "the scroll probe must be focusable, found {element}"
+        );
+        assert!(
+            element.contains(r#"id="scroll-probe""#),
+            "the scroll probe must be nameable in diagnostics, found {element}"
+        );
+    }
+
+    #[test]
+    fn the_play_page_reserves_more_scroll_room_than_the_browser_gate_demands() {
+        let html = source("site/templates/play.html");
+        let css = source("site/static/play.css");
+
+        assert!(
+            html.contains("data-scroll-reserve"),
+            "the play page must mark its deliberate scroll reserve"
+        );
+
+        let rule = css
+            .split_once(".scroll-reserve {")
+            .expect("play.css must style the scroll reserve")
+            .1
+            .split_once('}')
+            .expect("the scroll reserve rule must close")
+            .0;
+        assert!(
+            rule.contains("min-height"),
+            "the reserve must be a floor, not a fixed height, found {rule}"
+        );
+        assert!(
+            rule.contains("100vh"),
+            "the reserve must outgrow whatever viewport the runner has, found {rule}"
+        );
+
+        let absolute = reserve_pixels(rule);
+        let demanded = gate_constant("MINIMUM_SCROLL_RESERVE_PIXELS");
+        assert!(
+            absolute >= demanded,
+            "the page reserves {absolute}px above a full viewport but the browser \
+             gate demands at least {demanded}px of scroll room"
+        );
+    }
+
+    /// The absolute pixel term of the reserve, on top of the full viewport.
+    fn reserve_pixels(rule: &str) -> f64 {
+        let calc = rule
+            .split_once("calc(")
+            .expect("the reserve must state a viewport plus an absolute floor")
+            .1;
+        let pixels = calc
+            .split_once("px")
+            .expect("the reserve must carry an absolute pixel term")
+            .0;
+        pixels
+            .rsplit(|c: char| !c.is_ascii_digit() && c != '.')
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("could not read the reserve pixels from {rule}"))
+    }
+
+    /// A numeric constant declared at the top of the browser gate.
+    fn gate_constant(name: &str) -> f64 {
+        let gate = source("scripts/browser_gate.py");
+        let line = gate
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} = ")))
+            .unwrap_or_else(|| panic!("browser_gate.py must declare {name}"));
+        line.rsplit(" = ")
+            .next()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("{name} must be a number, found {line}"))
+    }
+
+    #[test]
+    fn the_browser_gate_proves_keyboard_ownership_against_the_neutral_probe() {
+        let gate = source("scripts/browser_gate.py");
+
+        for fragment in [
+            // trusted events, not synthetic ones
+            r#""type": "rawKeyDown""#,
+            r#""type": "char""#,
+            r#""type": "keyUp""#,
+            // the probe must own focus before the positive control runs
+            "data-scroll-probe",
+            "did not take keyboard focus",
+            "inside the canvas",
+            // an explicit reserve, not whatever the viewport left over
+            "MINIMUM_SCROLL_RESERVE_PIXELS",
+            "scrollable pixels, fewer than",
+            // both phases through one helper, with per-key evidence
+            "def press_control_keys",
+            "per-key scroll deltas",
+            "POSITIVE_CONTROL_KEYS",
+            // frames, not a wall clock: an animated scroll advances per frame
+            "NEXT_FRAMES_JS",
+            "requestAnimationFrame",
+        ] {
+            assert!(
+                gate.contains(fragment),
+                "browser_gate.py must contain {fragment}"
+            );
+        }
+
+        let body = gate
+            .split_once("def check_control_keys_do_not_scroll(")
+            .expect("the gate must keep the keyboard ownership check")
+            .1;
+        assert_eq!(
+            body.matches("press_control_keys(session)").count(),
+            2,
+            "the probed page and the focused canvas must be sent the same sequence"
+        );
+        assert!(
+            !body.contains("Input.dispatchKeyEvent"),
+            "the two phases must not grow their own key dispatch"
+        );
+        assert!(
+            body.contains(r#"describe_scroll(session, unfocused)"#)
+                && body.contains(r#"describe_scroll(session, focused)"#),
+            "both phases must report their per-key deltas on failure"
+        );
+    }
+
+    #[test]
     fn the_browser_shell_only_uses_relative_urls() {
         for relative in ["site/templates/play.html", "site/static/play.js"] {
             let text = source(relative);
@@ -1316,6 +1478,10 @@ mod web_source_contract {
         assert!(script.contains("set -euo pipefail"), "{script}");
         assert!(script.contains("trap "), "cleanup must be trapped");
         assert!(script.contains("--remote-debugging-port"), "{script}");
+        assert!(
+            script.contains("--disable-smooth-scrolling"),
+            "an animated keyboard scroll cannot be measured deterministically"
+        );
         for fragment in [
             "READY_TIMEOUT_SECONDS = 30",
             "data-game-state",
@@ -1323,6 +1489,9 @@ mod web_source_contract {
             "Input.dispatchKeyEvent",
             "Page.captureScreenshot",
             "scrollY",
+            "rawKeyDown",
+            "data-scroll-probe",
+            "MINIMUM_SCROLL_RESERVE_PIXELS",
             "MAX_MESSAGE_BYTES",
         ] {
             assert!(

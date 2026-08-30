@@ -25,6 +25,17 @@
       <span><kbd>Space</kbd> Repair</span>
     </div>
 
+    <!-- A neutral focus target that lives outside the canvas. It is a plain
+         focusable region on purpose: a button or a link would swallow Space
+         itself, so the browser gate could never prove that the same trusted
+         keys really scroll this page before it proves the focused canvas
+         refuses them. -->
+    <div class="scroll-probe" id="scroll-probe" data-scroll-probe tabindex="0"
+         aria-label="Page scroll probe">
+      Focus here instead of the canvas and the arrow keys, <kbd>Space</kbd>,
+      <kbd>Q</kbd>, and <kbd>E</kbd> scroll this page normally.
+    </div>
+
     <section class="play-notes">
       <h2>How this build is proved</h2>
       <p>This page only ships after a headless browser gate loads the same WebAssembly package, waits for the game to report <code>data-game-state="ready"</code>, proves the canvas renders approved palette colour, and confirms no error or unhandled rejection was captured.</p>
@@ -32,6 +43,10 @@
       <p>Move the technician with the arrow keys, orbit the camera with <kbd>Q</kbd> and <kbd>E</kbd>, and repair the highest priority faulted rack with <kbd>Space</kbd> while standing next to it.</p>
       <p>The build is generated from repository-owned sources only: the glTF assets are regenerated and byte-compared by the asset gate, and the browser shell has no package manager, bundler, or third-party script.</p>
     </section>
+
+    <footer class="scroll-reserve" data-scroll-reserve>
+      <p>Below this line the page keeps a deliberate scroll reserve. The browser gate scrolls it with the same trusted key events it later sends to the focused canvas, so &ldquo;the game owns these keys&rdquo; is proved against a page that genuinely could have scrolled rather than one that merely happened to fit.</p>
+    </footer>
   </main>
 
   <pre id="browser-errors" hidden aria-live="polite"></pre>

@@ -535,9 +535,24 @@ canvas is visible and 16:9 within one pixel, the reviewed control keys do not
 scroll the focused page, and the canvas region of a real screenshot carries at
 least three approved palette classes with real channel variance.
 
-The no-scroll assertion carries its own positive control: the same trusted
-Arrow, Q, E, and Space events must scroll the page while the canvas is blurred,
-so a page that simply could not scroll fails instead of passing silently.
+The no-scroll assertion carries its own positive control, and the control is
+built so that it cannot be starved. The page ships a neutral focusable region,
+`[data-scroll-probe]`, outside the canvas stage; it is a plain `div` rather than
+a button or a link, because those swallow Space themselves. The page also keeps
+an explicit scroll reserve of a whole viewport plus 720 absolute pixels, so how
+much room the header, stage, and notes leave over never depends on the runner's
+window size or fonts.
+
+The gate refuses to continue unless the probe really owns focus, then dispatches
+the trusted `rawKeyDown`, `char`, and `keyUp` sequence a real keystroke
+produces. Chrome only runs Space's scrolling default action on the character
+event, and Blink drops that character event when the key event before it was
+default-prevented, which is exactly what makes the focused canvas assertion
+bite. ArrowDown and Space must both move the probed page. The page is then reset
+to the top, the canvas is focused, and the identical sequence is sent through
+the same helper: every key must record a zero delta and the canvas must still
+hold focus. Every failure reports the active element, `scrollHeight`,
+`innerHeight`, and the per-key scroll deltas.
 
 Deleting one generated GLB from a package drives the gate to exit 1 with
 `assets: generated/rack.glb failed to load`, which is the sanitized handshake

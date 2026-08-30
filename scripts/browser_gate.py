@@ -12,7 +12,7 @@ The gate proves, independently:
 * ``#browser-errors`` captured no error and no unhandled rejection;
 * the canvas is visible and 16:9 within one pixel;
 * trusted Arrow/Q/E/Space input while the canvas is focused does not scroll a
-  page that is genuinely scrollable;
+  page that a neutral focus probe has just proved is genuinely scrollable;
 * the canvas region of a real screenshot is nonblank and carries at least
   three approved palette classes with real variance.
 """
@@ -45,15 +45,32 @@ MINIMUM_PALETTE_CLASSES = 3
 MINIMUM_CLASS_SHARE = 0.01
 MINIMUM_CHANNEL_VARIANCE = 25.0
 PALETTE_MATCH_DISTANCE = 48.0
+# The play page reserves a whole viewport plus this many absolute pixels below
+# the notes, so the positive control below can never be starved of somewhere to
+# scroll by a tall window or by whichever fonts the runner happens to have.
+MINIMUM_SCROLL_RESERVE_PIXELS = 240.0
+# Keyboard scrolling can be animated, so a delta is never read off a wall clock:
+# the gate waits for rendered frames, which is the only clock a scroll animation
+# actually advances on, and gives up after this long.
+KEY_SCROLL_SECONDS = 3.0
+SCROLL_RESET_SECONDS = 10.0
+# ``text`` is the character a key would type. Chrome only runs the default
+# action for Space on the character event, so a key that types something is
+# given the trusted ``char`` event a real keystroke would produce. Blink drops
+# that character event when the preceding key event was default-prevented,
+# which is exactly the behaviour the focused assertion relies on.
 CONTROL_KEYS = (
-    ("ArrowUp", 38, "ArrowUp"),
-    ("ArrowDown", 40, "ArrowDown"),
-    ("ArrowLeft", 37, "ArrowLeft"),
-    ("ArrowRight", 39, "ArrowRight"),
-    ("KeyQ", 81, "q"),
-    ("KeyE", 69, "e"),
-    ("Space", 32, " "),
+    ("ArrowUp", 38, "ArrowUp", None),
+    ("ArrowDown", 40, "ArrowDown", None),
+    ("ArrowLeft", 37, "ArrowLeft", None),
+    ("ArrowRight", 39, "ArrowRight", None),
+    ("KeyQ", 81, "q", "q"),
+    ("KeyE", 69, "e", "e"),
+    ("Space", 32, " ", " "),
 )
+# The keys whose scrolling is a browser guarantee rather than a page detail.
+# The positive control fails unless both of them move a page nobody is playing.
+POSITIVE_CONTROL_KEYS = ("ArrowDown", "Space")
 
 
 class GateFailure(Exception):
@@ -552,77 +569,245 @@ def check_no_browser_errors(session: DevTools) -> None:
         raise GateFailure(f"the browser captured errors: {captured!r}")
 
 
-def press_control_keys(session: DevTools) -> None:
-    for code, key_code, key in CONTROL_KEYS:
-        for event_type in ("keyDown", "keyUp"):
-            session.call(
-                "Input.dispatchKeyEvent",
-                {
-                    "type": event_type,
-                    "code": code,
-                    "key": key,
-                    "windowsVirtualKeyCode": key_code,
-                    "nativeVirtualKeyCode": key_code,
-                },
-            )
-        time.sleep(0.05)
+SCROLL_OFFSET_JS = "window.scrollY"
+
+SCROLL_TO_TOP_JS = "window.scrollTo(0, 0)"
+
+SCROLL_RESERVE_JS = "document.documentElement.scrollHeight - window.innerHeight"
+
+# A scroll animation advances once per rendered frame, so frames are the only
+# clock it can be measured against. A wall clock reads a janky renderer as a
+# settled page and turns a real scroll into a false zero.
+NEXT_FRAMES_JS = """
+new Promise((resolve) => {
+  let remaining = 2;
+  const step = () => (remaining-- > 0 ? requestAnimationFrame(step) : resolve(true));
+  step();
+})
+"""
+
+SCROLL_REPORT_JS = """
+(() => {
+  const node = document.activeElement;
+  const name = node
+    ? node.tagName.toLowerCase() + (node.id ? "#" + node.id : "")
+    : "none";
+  return {
+    activeElement: name,
+    scrollY: window.scrollY,
+    scrollHeight: document.documentElement.scrollHeight,
+    innerHeight: window.innerHeight,
+  };
+})()
+"""
+
+# The probe is a neutral focus target that lives outside the canvas. A button
+# or a link would consume Space itself, so the page ships a plain focusable
+# region and the gate refuses to continue unless that region really owns focus.
+FOCUS_SCROLL_PROBE_JS = """
+(() => {
+  const probe = document.querySelector("[data-scroll-probe]");
+  if (!probe) return { probe: null };
+  const canvas = document.getElementById("game-canvas");
+  if (canvas) {
+    if (canvas.contains(probe) || probe === canvas) {
+      return { probe: probe.id || "unnamed", insideCanvas: true };
+    }
+    canvas.blur();
+  }
+  probe.focus({ preventScroll: true });
+  window.scrollTo(0, 0);
+  return {
+    probe: probe.id || "unnamed",
+    insideCanvas: false,
+    owned: document.activeElement === probe,
+  };
+})()
+"""
+
+FOCUS_CANVAS_JS = """
+(() => {
+  const canvas = document.getElementById("game-canvas");
+  if (!canvas) return false;
+  canvas.focus({ preventScroll: true });
+  window.scrollTo(0, 0);
+  return document.activeElement === canvas;
+})()
+"""
+
+CANVAS_STILL_FOCUSED_JS = (
+    "document.activeElement === document.getElementById('game-canvas')"
+)
 
 
-def check_control_keys_do_not_scroll(session: DevTools) -> None:
-    scrollable = session.evaluate(
-        "document.documentElement.scrollHeight - window.innerHeight"
+def scroll_report(session: DevTools) -> dict:
+    """Active element, scroll offset, and the two heights, for diagnostics."""
+    return dict(session.evaluate(SCROLL_REPORT_JS))
+
+
+def describe_scroll(session: DevTools, deltas: dict[str, float] | None = None) -> str:
+    report = scroll_report(session)
+    detail = (
+        f"active element {report['activeElement']}, "
+        f"scrollY {report['scrollY']}, "
+        f"scrollHeight {report['scrollHeight']}, "
+        f"innerHeight {report['innerHeight']}"
     )
-    if float(scrollable) <= 0:
+    if deltas is not None:
+        rendered = ", ".join(f"{code} {delta:+g}" for code, delta in deltas.items())
+        detail = f"{detail}; per-key scroll deltas: {rendered or 'none recorded'}"
+    return detail
+
+
+def wait_for_scroll_to_settle(session: DevTools, before: float | None = None) -> float:
+    """Waits out an animated scroll and returns where the page came to rest.
+
+    Frames are the clock, because a scroll animation advances once per rendered
+    frame and can therefore hide entirely between two wall-clock samples on a
+    busy renderer. When ``before`` is given, a page that has not moved yet is
+    not mistaken for a page that will never move: the wait watches for the
+    scroll to start before it waits for the scroll to stop.
+    """
+    deadline = time.monotonic() + KEY_SCROLL_SECONDS
+    session.evaluate(NEXT_FRAMES_JS)
+    current = float(session.evaluate(SCROLL_OFFSET_JS))
+    while before is not None and current == before and time.monotonic() < deadline:
+        session.evaluate(NEXT_FRAMES_JS)
+        current = float(session.evaluate(SCROLL_OFFSET_JS))
+    while time.monotonic() < deadline:
+        session.evaluate(NEXT_FRAMES_JS)
+        following = float(session.evaluate(SCROLL_OFFSET_JS))
+        if following == current:
+            return current
+        current = following
+    return current
+
+
+def reset_scroll(session: DevTools) -> None:
+    """Returns the page to the top and proves it stayed there.
+
+    A keyboard scroll is an animation that outlives a single ``scrollTo``, so
+    the page is sent back to the top until it settles there.
+    """
+    deadline = time.monotonic() + SCROLL_RESET_SECONDS
+    while time.monotonic() < deadline:
+        session.evaluate(SCROLL_TO_TOP_JS)
+        if wait_for_scroll_to_settle(session) == 0.0:
+            return
+    raise GateFailure(
+        "the play page would not come to rest at the top of the document: "
+        + describe_scroll(session)
+    )
+
+
+def press_control_key(
+    session: DevTools, code: str, key_code: int, key: str, text: str | None
+) -> float:
+    """Dispatches one trusted keystroke and reports how far the page scrolled.
+
+    The sequence is the one a real keystroke produces: a raw key down, the
+    character event when the key types something, and a key up.
+    """
+    before = float(session.evaluate(SCROLL_OFFSET_JS))
+    identity = {
+        "code": code,
+        "key": key,
+        "windowsVirtualKeyCode": key_code,
+        "nativeVirtualKeyCode": key_code,
+    }
+    session.call("Input.dispatchKeyEvent", {"type": "rawKeyDown", **identity})
+    if text is not None:
+        session.call("Input.dispatchKeyEvent", {"type": "char", "text": text, **identity})
+    session.call("Input.dispatchKeyEvent", {"type": "keyUp", **identity})
+    return wait_for_scroll_to_settle(session, before) - before
+
+
+def press_control_keys(session: DevTools) -> dict[str, float]:
+    """Runs the whole reviewed key sequence and records a delta for each key.
+
+    Both phases of the assertion call this and nothing else, so the focused
+    page and the probed page can never be sent different keystrokes.
+    """
+    deltas: dict[str, float] = {}
+    for code, key_code, key, text in CONTROL_KEYS:
+        reset_scroll(session)
+        deltas[code] = press_control_key(session, code, key_code, key, text)
+    return deltas
+
+
+def check_control_keys_do_not_scroll(session: DevTools) -> dict:
+    reserve = float(session.evaluate(SCROLL_RESERVE_JS))
+    if reserve < MINIMUM_SCROLL_RESERVE_PIXELS:
         raise GateFailure(
-            "the play page is not scrollable, so the no-scroll assertion would be vacuous"
+            f"the play page reserves {reserve} scrollable pixels, fewer than the "
+            f"{MINIMUM_SCROLL_RESERVE_PIXELS} the no-scroll assertion needs to be "
+            "worth making: " + describe_scroll(session)
         )
 
-    # Positive control: the same trusted keys must really scroll this page when
-    # the canvas is not focused. Without it, a page that simply cannot scroll
-    # would pass the assertion below for the wrong reason.
-    session.evaluate(
-        """
-        (() => {
-          document.getElementById("game-canvas").blur();
-          document.body.focus();
-          window.scrollTo(0, 0);
-        })()
-        """
-    )
-    press_control_keys(session)
-    unfocused_scroll = float(session.evaluate("window.scrollY"))
-    if unfocused_scroll <= 0.0:
+    # Positive control. The same trusted keys must really scroll this page while
+    # a neutral element outside the canvas holds focus. Without it, a page that
+    # simply cannot scroll would pass the assertion below for the wrong reason.
+    probe = dict(session.evaluate(FOCUS_SCROLL_PROBE_JS))
+    if not probe.get("probe"):
         raise GateFailure(
-            "the trusted control keys did not scroll the unfocused page, so the "
-            "focused no-scroll assertion would prove nothing"
+            "the play page has no [data-scroll-probe] element, so there is no "
+            "neutral focus target to prove the control keys against: "
+            + describe_scroll(session)
+        )
+    if probe.get("insideCanvas"):
+        raise GateFailure(
+            f"the scroll probe {probe['probe']} is inside the canvas, so focusing "
+            "it would not prove anything about an unfocused page: "
+            + describe_scroll(session)
+        )
+    if not probe.get("owned"):
+        raise GateFailure(
+            f"the scroll probe {probe['probe']} did not take keyboard focus, so "
+            "the control keys would not be proved against an unfocused canvas: "
+            + describe_scroll(session)
         )
 
-    focused = session.evaluate(
-        """
-        (() => {
-          const canvas = document.getElementById("game-canvas");
-          canvas.focus({ preventScroll: true });
-          window.scrollTo(0, 0);
-          return document.activeElement === canvas;
-        })()
-        """
-    )
-    if not focused:
-        raise GateFailure("the canvas refused keyboard focus")
-
-    press_control_keys(session)
-
-    scroll = session.evaluate("window.scrollY")
-    if float(scroll) != 0.0:
+    unfocused = press_control_keys(session)
+    inert = [code for code in POSITIVE_CONTROL_KEYS if unfocused.get(code, 0.0) <= 0.0]
+    if inert:
         raise GateFailure(
-            f"a focused control key scrolled the page to {scroll}; the reviewed keys must be owned by the game"
+            f"the trusted control keys {inert} did not scroll the page while the "
+            "neutral scroll probe held focus, so the focused no-scroll assertion "
+            "would prove nothing: " + describe_scroll(session, unfocused)
         )
 
-    still_focused = session.evaluate(
-        "document.activeElement === document.getElementById('game-canvas')"
-    )
-    if not still_focused:
-        raise GateFailure("the canvas lost focus while the game keys were pressed")
+    reset_scroll(session)
+    if not session.evaluate(FOCUS_CANVAS_JS):
+        raise GateFailure("the canvas refused keyboard focus: " + describe_scroll(session))
+
+    focused = press_control_keys(session)
+    moved = {code: delta for code, delta in focused.items() if delta != 0.0}
+    if moved:
+        raise GateFailure(
+            f"the focused control keys {sorted(moved)} scrolled the page; the "
+            "reviewed keys must be owned by the game: "
+            + describe_scroll(session, focused)
+        )
+
+    resting = float(session.evaluate(SCROLL_OFFSET_JS))
+    if resting != 0.0:
+        raise GateFailure(
+            f"the page came to rest at {resting} after the focused key sequence: "
+            + describe_scroll(session, focused)
+        )
+
+    if not session.evaluate(CANVAS_STILL_FOCUSED_JS):
+        raise GateFailure(
+            "the canvas lost focus while the game keys were pressed: "
+            + describe_scroll(session, focused)
+        )
+
+    return {
+        "reserve_pixels": reserve,
+        "probe": probe["probe"],
+        "unfocused_deltas": unfocused,
+        "focused_deltas": focused,
+    }
 
 
 def check_canvas_pixels(
@@ -744,7 +929,7 @@ def main() -> int:
         check_no_browser_errors(session)
         geometry = canvas_geometry(session)
         check_canvas(geometry)
-        check_control_keys_do_not_scroll(session)
+        scroll = check_control_keys_do_not_scroll(session)
         check_no_browser_errors(session)
         pixels = check_canvas_pixels(session, palette, arguments.diagnostics)
     except GateFailure as failure:
@@ -763,6 +948,7 @@ def main() -> int:
             "buffer": [geometry["bufferWidth"], geometry["bufferHeight"]],
         },
         "pixels": pixels,
+        "scroll": scroll,
     }
     arguments.diagnostics.mkdir(parents=True, exist_ok=True)
     (arguments.diagnostics / "browser-gate.json").write_text(
