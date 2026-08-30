@@ -1229,6 +1229,36 @@ fn command_line_rejects_a_readback_delay_no_readback_can_ever_serve() {
     }
 }
 
+/// Every injectable fault is reachable by its documented name, and no two
+/// names collide.
+///
+/// The faults are the failure registry's executable half, so a fault that
+/// stopped parsing would silently stop being proven end to end.
+#[test]
+fn every_injectable_fault_parses_from_its_documented_name() {
+    assert_eq!(
+        VerificationFault::ALL.map(VerificationFault::name).to_vec(),
+        vec!["drop-capture", "stall", "hang"]
+    );
+    for fault in VerificationFault::ALL {
+        assert_eq!(
+            parse(&["--verify-output", "a", "--verify-fault", fault.name()])
+                .expect("a documented fault name parses")
+                .fault,
+            Some(fault)
+        );
+    }
+    assert_eq!(
+        VerificationFault::ALL
+            .map(VerificationFault::name)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        VerificationFault::ALL.len(),
+        "two faults may not answer to the same name"
+    );
+}
+
 #[test]
 fn cli_exits_with_code_two_for_every_unusable_output_path() {
     let temp = TempDir::new("cli-exit");
