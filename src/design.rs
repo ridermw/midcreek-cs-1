@@ -37,11 +37,11 @@ pub const WALL_HEIGHT: f32 = 1.2;
 /// Thickness of the low perimeter wall. Walls sit immediately outside the play
 /// area so a player clamped by the room bounds stops flush against them.
 pub const WALL_THICKNESS: f32 = 0.4;
-/// Painted floor markings are thin decals lifted just clear of the floor.
 /// Height of the raised-floor grid above the walkable floor, in metres. It is
 /// above the floor and the apron, and below the yellow floor markings.
 pub const FLOOR_GRID_HEIGHT: f32 = 0.002;
 
+/// Width of the painted floor-marking decals, in metres.
 pub const FLOOR_MARKING_WIDTH: f32 = 0.12;
 
 /// Width of the perimeter hazard striping, in metres.
@@ -55,7 +55,6 @@ pub const PERIMETER_MARKING_OFFSET: f32 = 19.4;
 pub const PERIMETER_MARKING_INSET: f32 = 1.4;
 /// Height above the floor at which markings are drawn.
 pub const FLOOR_MARKING_HEIGHT: f32 = 0.01;
-/// Height of the overhead cable tray module origin.
 /// Height of the overhead cable trays above the floor, in metres.
 ///
 /// This is not a free choice. An orthographic camera at
