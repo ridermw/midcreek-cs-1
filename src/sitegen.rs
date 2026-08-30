@@ -20,6 +20,9 @@ use crate::{
     },
 };
 
+/// The published directory holding every screenshot the hub serves.
+pub const SCREENSHOTS_ROOT: &str = "screenshots";
+
 /// The published directory holding the frames of the current verified run.
 pub const CURRENT_SCREENSHOTS: &str = "screenshots/current";
 
@@ -28,6 +31,9 @@ pub const HISTORY_SCREENSHOTS: &str = "screenshots/history";
 
 /// The published screenshot history manifest.
 pub const GALLERY_FILE: &str = "gallery.json";
+
+/// The published record of the last green publication.
+pub const LAST_GREEN_FILE: &str = "last-green.json";
 
 /// The published sanitized projection of the verification reports.
 pub const VERIFICATION_FILE: &str = "verification.json";
@@ -1479,7 +1485,10 @@ fn derive_gates(
     };
     let mut gates = vec![
         GateSummary {
-            name: "Rendered image contracts".to_owned(),
+            // The run's own report vouches for the frames it captured. It does
+            // not carry the reference image analyzers' verdict, so this gate
+            // never claims one.
+            name: "Verified frame captures".to_owned(),
             status: status(succeeded),
             passed: frames.len() as u32,
             failed: failures.len() as u32,
@@ -1616,8 +1625,11 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         .or_else(|| inputs.repo.commits.first())
         .map_or("Unknown", |commit| commit.committed_at.as_str());
     let reference_paths = copy_reference_assets(&inputs.reference_manifest, output)?;
-    let playable_files = copy_playable_build(inputs.playable.as_ref(), inputs, output)?;
+    let playable_files = copy_playable_build(inputs.playable.as_ref(), output)?;
     let evidence = publish_verification(inputs, &source_commit, updated_at, current_task, output)?;
+    // The manifest is written last, because only a completed promotion knows
+    // which pixels this build actually published.
+    write_last_green(inputs.playable.as_ref(), evidence.as_ref(), output)?;
 
     let replacements = [
         ("{{PROJECT}}", escape_html(&inputs.progress.project)),
@@ -1703,6 +1715,8 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
 struct PublishedEvidence {
     /// Every published file, relative to the site output.
     files: Vec<PathBuf>,
+    /// The semantic hash of the frames this build promoted.
+    semantic_visual_hash: String,
     /// The history after this publication.
     gallery: GalleryManifest,
     /// The current frames, by stable label.
@@ -1818,6 +1832,7 @@ fn publish_verification(
 
     Ok(Some(PublishedEvidence {
         files,
+        semantic_visual_hash: summary.semantic_visual_hash.clone(),
         gallery,
         current,
         browser,
@@ -1891,48 +1906,157 @@ pub fn assemble_site(
         (_, _, None) => BuildDisposition::FirstRunStatusOnly,
     };
 
-    // A green replacement publishes the current tree alone, so the previous
-    // game is only ever discarded when a complete replacement really exists.
+    // A green replacement publishes the current game alone, so the previous
+    // one is only ever discarded when a complete replacement really exists.
     // Everything below runs before the output is touched.
     if disposition == BuildDisposition::GreenReplacement {
         require_complete_replacement(current, previous)?;
     }
 
-    prepare_assembly_output(output)?;
-    if matches!(
+    let retains_game = matches!(
         disposition,
         BuildDisposition::RetainLastGreen | BuildDisposition::FailedRetainLastGreen
-    ) {
-        let previous = previous.expect("retention dispositions carry a previous site");
-        copy_retained_artifacts(previous, output)?;
-    } else if let Some(previous) = previous {
-        // The visual history is cumulative, so even a complete green
-        // replacement carries the accepted history forward. Only the current
-        // frames and the gallery manifest are replaced wholesale.
-        copy_previous_history(previous, output)?;
+    );
+    let evidence = evidence_publication(current);
+
+    prepare_assembly_output(output)?;
+
+    // The two domains are retained independently. A build may promote verified
+    // evidence without producing a game, and a new game never invalidates the
+    // last verified pixels. The previous publication is laid down first so
+    // that whatever this build really published overlays it.
+    if let Some(previous) = previous {
+        require_directory(previous)?;
+        let mut retained = Vec::new();
+        if retains_game {
+            retained.extend(PLAYABLE_ARTIFACTS);
+        }
+        retained.extend(match evidence {
+            // Promoted pixels replace the current frames and the manifest, but
+            // the visual history is cumulative and always carries forward.
+            EvidencePublication::Promoted => &[HISTORY_SCREENSHOTS][..],
+            // A projection alone publishes this run's status over the last
+            // green pixels and the manifest that names them.
+            EvidencePublication::ProjectionOnly => &EVIDENCE_PIXELS[..],
+            // Nothing verified at all: the whole last green evidence set
+            // stays, so no image is left without the manifest that names it.
+            EvidencePublication::Absent => &EVIDENCE_ARTIFACTS[..],
+        });
+        copy_previous_artifacts(previous, output, &retained)?;
     }
 
-    copy_site_tree(
-        current,
-        current,
-        output,
-        disposition != BuildDisposition::GreenReplacement,
-    )?;
+    // A build never publishes a game it did not earn.
+    let protected: &[&str] = if retains_game {
+        &PLAYABLE_ARTIFACTS
+    } else {
+        &[]
+    };
+    copy_site_tree(current, current, output, protected)?;
+
+    reconcile_last_green(output)?;
+    validate_assembled_links(output)?;
     Ok(disposition)
 }
 
-/// Carries the accepted screenshot history of a previous publication forward.
-fn copy_previous_history(previous: &Path, output: &Path) -> Result<(), SitegenError> {
-    require_directory(previous)?;
-    let source = previous.join(HISTORY_SCREENSHOTS);
-    match fs::symlink_metadata(&source) {
-        Ok(_) => copy_artifact(&source, &output.join(HISTORY_SCREENSHOTS)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(SitegenError::Io {
-            path: source,
-            message: error.to_string(),
-        }),
+/// What the current tree publishes about verification, independent of whether
+/// it also published a game.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidencePublication {
+    /// Promoted frames and the manifest that names them.
+    Promoted,
+    /// A sanitized projection alone: a failed run, or a green run that
+    /// promoted no pixels.
+    ProjectionOnly,
+    /// No verification evidence at all.
+    Absent,
+}
+
+fn evidence_publication(current: &Path) -> EvidencePublication {
+    if current.join(CURRENT_SCREENSHOTS).is_dir() {
+        EvidencePublication::Promoted
+    } else if current.join(VERIFICATION_FILE).is_file() {
+        EvidencePublication::ProjectionOnly
+    } else {
+        EvidencePublication::Absent
     }
+}
+
+/// Carries named artifacts of a previous publication forward.
+fn copy_previous_artifacts(
+    previous: &Path,
+    output: &Path,
+    retained: &[&str],
+) -> Result<(), SitegenError> {
+    for relative in retained {
+        let source = previous.join(relative);
+        match fs::symlink_metadata(&source) {
+            Ok(_) => copy_artifact(&source, &output.join(relative))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SitegenError::Io {
+                    path: source,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Brings `last-green.json` back into agreement with the tree assembly
+/// actually produced.
+///
+/// Assembly may retain the previous game while publishing new evidence, so the
+/// manifest that survived describes a game that is still correct beside pixels
+/// that are not. It is rewritten from the assembled tree and the evidence
+/// published in it, never from a second record. A manifest this generator did
+/// not write does not parse, and assembly leaves it exactly as it found it
+/// rather than inventing one.
+fn reconcile_last_green(output: &Path) -> Result<(), SitegenError> {
+    let path = output.join(LAST_GREEN_FILE);
+    let Ok(json) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(mut manifest) = serde_json::from_str::<LastGreenManifest>(&json) else {
+        return Ok(());
+    };
+    manifest.game_files = published_files(output, "play")?;
+    manifest.screenshot_files = published_files(output, CURRENT_SCREENSHOTS)?;
+    if let Some(hash) = promoted_visual_hash(output) {
+        manifest.semantic_visual_hash = Some(hash);
+    }
+    let json = serde_json::to_string_pretty(&manifest).map_err(|error| SitegenError::Json {
+        path: PathBuf::from(LAST_GREEN_FILE),
+        message: error.to_string(),
+    })?;
+    write_file(&path, json.as_bytes())
+}
+
+/// The hash of the evidence the assembled tree publishes, when that evidence
+/// succeeded.
+///
+/// A failed projection describes no pixels, so it supplies no hash and the
+/// retained one keeps describing the retained frames. The published document
+/// is read as a whole so that assembly never has to track the projection's
+/// schema.
+fn promoted_visual_hash(output: &Path) -> Option<String> {
+    let json = fs::read_to_string(output.join(VERIFICATION_FILE)).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    if value.get("succeeded")?.as_bool() != Some(true) {
+        return None;
+    }
+    Some(value.get("semantic_visual_hash")?.as_str()?.to_owned())
+}
+
+/// Every published file below one site-relative directory, in stable order.
+fn published_files(output: &Path, relative: &str) -> Result<Vec<PathBuf>, SitegenError> {
+    let root = output.join(relative);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = collect_files(&root, output)?;
+    files.sort();
+    Ok(files)
 }
 
 /// Refuses a green replacement that would publish a broken game or silently
@@ -2076,6 +2200,47 @@ pub fn validate_site_output(
     Ok(())
 }
 
+/// Proves every link the assembled page makes resolves against the assembled
+/// tree.
+///
+/// Generation validates a page against the files one build wrote, and accepts
+/// history links its manifest declares because those images only arrive at
+/// assembly. Assembly is where they arrive, and where it is decided which of
+/// the previous files survive, so the same links are checked once more with no
+/// allowance left: after assembly the file has to be there.
+pub fn validate_assembled_links(output: &Path) -> Result<(), SitegenError> {
+    let index_path = output.join("index.html");
+    let html = match fs::read_to_string(&index_path) {
+        Ok(html) => html,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(SitegenError::Io {
+                path: index_path,
+                message: error.to_string(),
+            });
+        }
+    };
+    let document = Html::parse_document(&html);
+    let ids = document
+        .select(&selector("[id]"))
+        .filter_map(|element| element.value().attr("id").map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+
+    for element in document.select(&selector("a[href], img[src], link[href], script[src]")) {
+        let attribute = if element.value().attr("href").is_some() {
+            "href"
+        } else {
+            "src"
+        };
+        let target = element
+            .value()
+            .attr(attribute)
+            .expect("the selector guarantees a target");
+        validate_local_target(output, &ids, &BTreeSet::new(), &index_path, target)?;
+    }
+    Ok(())
+}
+
 fn prepare_output(output: &Path) -> Result<(), SitegenError> {
     validate_output_path(output)?;
     if let Ok(metadata) = fs::symlink_metadata(output) {
@@ -2214,32 +2379,20 @@ fn require_directory(path: &Path) -> Result<(), SitegenError> {
     }
 }
 
-fn copy_retained_artifacts(previous: &Path, output: &Path) -> Result<(), SitegenError> {
-    require_directory(previous)?;
-    for relative in RETAINED_ARTIFACTS {
-        let source = previous.join(relative);
-        match fs::symlink_metadata(&source) {
-            Ok(_) => copy_artifact(&source, &output.join(relative))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(SitegenError::Io {
-                    path: source,
-                    message: error.to_string(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
+/// The packaged game and the manifest that describes it.
+const PLAYABLE_ARTIFACTS: [&str; 2] = ["play", LAST_GREEN_FILE];
 
-/// Everything a failing publication keeps from the last green one.
-const RETAINED_ARTIFACTS: [&str; 4] = ["play", "screenshots", GALLERY_FILE, "last-green.json"];
+/// The published pixels and the manifest that names them.
+const EVIDENCE_PIXELS: [&str; 2] = [SCREENSHOTS_ROOT, GALLERY_FILE];
+
+/// Everything the last green publication said about verification.
+const EVIDENCE_ARTIFACTS: [&str; 3] = [SCREENSHOTS_ROOT, GALLERY_FILE, VERIFICATION_FILE];
 
 fn copy_site_tree(
     root: &Path,
     source: &Path,
     output: &Path,
-    skip_retained: bool,
+    protected: &[&str],
 ) -> Result<(), SitegenError> {
     let mut entries = fs::read_dir(source)
         .map_err(|error| SitegenError::Io {
@@ -2258,7 +2411,7 @@ fn copy_site_tree(
         let relative = path
             .strip_prefix(root)
             .expect("directory entries remain below the copied root");
-        if skip_retained && is_retained_artifact(relative) {
+        if is_protected_artifact(relative, protected) {
             continue;
         }
         copy_artifact(&path, &output.join(relative))?;
@@ -2281,7 +2434,7 @@ fn copy_artifact(source: &Path, destination: &Path) -> Result<(), SitegenError> 
             path: destination.to_path_buf(),
             message: error.to_string(),
         })?;
-        return copy_site_tree(source, source, destination, false);
+        return copy_site_tree(source, source, destination, &[]);
     }
     if !metadata.is_file() {
         return Err(SitegenError::MissingPreviousArtifact {
@@ -2302,12 +2455,12 @@ fn copy_artifact(source: &Path, destination: &Path) -> Result<(), SitegenError> 
         })
 }
 
-fn is_retained_artifact(relative: &Path) -> bool {
+fn is_protected_artifact(relative: &Path, protected: &[&str]) -> bool {
     relative
         .components()
         .next()
         .is_some_and(|component| match component {
-            std::path::Component::Normal(name) => RETAINED_ARTIFACTS
+            std::path::Component::Normal(name) => protected
                 .iter()
                 .any(|retained| name == std::ffi::OsStr::new(retained)),
             _ => false,
@@ -2443,11 +2596,10 @@ fn render_status(
     )
 }
 
-/// Copies a verified browser package into `play/`, records `last-green.json`,
-/// and returns the published relative paths in stable order.
+/// Copies a verified browser package into `play/` and returns the published
+/// relative paths in stable order.
 fn copy_playable_build(
     playable: Option<&PlayableBuild>,
-    inputs: &SiteInputs,
     output: &Path,
 ) -> Result<Vec<PathBuf>, SitegenError> {
     let Some(playable) = playable else {
@@ -2465,26 +2617,37 @@ fn copy_playable_build(
         path: destination.clone(),
         message: error.to_string(),
     })?;
-    copy_site_tree(&package, &package, &destination, false)?;
+    copy_site_tree(&package, &package, &destination, &[])?;
 
     let mut game_files = collect_files(&destination, output)?;
     game_files.sort();
+    Ok(game_files)
+}
+
+/// Records what this build published, enumerated from the output it wrote.
+///
+/// The hash belongs to the frames that were actually promoted, so a run that
+/// published no pixels records none, and the screenshot list is read back from
+/// the published directory rather than predicted from the promotion plan.
+fn write_last_green(
+    playable: Option<&PlayableBuild>,
+    evidence: Option<&PublishedEvidence>,
+    output: &Path,
+) -> Result<(), SitegenError> {
+    let Some(playable) = playable else {
+        return Ok(());
+    };
     let manifest = LastGreenManifest {
         source_commit: playable.source_commit.clone(),
-        semantic_visual_hash: inputs
-            .verification
-            .as_ref()
-            .map(|evidence| evidence.summary.semantic_visual_hash.clone()),
-        game_files: game_files.clone(),
-        screenshot_files: Vec::new(),
+        semantic_visual_hash: evidence.map(|evidence| evidence.semantic_visual_hash.clone()),
+        game_files: published_files(output, "play")?,
+        screenshot_files: published_files(output, CURRENT_SCREENSHOTS)?,
     };
     let json = serde_json::to_string_pretty(&manifest).map_err(|error| SitegenError::Json {
-        path: PathBuf::from("last-green.json"),
+        path: PathBuf::from(LAST_GREEN_FILE),
         message: error.to_string(),
     })?;
-    write_file(&output.join("last-green.json"), json.as_bytes())?;
-
-    Ok(game_files)
+    write_file(&output.join(LAST_GREEN_FILE), json.as_bytes())
 }
 
 /// Every regular file below `root`, relative to `base`, in directory order.

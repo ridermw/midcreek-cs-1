@@ -1854,6 +1854,51 @@ mod verification_publication_contract {
         );
     }
 
+    /// A relative path made only of normal components, naming a real regular
+    /// file that is not itself a link, still escapes its root when a directory
+    /// above it is a link. Only canonicalizing both sides catches it.
+    #[test]
+    fn an_artifact_below_a_symlinked_ancestor_that_escapes_the_root_is_refused() {
+        let root = scratch("symlinked-ancestor-root");
+        let outside = scratch("symlinked-ancestor-target");
+        copy_verification_fixture(root.path());
+
+        let name = FrameName::WalkNorthEast.file_name();
+        let frames = outside.path().join("frames");
+        fs::create_dir_all(&frames).unwrap();
+        fs::copy(verification_root().join(name), frames.join(name)).unwrap();
+        std::os::unix::fs::symlink(&frames, root.path().join("frames")).unwrap();
+
+        let declared = format!("frames/{name}");
+        let mut report = raw_report("report.json");
+        report.frames.get_mut(name).unwrap().path = declared.clone();
+
+        // Every check that precedes canonicalization is satisfied: the path is
+        // relative, carries only normal components, and names a regular file
+        // that is not a link.
+        assert!(
+            Path::new(&declared)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        );
+        let reached = fs::symlink_metadata(root.path().join(&declared)).unwrap();
+        assert!(reached.is_file() && !reached.file_type().is_symlink());
+        assert_eq!(
+            fs::read(root.path().join(&declared)).unwrap(),
+            fs::read(verification_root().join(name)).unwrap(),
+            "the artifact is otherwise entirely valid"
+        );
+
+        let result = VerificationEvidence::project(&report, root.path(), None);
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedArtifact { path })
+                if path == Path::new(&declared)),
+            "{:?}",
+            result.err()
+        );
+    }
+
     #[test]
     fn a_missing_artifact_is_refused() {
         let root = scratch("missing-artifact");
@@ -2190,10 +2235,43 @@ mod verification_publication_contract {
         let site = build_fixture_site("verified-game").unwrap();
         let html = site.index_html();
 
-        assert_text(&html, "#tests", "Rendered image contracts");
+        assert_text(&html, "#tests", "Verified frame captures");
         assert_text(&html, "#tests", "14 passed");
         assert_text(&html, "#tests", "Browser readiness");
         assert_text(&html, "#tests", "4.82 s");
+    }
+
+    /// The projection reads the run's own report. It can vouch for the frames
+    /// the run really captured, but it never re-runs `evaluate_frame`, so it
+    /// must not publish the render contract's verdict as if it had.
+    #[test]
+    fn the_published_gates_never_claim_the_render_image_contract_passed() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+        let summary =
+            serde_json::from_str::<VerificationSummary>(&read(site.root().join(VERIFICATION_FILE)))
+                .unwrap();
+
+        assert!(
+            !html.contains("Rendered image contracts"),
+            "the report alone cannot vouch for the reference image analyzers"
+        );
+        assert!(
+            summary
+                .gates
+                .iter()
+                .all(|gate| gate.name != "Rendered image contracts"),
+            "{:?}",
+            summary.gates
+        );
+        assert!(
+            summary
+                .gates
+                .iter()
+                .any(|gate| gate.name == "Verified frame captures" && gate.passed == 14),
+            "{:?}",
+            summary.gates
+        );
     }
 
     #[test]
@@ -2481,6 +2559,93 @@ mod verification_publication_contract {
             subject: "Publish verification evidence".to_owned(),
             committed_at: "2026-08-30T09:00:00Z".to_owned(),
             task_id: Some("autonomous-assets".to_owned()),
+        }
+    }
+
+    /// A build that publishes both domains at once: the packaged game and the
+    /// promoted verification frames.
+    #[test]
+    fn last_green_metadata_enumerates_the_screenshots_it_actually_promoted() {
+        let package = scratch("last-green-package");
+        for (relative, contents) in [
+            ("index.html", "<!doctype html><html><body></body></html>"),
+            ("game.js", "export default function init() {}"),
+            ("game_bg.wasm", "\0asm"),
+            ("play.js", "// bootstrap"),
+            ("play.css", "/* shell */"),
+            ("assets/generated/rack.glb", "glTF"),
+        ] {
+            let path = package.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let mut inputs = site_inputs("verified-game");
+        inputs.playable = Some(midcreek_cs_1::sitegen::PlayableBuild {
+            directory: package.path().to_path_buf(),
+            source_commit: "1111111111111111111111111111111111111111".to_owned(),
+            run_url: "https://example.invalid/run/1".to_owned(),
+        });
+
+        let site = build_site_from_inputs("last-green-evidence", &inputs).unwrap();
+        let metadata = serde_json::from_str::<midcreek_cs_1::sitegen::LastGreenManifest>(&read(
+            site.root().join("last-green.json"),
+        ))
+        .unwrap();
+        let summary =
+            serde_json::from_str::<VerificationSummary>(&read(site.root().join(VERIFICATION_FILE)))
+                .unwrap();
+
+        assert_eq!(
+            metadata.semantic_visual_hash.as_deref(),
+            Some(summary.semantic_visual_hash.as_str())
+        );
+        for file in &metadata.screenshot_files {
+            assert!(
+                site.root().join(file).is_file(),
+                "last-green.json names {file:?}, which was never published"
+            );
+        }
+
+        let mut published = Vec::new();
+        collect_relative(
+            &site.root().join(CURRENT_SCREENSHOTS),
+            site.root(),
+            &mut published,
+        );
+        published.sort();
+        assert!(
+            !published.is_empty(),
+            "this fixture promotes a full set of current frames"
+        );
+        assert_eq!(
+            metadata.screenshot_files, published,
+            "every current screenshot is listed exactly once"
+        );
+        assert!(
+            site.root().join(HISTORY_SCREENSHOTS).is_dir(),
+            "this fixture also opens a history point, so the distinction is real"
+        );
+        assert!(
+            metadata
+                .screenshot_files
+                .iter()
+                .all(|file| !file.starts_with(HISTORY_SCREENSHOTS)),
+            "history frames are not the current screenshots"
+        );
+    }
+
+    /// Every regular file below `root`, relative to `base`.
+    fn collect_relative(root: &Path, base: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_relative(&path, base, found);
+            } else {
+                found.push(path.strip_prefix(base).unwrap().to_path_buf());
+            }
         }
     }
 

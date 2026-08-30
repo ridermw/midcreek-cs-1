@@ -561,8 +561,7 @@ seconds and shows five approved palette classes across the full 1152x648 canvas.
 
 A green run publishes the package under `play/` together with `last-green.json`.
 Any failing run retains the previous verified game, because `assemble_site`
-treats `play/`, `screenshots/`, `gallery.json`, and `last-green.json` as
-retained artifacts.
+treats `play/` and `last-green.json` as one retained domain.
 
 Three containment rules keep publication and the gate from destroying anything:
 
@@ -766,11 +765,20 @@ no captured output, no host or environment value, no absolute path, and no
 `failure_reason`: a failure publishes the named stage it stopped in and the
 metrics that missed their bounds, and the workflow run keeps the rest.
 
+The gates are named for what the two documents can actually prove. The
+report-derived gate is `Verified frame captures`: it reports the frames the run
+really captured and the metric bounds the run itself recorded as missed. It is
+deliberately not called a rendered image contract, because the projection never
+re-runs `evaluate_frame` and so holds no verdict from the reference image
+analyzers. Publishing that verdict needs the render-contract job's own result.
+
 Four containment rules apply before a single pixel is copied:
 
 - every artifact path is resolved strictly inside the directory that declared
-  it, so an absolute path, a `..` escape, a symbolic link, and a link above the
-  directory are all refused;
+  it: an absolute path, a `..` escape, a backslash, and a symbolic link at the
+  artifact itself are refused outright, and both the root and the artifact are
+  then canonicalized so that a symbolic link anywhere *above* an otherwise
+  valid file cannot smuggle it in from outside the root;
 - a missing artifact and an undecodable image are refused;
 - an image whose size disagrees with its own report is refused;
 - a report whose approved-reference hashes are not the ones this repository
@@ -801,15 +809,38 @@ and a failure cannot erase one. A green run whose hash did not move still
 republishes the current frames.
 
 A failed run writes `verification.json` and nothing else, so `screenshots/` and
-`gallery.json` stay absent from the generated tree and `assemble_site` retains
-whatever the last green publication left there. `gallery.json` is a retained
-artifact alongside `play/`, `screenshots/`, and `last-green.json`, and a green
-replacement now carries `screenshots/history/` forward rather than dropping it.
+`gallery.json` stay absent from the generated tree.
+
+Assembly then retains the two domains independently, because a run can verify
+without packaging a game and can package a game without verifying anything:
+
+- the playable domain is `play/` and `last-green.json`. A `GreenReplacement`
+  publishes the current package; every retention disposition keeps the previous
+  one and never lets a status-only build publish an unverified package.
+- the evidence domain is decided by what the current tree actually published.
+  Promoted frames replace `screenshots/current/`, `gallery.json`, and
+  `verification.json` while `screenshots/history/` always carries forward. A
+  projection alone — a failure, or a green run that promoted no pixels —
+  publishes this run's status over the retained pixels and the manifest that
+  names them. A build with no evidence at all retains the whole previous
+  evidence set, so an image is never left without the manifest that names it.
+
+So `RetainLastGreen` keeps the last verified game while publishing the native
+evidence this run really produced, and `FailedRetainLastGreen` publishes the
+current failure status beside the last green screenshots.
+
+`last-green.json` describes the assembled tree rather than the plan that
+produced it. The generator writes it after promotion completes, enumerating
+`play/` and `screenshots/current/` from the output it wrote, and assembly
+reconciles it again once the two domains are combined, taking the semantic hash
+from a succeeded `verification.json` only.
 
 Because older history images arrive at assembly rather than at generation, the
 published `gallery.json` is what vouches for them: `validate_site_output`
 accepts a `screenshots/history/` link the manifest declares and still rejects
-one it does not.
+one it does not. Assembly is where they arrive, so `validate_assembled_links`
+re-checks every link of the assembled page against the assembled tree with no
+allowance left — after assembly the file has to be there.
 
 The site generator and its CLI are native-only. Publication reads the
 repository, decodes verified frames, and writes files, so the browser game

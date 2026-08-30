@@ -7,7 +7,8 @@ use std::{
 };
 
 use midcreek_cs_1::sitegen::{
-    BuildDisposition, GateStatus, SitegenError, WorkflowSummary, assemble_site,
+    BuildDisposition, GateStatus, LastGreenManifest, SitegenError, WorkflowSummary, assemble_site,
+    validate_assembled_links,
 };
 use sha2::{Digest, Sha256};
 
@@ -830,5 +831,506 @@ fn a_first_green_run_without_a_previous_site_publishes_its_own_history() {
             .path()
             .join("screenshots/history/11111111/01-healthy-center-ne.png")
             .is_file()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verified evidence is its own domain, retained independently of the game
+// ---------------------------------------------------------------------------
+
+/// The manifest a previous green publication left behind, naming one accepted
+/// history point.
+const PRIOR_GALLERY: &str = r#"{"entries":[{"semantic_visual_hash":"aaaaaaaa","source_commit":"2222222222222222222222222222222222222222","committed_at":"2026-08-28T00:00:00Z","current_task":"pages-verification","frames":{"center":"screenshots/history/22222222/01-healthy-center-ne.png"},"metrics":{},"metric_deltas":{}}]}"#;
+
+/// The same manifest after a later green run opened a second point.
+const TWO_POINT_GALLERY: &str = r#"{"entries":[{"semantic_visual_hash":"aaaaaaaa","source_commit":"2222222222222222222222222222222222222222","committed_at":"2026-08-28T00:00:00Z","current_task":"pages-verification","frames":{"center":"screenshots/history/22222222/01-healthy-center-ne.png"},"metrics":{},"metric_deltas":{}},{"semantic_visual_hash":"bbbbbbbb","source_commit":"1111111111111111111111111111111111111111","committed_at":"2026-08-30T00:00:00Z","current_task":"pages-status-always","frames":{"center":"screenshots/history/11111111/01-healthy-center-ne.png"},"metrics":{},"metric_deltas":{}}]}"#;
+
+const OLD_HISTORY: &str = "screenshots/history/22222222/01-healthy-center-ne.png";
+const NEW_HISTORY: &str = "screenshots/history/11111111/01-healthy-center-ne.png";
+const CURRENT_FRAME: &str = "screenshots/current/01-healthy-center-ne.png";
+
+/// A green projection, exactly as `verification.json` records one.
+const GREEN_PROJECTION: &str = r#"{"succeeded":true,"semantic_visual_hash":"bbbbbbbb"}"#;
+
+/// A failed projection: the current status, with no pixels behind it. It still
+/// carries the run's semantic hash, exactly as `VerificationSummary` does.
+const FAILED_PROJECTION: &str =
+    r#"{"succeeded":false,"failed_stage":"repair","semantic_visual_hash":"cccccccc"}"#;
+
+/// An index that links exactly the given site-relative targets.
+fn index_linking(targets: &[&str]) -> String {
+    let images = targets
+        .iter()
+        .map(|target| format!(r#"<img src="{target}" alt="a verified frame">"#))
+        .collect::<String>();
+    format!(
+        "<!doctype html><html><head><title>Hub</title></head><body><main>{images}</main></body></html>"
+    )
+}
+
+/// A previous publication carrying a complete green evidence set.
+fn previous_with_evidence(name: &str, index: &str) -> TempDirectory {
+    let mut files = vec![
+        ("index.html", index),
+        ("gallery.json", PRIOR_GALLERY),
+        ("verification.json", GREEN_PROJECTION),
+        (CURRENT_FRAME, "old current"),
+        (OLD_HISTORY, "old history"),
+        ("play/game_bg.wasm", "last-known-good-game"),
+        ("play/index.html", "old shell"),
+        (
+            "last-green.json",
+            r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/game_bg.wasm","play/index.html"],"screenshot_files":["screenshots/current/01-healthy-center-ne.png"]}"#,
+        ),
+    ];
+    files.sort();
+    fixture_site(name, &files)
+}
+
+#[test]
+fn a_green_replacement_without_current_evidence_keeps_the_manifest_that_names_its_history() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("prior-evidence", &previous_index);
+    // The next green build carries no verification evidence at all: no
+    // projection, no gallery, no screenshots.
+    let current_index = index_linking(&[]);
+    let mut files = vec![("index.html", current_index.as_str())];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("green-without-evidence", &files);
+    let output = TempDirectory::new("green-without-evidence-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::GreenReplacement);
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        PRIOR_GALLERY,
+        "history images without the manifest that names them are orphans"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(OLD_HISTORY)).unwrap(),
+        "old history"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(CURRENT_FRAME)).unwrap(),
+        "old current",
+        "a build that verified nothing must not drop the last verified frames"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("verification.json")).unwrap(),
+        GREEN_PROJECTION,
+        "the last published evidence stays beside the pixels it describes"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "verified-new-game",
+        "the playable domain is still replaced wholesale"
+    );
+}
+
+#[test]
+fn two_later_builds_keep_the_earliest_history_named_and_renderable() {
+    let first_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let first = previous_with_evidence("chain-first", &first_index);
+
+    // Build two: green, but it verified nothing, so it publishes no evidence.
+    let quiet_index = index_linking(&[]);
+    let mut quiet_files = vec![("index.html", quiet_index.as_str())];
+    quiet_files.extend_from_slice(COMPLETE_PACKAGE);
+    let quiet = fixture_site("chain-quiet", &quiet_files);
+    let second = TempDirectory::new("chain-second-output");
+    assert_eq!(
+        assemble_site(
+            Some(first.path()),
+            quiet.path(),
+            &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+            second.path(),
+        )
+        .unwrap(),
+        BuildDisposition::GreenReplacement
+    );
+
+    // Build three: green with new evidence. It writes only its own history
+    // point, and its page links both points, exactly as the generator renders
+    // a two-entry gallery.
+    let loud_index = index_linking(&[OLD_HISTORY, NEW_HISTORY, CURRENT_FRAME]);
+    let mut loud_files = vec![
+        ("index.html", loud_index.as_str()),
+        ("gallery.json", TWO_POINT_GALLERY),
+        ("verification.json", GREEN_PROJECTION),
+        (CURRENT_FRAME, "new current"),
+        (NEW_HISTORY, "new history"),
+    ];
+    loud_files.extend_from_slice(COMPLETE_PACKAGE);
+    let loud = fixture_site("chain-loud", &loud_files);
+    let third = TempDirectory::new("chain-third-output");
+
+    let disposition = assemble_site(
+        Some(second.path()),
+        loud.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        third.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::GreenReplacement);
+    assert_eq!(
+        fs::read_to_string(third.path().join(OLD_HISTORY)).unwrap(),
+        "old history",
+        "the earliest accepted point survives two later builds"
+    );
+    assert_eq!(
+        fs::read_to_string(third.path().join(NEW_HISTORY)).unwrap(),
+        "new history"
+    );
+    assert_eq!(
+        fs::read_to_string(third.path().join("gallery.json")).unwrap(),
+        TWO_POINT_GALLERY,
+        "the manifest must still name the earliest point"
+    );
+    // Named and renderable: every link the assembled page makes resolves
+    // against the assembled tree.
+    validate_assembled_links(third.path()).unwrap();
+}
+
+#[test]
+fn a_status_only_run_publishes_current_evidence_while_retaining_the_previous_game() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("retain-game-prior", &previous_index);
+    // Native verification passed and the web gate was skipped: there is no new
+    // package, but the native run produced complete evidence.
+    let current_index = index_linking(&[OLD_HISTORY, NEW_HISTORY, CURRENT_FRAME]);
+    let current = fixture_site(
+        "retain-game-current",
+        &[
+            ("index.html", current_index.as_str()),
+            ("gallery.json", TWO_POINT_GALLERY),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "new current"),
+            (NEW_HISTORY, "new history"),
+        ],
+    );
+    let output = TempDirectory::new("retain-game-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game",
+        "the playable domain is retained"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(CURRENT_FRAME)).unwrap(),
+        "new current",
+        "the evidence domain is promoted on its own merit"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(NEW_HISTORY)).unwrap(),
+        "new history"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(OLD_HISTORY)).unwrap(),
+        "old history"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        TWO_POINT_GALLERY
+    );
+    validate_assembled_links(output.path()).unwrap();
+}
+
+#[test]
+fn a_status_only_run_without_evidence_retains_the_previous_evidence_and_game() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("retain-both-prior", &previous_index);
+    let current_index = index_linking(&[]);
+    let current = fixture_site(
+        "retain-both-current",
+        &[("index.html", current_index.as_str())],
+    );
+    let output = TempDirectory::new("retain-both-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(CURRENT_FRAME)).unwrap(),
+        "old current"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        PRIOR_GALLERY
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("verification.json")).unwrap(),
+        GREEN_PROJECTION
+    );
+}
+
+#[test]
+fn a_failed_run_publishes_its_failure_while_retaining_the_previous_pixels() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("failure-prior", &previous_index);
+    let current_index = index_linking(&[]);
+    let current = fixture_site(
+        "failure-current",
+        &[
+            ("index.html", current_index.as_str()),
+            ("verification.json", FAILED_PROJECTION),
+        ],
+    );
+    let output = TempDirectory::new("failure-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("verification.json")).unwrap(),
+        FAILED_PROJECTION,
+        "a failure publishes its own status, not the last green one"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(CURRENT_FRAME)).unwrap(),
+        "old current"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        PRIOR_GALLERY
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+}
+
+#[test]
+fn a_web_failure_still_publishes_the_native_evidence_that_passed() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("web-failure-prior", &previous_index);
+    // Native verification passed and promoted its frames; only the browser
+    // gate failed, so the previous package stays published.
+    let current_index = index_linking(&[OLD_HISTORY, NEW_HISTORY, CURRENT_FRAME]);
+    let current = fixture_site(
+        "web-failure-current",
+        &[
+            ("index.html", current_index.as_str()),
+            ("gallery.json", TWO_POINT_GALLERY),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "new current"),
+            (NEW_HISTORY, "new history"),
+        ],
+    );
+    let output = TempDirectory::new("web-failure-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Failed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(CURRENT_FRAME)).unwrap(),
+        "new current"
+    );
+    validate_assembled_links(output.path()).unwrap();
+}
+
+#[test]
+fn an_assembled_page_that_links_a_file_assembly_did_not_carry_is_refused() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("dangling-prior", &previous_index);
+    // The page links a history point no manifest declares and no build wrote.
+    let current_index = index_linking(&["screenshots/history/deadbeef/01-healthy-center-ne.png"]);
+    let current = fixture_site(
+        "dangling-current",
+        &[("index.html", current_index.as_str())],
+    );
+    let output = TempDirectory::new("dangling-output");
+
+    let result = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::BrokenLocalLink { .. })),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn a_status_only_run_never_publishes_a_package_it_did_not_verify() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("unverified-package-prior", &previous_index);
+    // No gate verified this package, so it must never reach the site even
+    // though the build left one behind.
+    let current_index = index_linking(&[]);
+    let current = fixture_site(
+        "unverified-package-current",
+        &[
+            ("index.html", current_index.as_str()),
+            ("play/game_bg.wasm", "unverified-game"),
+            ("play/index.html", "unverified shell"),
+            ("last-green.json", r#"{"source_commit":"unverified"}"#),
+        ],
+    );
+    let output = TempDirectory::new("unverified-package-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/index.html")).unwrap(),
+        "old shell"
+    );
+    let metadata: LastGreenManifest =
+        serde_json::from_str(&fs::read_to_string(output.path().join("last-green.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        metadata.source_commit, "2222222222222222222222222222222222222222",
+        "the retained game keeps the manifest that describes it"
+    );
+}
+
+#[test]
+fn a_failed_projection_never_relabels_the_retained_screenshots() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("failed-hash-prior", &previous_index);
+    let current_index = index_linking(&[]);
+    let current = fixture_site(
+        "failed-hash-current",
+        &[
+            ("index.html", current_index.as_str()),
+            ("verification.json", FAILED_PROJECTION),
+        ],
+    );
+    let output = TempDirectory::new("failed-hash-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let metadata: LastGreenManifest =
+        serde_json::from_str(&fs::read_to_string(output.path().join("last-green.json")).unwrap())
+            .unwrap();
+
+    assert_eq!(
+        metadata.semantic_visual_hash.as_deref(),
+        Some("aaaaaaaa"),
+        "a failed projection describes no pixels, so it supplies no hash"
+    );
+    assert_eq!(
+        metadata.screenshot_files,
+        [PathBuf::from(
+            "screenshots/current/01-healthy-center-ne.png"
+        )],
+        "the retained frames are still the ones the manifest names"
+    );
+}
+
+#[test]
+fn retained_last_green_metadata_is_reconciled_with_the_assembled_tree() {
+    let previous_index = index_linking(&[OLD_HISTORY, CURRENT_FRAME]);
+    let previous = previous_with_evidence("reconcile-prior", &previous_index);
+    let current_index = index_linking(&[OLD_HISTORY, NEW_HISTORY, CURRENT_FRAME]);
+    let current = fixture_site(
+        "reconcile-current",
+        &[
+            ("index.html", current_index.as_str()),
+            ("gallery.json", TWO_POINT_GALLERY),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "new current"),
+            ("screenshots/current/worker-crop.png", "new crop"),
+            (NEW_HISTORY, "new history"),
+        ],
+    );
+    let output = TempDirectory::new("reconcile-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    let metadata: LastGreenManifest =
+        serde_json::from_str(&fs::read_to_string(output.path().join("last-green.json")).unwrap())
+            .unwrap();
+
+    assert_eq!(
+        metadata.source_commit, "2222222222222222222222222222222222222222",
+        "the retained manifest still describes the retained game"
+    );
+    assert_eq!(
+        metadata.game_files,
+        ["play/game_bg.wasm", "play/index.html"].map(PathBuf::from)
+    );
+    assert_eq!(
+        metadata.screenshot_files,
+        [
+            "screenshots/current/01-healthy-center-ne.png",
+            "screenshots/current/worker-crop.png",
+        ]
+        .map(PathBuf::from),
+        "the manifest must enumerate the pixels the assembled tree actually holds"
+    );
+    assert_eq!(
+        metadata.semantic_visual_hash.as_deref(),
+        Some("bbbbbbbb"),
+        "the promoted evidence supplies the hash of the promoted frames"
     );
 }
