@@ -36,6 +36,10 @@ from pathlib import Path
 
 READY_TIMEOUT_SECONDS = 30
 BROWSER_TIMEOUT_SECONDS = 30
+# A DevTools answer is a JSON document; a screenshot is the largest one the
+# gate ever asks for. Anything past this is a confused browser, not a message.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+MAX_CONTROL_PAYLOAD_BYTES = 125
 ASPECT_TOLERANCE_PIXELS = 1.0
 MINIMUM_PALETTE_CLASSES = 3
 MINIMUM_CLASS_SHARE = 0.01
@@ -62,12 +66,32 @@ class GateFailure(Exception):
 
 
 class WebSocket:
-    """The smallest RFC 6455 text client the DevTools Protocol needs."""
+    """An RFC 6455 client with the framing the DevTools Protocol really uses.
 
-    def __init__(self, url: str, timeout: float = BROWSER_TIMEOUT_SECONDS) -> None:
+    Messages are reassembled across continuation frames, control frames may be
+    interleaved at any point, and both a single announced frame and a
+    reassembled message are bounded, so a confused browser fails loudly instead
+    of making the gate hang or exhaust memory.
+    """
+
+    CONTINUATION = 0x0
+    TEXT = 0x1
+    BINARY = 0x2
+    CLOSE = 0x8
+    PING = 0x9
+    PONG = 0xA
+    CONTROL_OPCODES = (CLOSE, PING, PONG)
+
+    def __init__(
+        self,
+        url: str,
+        timeout: float = BROWSER_TIMEOUT_SECONDS,
+        max_message_bytes: int = MAX_MESSAGE_BYTES,
+    ) -> None:
         match = re.match(r"ws://([^/:]+):(\d+)(/.*)", url)
         if not match:
             raise GateFailure(f"unsupported DevTools endpoint: {url}")
+        self._max_message_bytes = max_message_bytes
         host, port, resource = match.group(1), int(match.group(2)), match.group(3)
         self._socket = socket.create_connection((host, port), timeout=timeout)
         self._socket.settimeout(timeout)
@@ -89,14 +113,24 @@ class WebSocket:
             raise GateFailure(f"DevTools refused the WebSocket upgrade: {head!r}")
 
     def _read_more(self) -> None:
-        chunk = self._socket.recv(65536)
+        try:
+            chunk = self._socket.recv(65536)
+        except TimeoutError as failure:
+            raise GateFailure(
+                "the DevTools WebSocket stopped answering with "
+                f"{len(self._buffer)} bytes buffered: {failure}"
+            ) from failure
+        except OSError as failure:
+            raise GateFailure(
+                f"the DevTools WebSocket could not be read: {failure}"
+            ) from failure
         if not chunk:
             raise GateFailure("the DevTools WebSocket closed unexpectedly")
         self._buffer += chunk
 
     def send(self, payload: str) -> None:
         data = payload.encode("utf-8")
-        header = bytearray([0x81])
+        header = bytearray([0x80 | self.TEXT])
         mask = os.urandom(4)
         length = len(data)
         if length < 126:
@@ -112,21 +146,73 @@ class WebSocket:
         self._socket.sendall(bytes(header) + masked)
 
     def receive(self) -> str:
+        """Returns the next complete message, reassembled across fragments."""
+        message = bytearray()
+        message_opcode: int | None = None
         while True:
-            frame = self._read_frame()
-            if frame is None:
+            final, opcode, payload = self._read_frame()
+
+            if opcode in self.CONTROL_OPCODES:
+                self._handle_control(final, opcode, payload, len(message))
                 continue
-            opcode, payload = frame
-            if opcode == 0x1:
-                return payload.decode("utf-8")
-            if opcode == 0x8:
-                raise GateFailure("the browser closed the DevTools connection")
-            if opcode == 0x9:
-                self._send_pong(payload)
+
+            if opcode == self.CONTINUATION:
+                if message_opcode is None:
+                    raise GateFailure(
+                        "the browser sent a continuation frame with no message to "
+                        f"continue (payload {payload[:64]!r})"
+                    )
+            elif opcode in (self.TEXT, self.BINARY):
+                if message_opcode is not None:
+                    raise GateFailure(
+                        f"the browser started a 0x{opcode:x} message inside an "
+                        f"unfinished 0x{message_opcode:x} message after "
+                        f"{len(message)} bytes"
+                    )
+                message_opcode = opcode
+            else:
+                raise GateFailure(f"unsupported WebSocket opcode 0x{opcode:x}")
+
+            message += payload
+            if len(message) > self._max_message_bytes:
+                raise GateFailure(
+                    f"a DevTools message grew past the {self._max_message_bytes} "
+                    f"byte limit at {len(message)} bytes"
+                )
+            if final:
+                try:
+                    return bytes(message).decode("utf-8")
+                except UnicodeDecodeError as failure:
+                    raise GateFailure(
+                        f"a DevTools message was not valid UTF-8: {failure}"
+                    ) from failure
+
+    def _handle_control(
+        self, final: bool, opcode: int, payload: bytes, pending: int
+    ) -> None:
+        if not final:
+            raise GateFailure(
+                f"the browser fragmented a control frame (opcode 0x{opcode:x})"
+            )
+        if len(payload) > MAX_CONTROL_PAYLOAD_BYTES:
+            raise GateFailure(
+                f"the browser sent a {len(payload)} byte control frame "
+                f"(opcode 0x{opcode:x}), over the {MAX_CONTROL_PAYLOAD_BYTES} "
+                "byte limit"
+            )
+        if opcode == self.CLOSE:
+            code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else None
+            reason = payload[2:].decode("utf-8", "replace")
+            raise GateFailure(
+                "the browser closed the DevTools connection "
+                f"(code {code}, reason {reason!r}) after {pending} pending bytes"
+            )
+        if opcode == self.PING:
+            self._send_pong(payload)
 
     def _send_pong(self, payload: bytes) -> None:
         mask = os.urandom(4)
-        header = bytearray([0x8A, 0x80 | len(payload)]) + mask
+        header = bytearray([0x80 | self.PONG, 0x80 | len(payload)]) + mask
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
         self._socket.sendall(bytes(header) + masked)
 
@@ -134,10 +220,17 @@ class WebSocket:
         while len(self._buffer) < count:
             self._read_more()
 
-    def _read_frame(self) -> tuple[int, bytes] | None:
+    def _read_frame(self) -> tuple[bool, int, bytes]:
         self._need(2)
         first, second = self._buffer[0], self._buffer[1]
+        if first & 0x70:
+            raise GateFailure(
+                f"the browser set a reserved WebSocket bit (0x{first:02x}); no "
+                "extension was negotiated"
+            )
+        final = bool(first & 0x80)
         opcode = first & 0x0F
+        masked = bool(second & 0x80)
         length = second & 0x7F
         offset = 2
         if length == 126:
@@ -148,10 +241,17 @@ class WebSocket:
             self._need(10)
             length = struct.unpack(">Q", self._buffer[2:10])[0]
             offset = 10
+        if masked:
+            raise GateFailure("the browser masked a server frame, which RFC 6455 forbids")
+        if length > self._max_message_bytes:
+            raise GateFailure(
+                f"the browser announced a {length} byte frame, over the "
+                f"{self._max_message_bytes} byte limit"
+            )
         self._need(offset + length)
         payload = self._buffer[offset : offset + length]
         self._buffer = self._buffer[offset + length :]
-        return opcode, bytes(payload)
+        return final, opcode, bytes(payload)
 
     def close(self) -> None:
         try:

@@ -6,7 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use midcreek_cs_1::sitegen::{BuildDisposition, GateStatus, WorkflowSummary, assemble_site};
+use midcreek_cs_1::sitegen::{
+    BuildDisposition, GateStatus, SitegenError, WorkflowSummary, assemble_site,
+};
 use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -326,7 +328,7 @@ mod workflow_contract {
         for fragment in [
             "rustup target add wasm32-unknown-unknown",
             "cargo install wasm-bindgen-cli --version",
-            "chromium-browser",
+            "google-chrome-stable",
             "./scripts/build-web.sh",
             "./scripts/web-smoke.sh",
             "actions/upload-artifact@",
@@ -336,6 +338,40 @@ mod workflow_contract {
                 "Build web should contain {fragment}"
             );
         }
+    }
+
+    #[test]
+    fn the_web_job_resolves_the_preinstalled_chrome_instead_of_installing_chromium() {
+        let workflow = workflow_source();
+        let web = web_job(&workflow);
+
+        assert!(
+            !web.contains("chromium-browser"),
+            "Build web must not install or hardcode chromium-browser: {web}"
+        );
+        assert!(
+            !web.contains("/usr/bin/"),
+            "Build web must not hardcode a browser path: {web}"
+        );
+
+        let resolved = web
+            .find("command -v google-chrome-stable")
+            .expect("Build web should resolve the preinstalled Chrome");
+        let asserted = web
+            .find("no preinstalled Google Chrome")
+            .expect("Build web should fail loudly when Chrome is absent");
+        let exported = web
+            .find(r#"echo "CHROME=$chrome" >> "$GITHUB_ENV""#)
+            .expect("Build web should export the resolved Chrome");
+        let smoke = web
+            .find("./scripts/web-smoke.sh")
+            .expect("Build web should run the browser gate");
+
+        assert!(web.contains("command -v google-chrome"), "{web}");
+        assert!(
+            resolved < asserted && asserted < exported && exported < smoke,
+            "Chrome must be resolved and asserted before the browser gate: {web}"
+        );
     }
 
     #[test]
@@ -473,16 +509,13 @@ fn a_green_run_replaces_the_previous_playable_build_and_last_green_metadata() {
             ("last-green.json", r#"{"source_commit":"old"}"#),
         ],
     );
-    let current = fixture_site(
-        "current-green-game",
-        &[
-            ("index.html", "CURRENT SOURCE: GREEN"),
-            ("play/game_bg.wasm", "verified-new-game"),
-            ("play/index.html", "new shell"),
-            ("screenshots/center.png", "verified-new-frame"),
-            ("last-green.json", r#"{"source_commit":"new"}"#),
-        ],
-    );
+    let mut current_files = vec![
+        ("index.html", "CURRENT SOURCE: GREEN"),
+        ("screenshots/center.png", "verified-new-frame"),
+        ("last-green.json", r#"{"source_commit":"new"}"#),
+    ];
+    current_files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("current-green-game", &current_files);
     let output = TempDirectory::new("green-replacement-output");
 
     let disposition = assemble_site(
@@ -506,4 +539,127 @@ fn a_green_run_replaces_the_previous_playable_build_and_last_green_metadata() {
         fs::read_to_string(output.path().join("screenshots/center.png")).unwrap(),
         "verified-new-frame"
     );
+}
+
+/// A complete current `play/` package, exactly as `build-web.sh` produces it.
+const COMPLETE_PACKAGE: &[(&str, &str)] = &[
+    ("play/index.html", "new shell"),
+    ("play/play.js", "// bootstrap"),
+    ("play/play.css", "/* shell */"),
+    ("play/game.js", "export default function init() {}"),
+    ("play/game_bg.wasm", "verified-new-game"),
+    ("play/assets/generated/rack.glb", "glTF"),
+];
+
+#[test]
+fn a_green_run_with_an_incomplete_package_refuses_to_wipe_the_previous_game() {
+    let previous = fixture_site(
+        "previous-green-complete",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("play/index.html", "old shell"),
+            ("play/play.js", "// old bootstrap"),
+            ("play/play.css", "/* old shell */"),
+            ("play/game.js", "// old bindings"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+            ("play/assets/generated/rack.glb", "glTF"),
+            ("last-green.json", r#"{"source_commit":"old"}"#),
+        ],
+    );
+    // The current green site lost its WASM payload, its stylesheet, and every
+    // generated asset. Replacing the previous game with it would publish a
+    // broken build and destroy the last known good one.
+    let current = fixture_site(
+        "current-green-incomplete",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("play/index.html", "new shell"),
+            ("play/play.js", "// bootstrap"),
+            ("play/game.js", "export default function init() {}"),
+        ],
+    );
+    let root = TempDirectory::new("incomplete-green-root");
+    let output = root.path().join("output");
+
+    let result = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        &output,
+    );
+
+    match result {
+        Err(SitegenError::IncompletePlayablePackage { path, missing }) => {
+            assert_eq!(path, current.path().join("play"));
+            assert_eq!(missing, ["play.css", "game_bg.wasm", "assets"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!output.exists(), "the output must be left untouched");
+    assert_eq!(
+        fs::read_to_string(previous.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+}
+
+#[test]
+fn a_green_run_that_lost_its_package_entirely_refuses_to_wipe_the_previous_game() {
+    let previous = fixture_site(
+        "previous-green-lost",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("play/index.html", "old shell"),
+            ("play/play.js", "// old bootstrap"),
+            ("play/play.css", "/* old shell */"),
+            ("play/game.js", "// old bindings"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+            ("play/assets/generated/rack.glb", "glTF"),
+        ],
+    );
+    let current = fixture_site(
+        "current-green-no-package",
+        &[("index.html", "CURRENT SOURCE: GREEN")],
+    );
+    let root = TempDirectory::new("lost-green-root");
+    let output = root.path().join("output");
+
+    let result = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        &output,
+    );
+
+    match result {
+        Err(SitegenError::IncompletePlayablePackage { path, missing }) => {
+            assert_eq!(path, current.path().join("play"));
+            assert_eq!(missing, ["play/"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!output.exists(), "the output must be left untouched");
+    assert_eq!(
+        fs::read_to_string(previous.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+}
+
+#[test]
+fn a_green_first_run_without_any_game_still_publishes_status_only() {
+    let current = fixture_site(
+        "current-green-status-only",
+        &[("index.html", "CURRENT SOURCE: GREEN")],
+    );
+    let output = TempDirectory::new("green-status-only-output");
+
+    let disposition = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::GreenReplacement);
+    assert!(output.path().join("index.html").exists());
 }

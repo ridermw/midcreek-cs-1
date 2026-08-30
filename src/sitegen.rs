@@ -156,7 +156,16 @@ pub struct PlayableBuild {
 }
 
 /// Every file the packaged browser game must contain before it is published.
-pub const REQUIRED_PLAYABLE_FILES: [&str; 4] = ["index.html", "play.js", "game.js", "game_bg.wasm"];
+pub const REQUIRED_PLAYABLE_FILES: [&str; 5] = [
+    "index.html",
+    "play.js",
+    "play.css",
+    "game.js",
+    "game_bg.wasm",
+];
+
+/// The directory holding the generated models the packaged game loads.
+pub const REQUIRED_PLAYABLE_ASSETS: &str = "assets";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildDisposition {
@@ -389,6 +398,8 @@ pub enum SitegenError {
     InvalidHtml { path: PathBuf, message: String },
     MissingPreviousArtifact { path: PathBuf },
     OutputNotEmpty { path: PathBuf },
+    UntrustedPlayablePackage { path: PathBuf },
+    IncompletePlayablePackage { path: PathBuf, missing: Vec<String> },
 }
 
 impl fmt::Display for SitegenError {
@@ -455,6 +466,21 @@ impl fmt::Display for SitegenError {
                     formatter,
                     "assembly output directory is not empty: {}",
                     path.display()
+                )
+            }
+            Self::UntrustedPlayablePackage { path } => {
+                write!(
+                    formatter,
+                    "playable package is not inside a trusted build root: {}",
+                    path.display()
+                )
+            }
+            Self::IncompletePlayablePackage { path, missing } => {
+                write!(
+                    formatter,
+                    "playable package {} is incomplete: missing {}",
+                    path.display(),
+                    missing.join(", ")
                 )
             }
         }
@@ -869,23 +895,34 @@ pub fn assemble_site(
     output: &Path,
 ) -> Result<BuildDisposition, SitegenError> {
     require_directory(current)?;
-    prepare_assembly_output(output)?;
 
     let disposition = match (workflow.native, workflow.web, previous) {
         (GateStatus::Passed, GateStatus::Passed, _) => BuildDisposition::GreenReplacement,
-        (GateStatus::Failed, _, Some(previous)) | (_, GateStatus::Failed, Some(previous)) => {
-            copy_retained_artifacts(previous, output)?;
+        (GateStatus::Failed, _, Some(_)) | (_, GateStatus::Failed, Some(_)) => {
             BuildDisposition::FailedRetainLastGreen
         }
         (GateStatus::Failed, _, None) | (_, GateStatus::Failed, None) => {
             BuildDisposition::FirstRunStatusOnly
         }
-        (_, _, Some(previous)) => {
-            copy_retained_artifacts(previous, output)?;
-            BuildDisposition::RetainLastGreen
-        }
+        (_, _, Some(_)) => BuildDisposition::RetainLastGreen,
         (_, _, None) => BuildDisposition::FirstRunStatusOnly,
     };
+
+    // A green replacement publishes the current tree alone, so the previous
+    // game is only ever discarded when a complete replacement really exists.
+    // Everything below runs before the output is touched.
+    if disposition == BuildDisposition::GreenReplacement {
+        require_complete_replacement(current, previous)?;
+    }
+
+    prepare_assembly_output(output)?;
+    if matches!(
+        disposition,
+        BuildDisposition::RetainLastGreen | BuildDisposition::FailedRetainLastGreen
+    ) {
+        let previous = previous.expect("retention dispositions carry a previous site");
+        copy_retained_artifacts(previous, output)?;
+    }
 
     copy_site_tree(
         current,
@@ -894,6 +931,53 @@ pub fn assemble_site(
         disposition != BuildDisposition::GreenReplacement,
     )?;
     Ok(disposition)
+}
+
+/// Refuses a green replacement that would publish a broken game or silently
+/// drop the last verified one.
+///
+/// A status-only site with no game at all is still a valid replacement, but
+/// only while there is no previous game left to lose.
+fn require_complete_replacement(
+    current: &Path,
+    previous: Option<&Path>,
+) -> Result<(), SitegenError> {
+    let package = current.join("play");
+    if !package.is_dir() {
+        let previous_has_game = previous.is_some_and(|previous| previous.join("play").is_dir());
+        if previous_has_game {
+            return Err(SitegenError::IncompletePlayablePackage {
+                path: package,
+                missing: vec!["play/".to_owned()],
+            });
+        }
+        return Ok(());
+    }
+
+    let missing = missing_playable_parts(&package);
+    if !missing.is_empty() {
+        return Err(SitegenError::IncompletePlayablePackage {
+            path: package,
+            missing,
+        });
+    }
+    Ok(())
+}
+
+/// Every required part a packaged browser game is missing, in declared order.
+fn missing_playable_parts(package: &Path) -> Vec<String> {
+    let mut missing = REQUIRED_PLAYABLE_FILES
+        .into_iter()
+        .filter(|required| !package.join(required).is_file())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let assets = package.join(REQUIRED_PLAYABLE_ASSETS);
+    let has_assets =
+        assets.is_dir() && collect_files(&assets, package).is_ok_and(|files| !files.is_empty());
+    if !has_assets {
+        missing.push(REQUIRED_PLAYABLE_ASSETS.to_owned());
+    }
+    missing
 }
 
 pub fn validate_site_output(
@@ -1036,6 +1120,73 @@ fn prepare_assembly_output(output: &Path) -> Result<(), SitegenError> {
             message: error.to_string(),
         }),
     }
+}
+
+/// The build roots a packaged browser game may legitimately come from.
+///
+/// Local runs and `sitegen` invocations build into the repository `target/`
+/// directory; the Pages workflow builds into the runner temporary directory.
+/// Nothing else is trusted, so a package path can never reach the source tree
+/// or an arbitrary location on the host.
+pub fn trusted_playable_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Ok(target) = fs::canonicalize(repository.join("target")) {
+        roots.push(target);
+    }
+    if let Some(runner_temp) = std::env::var_os("RUNNER_TEMP")
+        && let Ok(runner_temp) = fs::canonicalize(runner_temp)
+        && !roots.contains(&runner_temp)
+    {
+        roots.push(runner_temp);
+    }
+    roots
+}
+
+/// Canonicalizes a packaged browser game and proves it is strictly inside one
+/// of `trusted_roots`.
+///
+/// Absolute paths, relative parent escapes, source-tree paths, and symbolic
+/// links that leave a trusted root all resolve to a canonical path outside
+/// every root and are refused before a single byte is copied.
+pub fn resolve_playable_package(
+    directory: &Path,
+    trusted_roots: &[PathBuf],
+) -> Result<PathBuf, SitegenError> {
+    let untrusted = || SitegenError::UntrustedPlayablePackage {
+        path: directory.to_path_buf(),
+    };
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Err(untrusted()),
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(SitegenError::MissingInput {
+                path: directory.to_path_buf(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SitegenError::MissingInput {
+                path: directory.to_path_buf(),
+            });
+        }
+        Err(error) => {
+            return Err(SitegenError::Io {
+                path: directory.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    }
+    let canonical = fs::canonicalize(directory).map_err(|error| SitegenError::Io {
+        path: directory.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let contained = trusted_roots
+        .iter()
+        .any(|root| canonical != *root && canonical.starts_with(root));
+    if !contained {
+        return Err(untrusted());
+    }
+    Ok(canonical)
 }
 
 fn require_directory(path: &Path) -> Result<(), SitegenError> {
@@ -1288,12 +1439,11 @@ fn copy_playable_build(
     let Some(playable) = playable else {
         return Ok(Vec::new());
     };
-    require_directory(&playable.directory)?;
-    for required in REQUIRED_PLAYABLE_FILES {
-        let path = playable.directory.join(required);
-        if !path.is_file() {
-            return Err(SitegenError::MissingInput { path });
-        }
+    let package = resolve_playable_package(&playable.directory, &trusted_playable_roots())?;
+    if let Some(missing) = missing_playable_parts(&package).first() {
+        return Err(SitegenError::MissingInput {
+            path: package.join(missing),
+        });
     }
 
     let destination = output.join("play");
@@ -1301,12 +1451,7 @@ fn copy_playable_build(
         path: destination.clone(),
         message: error.to_string(),
     })?;
-    copy_site_tree(
-        &playable.directory,
-        &playable.directory,
-        &destination,
-        false,
-    )?;
+    copy_site_tree(&package, &package, &destination, false)?;
 
     let mut game_files = collect_files(&destination, output)?;
     game_files.sort();

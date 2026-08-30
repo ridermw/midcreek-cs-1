@@ -533,6 +533,21 @@ A green run publishes the package under `play/` together with `last-green.json`.
 Any failing run retains the previous verified game, because `assemble_site`
 treats `play/`, `screenshots/`, and `last-green.json` as retained artifacts.
 
+Three containment rules keep publication and the gate from destroying anything:
+
+- a packaged game is canonicalized and must sit strictly inside a trusted build
+  root, the repository `target/` directory or the workflow `RUNNER_TEMP`, so an
+  absolute path, a `..` escape, a source-tree path, and a symbolic link that
+  leaves the root are all refused before a byte is copied;
+- a `GreenReplacement` requires a complete current `play/` package, meaning
+  `index.html`, `play.js`, `play.css`, `game.js`, `game_bg.wasm`, and at least
+  one generated asset. An incomplete or missing package fails with
+  `IncompletePlayablePackage` and leaves the output untouched rather than
+  replacing a working game with a broken one;
+- `scripts/web-smoke.sh` never removes a caller path. The diagnostics directory
+  is canonicalized, contained to the same trusted roots, and cleaned only when
+  a previous run of the script left its `.midcreek-web-smoke` marker there.
+
 ## Foundation gates
 
 ```bash
@@ -560,9 +575,18 @@ Web gates:
 cargo test --lib web
 cargo test --test sitegen_contract
 cargo test --test pages_assembly_contract
+python3 scripts/browser_gate_test.py
 ./scripts/build-web.sh target/web-preview
 ./scripts/web-smoke.sh target/web-preview
 ```
 
 The browser gate needs a local Chrome or Chromium; set `CHROME` to point at one
-if it is not on the default macOS or Linux path.
+if it is not on the default macOS or Linux path. The Pages workflow resolves the
+runner's preinstalled `google-chrome-stable` and fails the job when it is
+absent, rather than installing a browser of its own.
+
+`scripts/browser_gate_test.py` drives the DevTools WebSocket client against a
+real loopback socket and proves single, fragmented, and control-interleaved
+messages reassemble, and that an unexpected continuation frame, an unfinished
+message, and an oversized message each fail with a `GateFailure` instead of
+hanging. `cargo test --test sitegen_contract` runs it too.

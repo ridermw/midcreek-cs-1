@@ -918,7 +918,7 @@ mod progress_contract {
 
 mod playable_publication_contract {
     use super::*;
-    use midcreek_cs_1::sitegen::PlayableBuild;
+    use midcreek_cs_1::sitegen::{PlayableBuild, resolve_playable_package, trusted_playable_roots};
     use std::path::PathBuf;
 
     const GREEN_COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -962,6 +962,7 @@ mod playable_publication_contract {
                 "play/game.js",
                 "play/game_bg.wasm",
                 "play/index.html",
+                "play/play.css",
                 "play/play.js",
             ]
             .map(PathBuf::from)
@@ -976,7 +977,9 @@ mod playable_publication_contract {
             &[
                 ("index.html", "<!doctype html>"),
                 ("play.js", "// bootstrap"),
+                ("play.css", "/* shell */"),
                 ("game.js", ""),
+                ("assets/generated/rack.glb", "glTF"),
             ],
         );
         let mut inputs = site_inputs("green");
@@ -996,19 +999,135 @@ mod playable_publication_contract {
     }
 
     #[test]
-    fn a_package_that_escapes_its_directory_is_refused() {
-        let package = package("escaping", PACKAGE_FILES);
+    fn a_package_without_generated_assets_is_refused_instead_of_published() {
+        let package = package(
+            "no-assets",
+            &[
+                ("index.html", "<!doctype html>"),
+                ("play.js", "// bootstrap"),
+                ("play.css", "/* shell */"),
+                ("game.js", ""),
+                ("game_bg.wasm", "\0asm"),
+            ],
+        );
         let mut inputs = site_inputs("green");
-        let mut build = playable(package.path());
-        build.directory = package.path().join("../..");
-        inputs.playable = Some(build);
+        inputs.playable = Some(playable(package.path()));
+
+        let result = build_site_from_inputs("playable-no-assets", &inputs);
+
+        assert!(
+            matches!(
+                &result,
+                Err(SitegenError::MissingInput { path })
+                    if path.file_name().is_some_and(|name| name == "assets")
+            ),
+            "{:?}",
+            result.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn a_complete_package_that_escapes_every_trusted_root_is_refused() {
+        // Every required file is present, so the only reason this can fail is
+        // that the directory is not inside a trusted build root.
+        let package = untrusted_package("escaping", PACKAGE_FILES);
+        for (relative, _) in PACKAGE_FILES {
+            assert!(package.path().join(relative).is_file(), "{relative}");
+        }
+        let roots = trusted_playable_roots();
+        assert!(
+            !roots
+                .iter()
+                .any(|root| package.path().starts_with(root.as_path())),
+            "the escape fixture must sit outside {roots:?}"
+        );
+        let mut inputs = site_inputs("green");
+        inputs.playable = Some(playable(package.path()));
 
         let result = build_site_from_inputs("playable-escaping", &inputs);
 
         assert!(
-            result.is_err(),
+            matches!(
+                &result,
+                Err(SitegenError::UntrustedPlayablePackage { path })
+                    if path == package.path()
+            ),
             "{:?}",
-            result.map(|site| site.index_html())
+            result.map(|site| site.index_html()).err()
+        );
+    }
+
+    #[test]
+    fn a_package_under_the_repository_target_root_is_trusted() {
+        let package = package("trusted-target", PACKAGE_FILES);
+
+        let resolved = resolve_playable_package(package.path(), &trusted_playable_roots()).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(package.path()).unwrap());
+    }
+
+    #[test]
+    fn a_package_under_the_runner_temp_root_is_trusted() {
+        let runner_temp = untrusted_package("runner-temp-root", &[]);
+        let directory = runner_temp.path().join("web");
+        write_package(&directory, PACKAGE_FILES);
+        let roots = vec![fs::canonicalize(runner_temp.path()).unwrap()];
+
+        let resolved = resolve_playable_package(&directory, &roots).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(&directory).unwrap());
+    }
+
+    #[test]
+    fn a_relative_parent_escape_from_a_trusted_root_is_refused() {
+        let package = package("relative-escape", PACKAGE_FILES);
+        let escape = package.path().join("../../..");
+
+        let result = resolve_playable_package(&escape, &trusted_playable_roots());
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_in_the_repository_source_tree_is_refused() {
+        let source_tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let result = resolve_playable_package(&source_tree, &trusted_playable_roots());
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_a_trusted_root_that_points_outside_it_is_refused() {
+        let outside = untrusted_package("symlink-escape-target", PACKAGE_FILES);
+        let holder = package("symlink-escape-holder", &[]);
+        let link = holder.path().join("web");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(link.join("game_bg.wasm").is_file());
+
+        let result = resolve_playable_package(&link, &trusted_playable_roots());
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn the_trusted_root_itself_is_not_a_package() {
+        let roots = trusted_playable_roots();
+
+        let result = resolve_playable_package(&roots[0], &roots);
+
+        assert!(
+            matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
+            "{result:?}"
         );
     }
 
@@ -1017,6 +1136,7 @@ mod playable_publication_contract {
         ("game.js", "export default function init() {}"),
         ("game_bg.wasm", "\0asm"),
         ("play.js", "// bootstrap"),
+        ("play.css", "/* shell */"),
         ("assets/generated/rack.glb", "glTF"),
     ];
 
@@ -1042,20 +1162,39 @@ mod playable_publication_contract {
         }
     }
 
-    fn package(name: &str, files: &[(&str, &str)]) -> Package {
+    fn unique_name(name: &str) -> String {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        format!(
             "midcreek-web-package-{}-{unique}-{name}",
             std::process::id()
-        ));
+        )
+    }
+
+    fn write_package(root: &Path, files: &[(&str, &str)]) {
+        fs::create_dir_all(root).unwrap();
         for (relative, contents) in files {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, contents).unwrap();
         }
+    }
+
+    /// A package inside the repository build root, where a real package lives.
+    fn package(name: &str, files: &[(&str, &str)]) -> Package {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/web-packages")
+            .join(unique_name(name));
+        write_package(&root, files);
+        Package(root)
+    }
+
+    /// A package outside every trusted build root.
+    fn untrusted_package(name: &str, files: &[(&str, &str)]) -> Package {
+        let root = std::env::temp_dir().join(unique_name(name));
+        write_package(&root, files);
         Package(root)
     }
 }
@@ -1182,11 +1321,176 @@ mod web_source_contract {
             "Input.dispatchKeyEvent",
             "Page.captureScreenshot",
             "scrollY",
+            "MAX_MESSAGE_BYTES",
         ] {
             assert!(
                 driver.contains(fragment),
                 "browser_gate.py must contain {fragment}"
             );
+        }
+    }
+
+    #[test]
+    fn the_browser_gate_reassembles_fragmented_websocket_messages() {
+        let driver = source("scripts/browser_gate.py");
+
+        for fragment in [
+            "CONTINUATION = 0x0",
+            "CONTROL_OPCODES",
+            "MAX_CONTROL_PAYLOAD_BYTES",
+            "max_message_bytes",
+            "def _handle_control",
+            "continuation frame with no message to",
+            "stopped answering",
+        ] {
+            assert!(
+                driver.contains(fragment),
+                "browser_gate.py must contain {fragment}"
+            );
+        }
+
+        let run = Command::new("python3")
+            .arg(repository().join("scripts/browser_gate_test.py"))
+            .output()
+            .expect("python3 should run the browser gate unit tests");
+
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    #[test]
+    fn the_browser_gate_only_cleans_diagnostics_it_owns() {
+        let script = source("scripts/web-smoke.sh");
+
+        for fragment in [
+            "midcreek-web-smoke",
+            "this script did not create it",
+            "refusing to write diagnostics outside",
+            "os.path.realpath",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "web-smoke.sh must contain {fragment}"
+            );
+        }
+        assert!(
+            !script.contains("diagnostics=\"${2:-$repository/target/web-smoke}\"\nrm -rf"),
+            "web-smoke.sh must never remove a caller path unconditionally"
+        );
+    }
+
+    #[test]
+    fn the_browser_gate_refuses_a_caller_owned_diagnostics_path() {
+        // The gate is handed the current directory, which is neither inside
+        // the repository build root nor a directory the gate created.
+        let sandbox = Sandbox::new("web-smoke-cwd");
+        fs::write(sandbox.path().join("keep-me.txt"), "caller owned").unwrap();
+        fs::create_dir(sandbox.path().join("nested")).unwrap();
+        fs::write(sandbox.path().join("nested/keep-me.txt"), "caller owned").unwrap();
+
+        let run = Command::new(repository().join("scripts/web-smoke.sh"))
+            .arg(repository().join("target"))
+            .arg(".")
+            .current_dir(sandbox.path())
+            .output()
+            .expect("the browser gate should launch");
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+        assert!(!run.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("refusing to write diagnostics outside"),
+            "{stderr}"
+        );
+        assert_eq!(read(sandbox.path().join("keep-me.txt")), "caller owned");
+        assert_eq!(
+            read(sandbox.path().join("nested/keep-me.txt")),
+            "caller owned"
+        );
+        for sentinel in ["Cargo.toml", "src/sitegen.rs", "scripts/web-smoke.sh"] {
+            assert!(
+                repository().join(sentinel).exists(),
+                "{sentinel} must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn the_browser_gate_refuses_a_diagnostics_directory_it_did_not_create() {
+        // Inside the build root, but populated by somebody else.
+        let sandbox = Sandbox::new_in(repository().join("target"), "web-smoke-foreign");
+        fs::write(sandbox.path().join("keep-me.txt"), "not ours").unwrap();
+
+        let run = Command::new(repository().join("scripts/web-smoke.sh"))
+            .arg(repository().join("target"))
+            .arg(sandbox.path())
+            .output()
+            .expect("the browser gate should launch");
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+        assert!(!run.status.success(), "{stderr}");
+        assert!(stderr.contains("this script did not create it"), "{stderr}");
+        assert_eq!(read(sandbox.path().join("keep-me.txt")), "not ours");
+    }
+
+    #[test]
+    fn the_browser_gate_refuses_source_root_and_symlink_diagnostics_paths() {
+        let sandbox = Sandbox::new_in(repository().join("target"), "web-smoke-links");
+        let link = sandbox.path().join("link");
+        std::os::unix::fs::symlink(sandbox.path(), &link).unwrap();
+
+        for candidate in [
+            repository().join("src"),
+            repository().to_path_buf(),
+            Path::new("/").to_path_buf(),
+            link,
+        ] {
+            let run = Command::new(repository().join("scripts/web-smoke.sh"))
+                .arg(repository().join("target"))
+                .arg(&candidate)
+                .output()
+                .expect("the browser gate should launch");
+            let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+            assert!(!run.status.success(), "{} {stderr}", candidate.display());
+            assert!(
+                stderr.contains("refusing"),
+                "{} {stderr}",
+                candidate.display()
+            );
+            assert!(repository().join("src/sitegen.rs").exists());
+        }
+    }
+
+    struct Sandbox(std::path::PathBuf);
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            Self::new_in(std::env::temp_dir(), name)
+        }
+
+        fn new_in(parent: impl AsRef<Path>, name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = parent
+                .as_ref()
+                .join(format!("midcreek-{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
