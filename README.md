@@ -199,8 +199,11 @@ node when the replacement is incomplete.
   the cel-shift floor-shadow role, sits 0.05 m below the floor so the coplanar
   40 m square never z-fights, carries no collider, and is never walkable.
 - Every frame the ground quadrilateral is cast from the current yaw, its
-  axis-aligned extents are subtracted from `RENDER_COVERAGE_SIZE`, and the
-  followed technician is clamped into what is left before the transform is
+  axis-aligned extents are subtracted from the *active blueprint's*
+  `room.coverage` -- the same field the validator checks and the apron is
+  authored from, falling back to `RENDER_COVERAGE_SIZE` exactly as the hall
+  spawner falls back to `SceneBlueprint::v0` -- and the followed technician is
+  clamped into what is left before the transform is
   derived. Because `72 / 2 - hypot(13, 8.71916) = 20.3468` m exceeds the room's
   20 m half extent, every legal player position is followed exactly, at every
   yaw; the clamp only ever engages for a position the technician cannot reach.
@@ -225,17 +228,48 @@ recovered ground target, and its projected framing through Bevy's real
 authored player spawn, all three aisle centre lines end to end, and all four
 room corners, at four settled headings and three tween samples each.
 
+**Tween samples are exact.** A sample of `n` frames is exactly `n / 18` of the
+turn: the key tap itself runs the first frame -- the press is read in
+`ReadInput` and the tween advances in `UpdateOrbitIntent` of that same frame --
+so the pump is one frame shorter and there is no trailing update. The requested
+midpoint really is `elapsed / duration = 0.5`, and because `smoothstep(0.5)` is
+`0.5` the eased yaw there is the plain arithmetic midpoint: 90 degrees
+clockwise off `NorthEast`, 90 degrees counter-clockwise off `SouthEast`, and
+0 degrees for both wraparounds through zero.
+`camera_orbit_tween_samples_land_on_the_exact_requested_fraction` asserts those
+numbers on the resource and on the real camera entity, and pins one frame later
+at `10 / 18` so an off-by-one frame cannot hide. Each batch of samples then runs
+with the virtual clock stopped, and asserts the whole `CameraOrbit` resource is
+unchanged and the yaw bit-identical for every sample, so a requested mid-tween
+state cannot settle part way through a loop.
+
+**Framing is the whole technician, not a ground point.** The gate projects the
+eight corners of the box that contains the technician's full spatial envelope,
+measured from the generated source: the rest pose and every sampled pose of the
+generated Idle, Walk, and Repair clips, rigidly skinned through the real rig,
+with the cel outline hulls included. That is a 0.7998 m radius and a 1.9704 m
+crown against a 0.3110 m radius and a 1.9440 m crown at rest, and every one of
+those corners has to stay at least 32 logical pixels inside the viewport.
+`camera_framing_margin_is_calibrated_against_the_real_pixel_to_world_scale`
+anchors that number independently: 1280 px over 26 m is 49.23077 px/m, so a
+point 12.35 m across the ground, or 7.9441 m along it, must project at exactly
+32 px from the edge, and one metre-pixel further out must fail the gate.
+
 **Room corners.** `camera_orbit_frames_every_room_corner_with_the_reviewed_margin`
 drives the running app to all four corners of the walkable room at all four
 settled headings and two tween samples each, asserts each tween sample really
-lies between headings, and requires both the reachable corner and the wall
-corner itself to keep at least 32 logical pixels of margin. The followed corner
+lies between headings, and requires the whole envelope around both the
+reachable corner and the wall corner itself to keep at least 32 logical pixels
+of margin. The followed corner
 is centred to within half a pixel and keeps the full 360 px half-viewport,
 because the apron lets the camera go there.
 `camera_orbit_holds_the_rendered_apron_instead_of_leaking_past_it` then proves
 the follow target is never clamped at a corner, that the whole ground
 quadrilateral stays inside the 72 m coverage, and that it genuinely does
 overhang the 40 m room -- so the apron is load bearing rather than decorative.
+`camera_follow_clamps_against_the_active_blueprint_coverage_not_the_constant`
+overrides the running hall with two other valid coverages and proves the
+runtime clamp boundary moves with the blueprint rather than with the constant.
 An earlier revision of the plan asked for corner framing *and* containment
 inside the 40 m room, which is impossible for any room size; the published
 challenge records how the two squares were separated.

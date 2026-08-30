@@ -12,7 +12,7 @@
 //!                      |
 //!                      v
 //! RENDER_COVERAGE_SIZE minus extents = legal target rectangle
-//!         (which contains the whole 40 m walkable room)
+//!   (blueprint.room.coverage; contains the whole 40 m walkable room)
 //!                      |
 //!                      v
 //! clamp followed player -> derive camera transform
@@ -22,8 +22,13 @@
 //! technician may only ever stand inside the 40 m room the perimeter walls
 //! enclose; the camera may overhang that room freely, because the 72 m visual
 //! apron beneath it is what actually gets rendered out there. The clamp is
-//! therefore against [`RENDER_COVERAGE_SIZE`], not
-//! [`ROOM_SIZE`](crate::design::ROOM_SIZE), and because
+//! therefore against the *rendered coverage of the hall that actually spawned*
+//! — [`HallBlueprint`]`.0.room.coverage`, the same field
+//! [`SceneBlueprint::validate`](crate::design::SceneBlueprint::validate)
+//! checks and the apron is authored from — falling back to
+//! [`RENDER_COVERAGE_SIZE`] exactly as `spawn_hall` falls back to
+//! [`SceneBlueprint::v0`](crate::design::SceneBlueprint::v0). It is never
+//! against [`ROOM_SIZE`](crate::design::ROOM_SIZE), and because
 //! `72 / 2 - hypot(13, 8.71916) = 20.3468` m exceeds the room's 20 m half
 //! extent, every legal player position is followed exactly, at every yaw. The
 //! clamp only ever engages for a position the technician cannot reach.
@@ -69,6 +74,7 @@ use crate::{
         ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, RENDER_COVERAGE_SIZE,
     },
     player::{Technician, ViewBasis},
+    world::HallBlueprint,
 };
 
 /// Degrees between two adjacent headings.
@@ -399,6 +405,17 @@ pub fn clamp_follow_target(player: Vec2, coverage: Vec2, yaw_radians: f32) -> Ve
     }
 }
 
+/// The rendered coverage the runtime clamp runs against.
+///
+/// The validator checks `blueprint.room.coverage` and the apron is authored
+/// from it, so the follow clamp reads the same field rather than the
+/// [`RENDER_COVERAGE_SIZE`] constant. An absent [`HallBlueprint`] falls back to
+/// the authored constant, which is exactly what `spawn_hall` spawns in that
+/// case.
+pub fn active_coverage(blueprint: Option<&HallBlueprint>) -> Vec2 {
+    blueprint.map_or(RENDER_COVERAGE_SIZE, |hall| hall.0.room.coverage)
+}
+
 /// Unit direction from the followed ground point towards the camera.
 pub fn camera_offset_direction(yaw_radians: f32) -> Vec3 {
     let elevation = CAMERA_ELEVATION_DEGREES.to_radians();
@@ -487,6 +504,7 @@ fn advance_orbit(time: Res<Time>, mut orbit: ResMut<CameraOrbit>, mut basis: Res
 
 fn follow_player(
     orbit: Res<CameraOrbit>,
+    blueprint: Option<Res<HallBlueprint>>,
     players: Query<&Transform, (With<Technician>, Without<CellShiftCamera>)>,
     mut cameras: Query<&mut Transform, With<CellShiftCamera>>,
 ) {
@@ -496,7 +514,7 @@ fn follow_player(
         .map(|transform| Vec2::new(transform.translation.x, transform.translation.z))
         .unwrap_or(Vec2::ZERO);
     let yaw = orbit.yaw_radians();
-    let target = clamp_follow_target(followed, RENDER_COVERAGE_SIZE, yaw);
+    let target = clamp_follow_target(followed, active_coverage(blueprint.as_deref()), yaw);
     for mut transform in &mut cameras {
         *transform = camera_transform(yaw, target);
     }
@@ -1192,6 +1210,35 @@ mod tests {
         assert_eq!(
             clamp_follow_target(Vec2::new(9.0, 9.0), Vec2::splat(30.0), yaw),
             Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn camera_clamp_coverage_comes_from_the_active_blueprint_not_the_constant() {
+        use crate::design::SceneBlueprint;
+        use crate::world::HallBlueprint;
+
+        // No blueprint is the same hall `spawn_hall` falls back to, so the
+        // fallback must be the authored constant and nothing else.
+        assert_eq!(active_coverage(None), RENDER_COVERAGE_SIZE);
+        assert_eq!(SceneBlueprint::v0().room.coverage, RENDER_COVERAGE_SIZE);
+        assert_eq!(
+            active_coverage(Some(&HallBlueprint(SceneBlueprint::v0()))),
+            RENDER_COVERAGE_SIZE
+        );
+
+        // An overridden coverage is honoured verbatim, and it really does move
+        // the legal rectangle the clamp is built from.
+        let mut overridden = SceneBlueprint::v0();
+        overridden.room.coverage = Vec2::new(80.0, 84.0);
+        let hall = HallBlueprint(overridden);
+        assert_eq!(active_coverage(Some(&hall)), Vec2::new(80.0, 84.0));
+
+        let yaw = CameraHeading::NorthEast.yaw_radians();
+        assert_ne!(
+            clamp_follow_target(Vec2::splat(30.0), active_coverage(Some(&hall)), yaw),
+            clamp_follow_target(Vec2::splat(30.0), active_coverage(None), yaw),
+            "an overridden coverage must not clamp like the authored constant"
         );
     }
 

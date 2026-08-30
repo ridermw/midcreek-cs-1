@@ -22,14 +22,18 @@ use bevy::{
 };
 use midcreek_cs_1::{
     CellShiftPlugin, CellShiftSet,
-    assetgen::{ASSET_MODULES, ASSET_NAMES, TECHNICIAN_BONES, generate_glb, load_source},
+    assetgen::{
+        ASSET_MODULES, ASSET_NAMES, Axis, ChannelSource, ClipSource, KeySource, ModuleSource,
+        PrimitiveSource, RigSource, TECHNICIAN_BONES, generate_glb, load_source,
+    },
     assets::{
         AssetLoadReport, AssetLoadState, GENERATED_ASSET_DIRECTORY, GeneratedAssets, RenderAssets,
         generated_modules, module_for,
     },
     camera::{
-        CAMERA_DISTANCE, CameraHeading, CameraOrbit, CellShiftCamera, camera_target_bounds,
-        clamp_follow_target, coverage_holds_room, ground_half_depth, ground_quadrilateral,
+        CAMERA_DISTANCE, CameraHeading, CameraOrbit, CellShiftCamera, active_coverage,
+        camera_target_bounds, clamp_follow_target, coverage_holds_room, ground_half_depth,
+        ground_quadrilateral,
     },
     design::{
         AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
@@ -2739,6 +2743,11 @@ fn camera_ground_target(app: &mut App) -> Vec2 {
 
 /// Viewport position of a ground point, through the real Bevy projection.
 fn viewport_of(app: &mut App, ground: Vec2) -> Vec2 {
+    viewport_of_world(app, Vec3::new(ground.x, 0.0, ground.y))
+}
+
+/// Viewport position of any world point, through the real Bevy projection.
+fn viewport_of_world(app: &mut App, world: Vec3) -> Vec2 {
     let entity = camera_entity(app);
     let global = *app
         .world()
@@ -2750,8 +2759,8 @@ fn viewport_of(app: &mut App, ground: Vec2) -> Vec2 {
         .expect("the camera carries a Camera")
         .clone();
     camera
-        .world_to_viewport(&global, Vec3::new(ground.x, 0.0, ground.y))
-        .unwrap_or_else(|error| panic!("{ground:?} did not project: {error:?}"))
+        .world_to_viewport(&global, world)
+        .unwrap_or_else(|error| panic!("{world:?} did not project: {error:?}"))
 }
 
 fn viewport_size(app: &mut App) -> Vec2 {
@@ -2766,8 +2775,14 @@ fn viewport_size(app: &mut App) -> Vec2 {
 /// Smallest distance from a projected ground point to any viewport edge.
 /// Negative when the point is off screen.
 fn framing_margin(app: &mut App, ground: Vec2) -> f32 {
+    world_framing_margin(app, Vec3::new(ground.x, 0.0, ground.y))
+}
+
+/// Smallest distance from any projected world point to any viewport edge.
+/// Negative when the point is off screen.
+fn world_framing_margin(app: &mut App, world: Vec3) -> f32 {
     let size = viewport_size(app);
-    let point = viewport_of(app, ground);
+    let point = viewport_of_world(app, world);
     point
         .x
         .min(point.y)
@@ -3185,21 +3200,318 @@ fn reachable_room_corners() -> [Vec2; 4] {
     room_corners(ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS))
 }
 
-/// Drives the camera to `yaw` by settling the nearest heading and then running
-/// a real turn for the requested number of frames.
-fn orbit_to(app: &mut App, heading: CameraHeading, frames: usize) {
+// ---------------------------------------------------------------------------
+// The technician's real spatial envelope
+// ---------------------------------------------------------------------------
+
+/// The space the generated technician actually occupies, relative to its ground
+/// origin, in metres. Framing the ground origin says nothing about whether the
+/// body is on screen, so the framing gate is measured against this instead.
+#[derive(Clone, Copy, Debug)]
+struct TechnicianEnvelope {
+    /// Largest horizontal distance from the ground origin to any skinned corner
+    /// of any authored shape. Taken as a radius so it holds at every facing.
+    radius: f32,
+    /// Lowest skinned corner.
+    min_y: f32,
+    /// Highest skinned corner, which is what a head-height framing gate needs.
+    max_y: f32,
+}
+
+impl TechnicianEnvelope {
+    /// The eight corners of the axis-aligned box containing the whole envelope
+    /// around `ground`. The projection is orthographic, hence affine, so the
+    /// extreme screen point of a convex body is a vertex of any box holding it.
+    fn corners(self, ground: Vec2) -> [Vec3; 8] {
+        let mut corners = [Vec3::ZERO; 8];
+        let mut index = 0;
+        for x in [-self.radius, self.radius] {
+            for y in [self.min_y, self.max_y] {
+                for z in [-self.radius, self.radius] {
+                    corners[index] = Vec3::new(ground.x + x, y, ground.y + z);
+                    index += 1;
+                }
+            }
+        }
+        corners
+    }
+}
+
+fn triple(value: [f64; 3]) -> Vec3 {
+    Vec3::new(value[0] as f32, value[1] as f32, value[2] as f32)
+}
+
+/// The exact quaternion `assetgen::push_animations` writes for an extrinsic XYZ
+/// Euler keyframe, restated here so the test does not inherit the generator's
+/// arithmetic by calling it.
+fn euler_degrees_to_quat(euler: [f64; 3]) -> Quat {
+    let (sin_x, cos_x) = (euler[0].to_radians() * 0.5).sin_cos();
+    let (sin_y, cos_y) = (euler[1].to_radians() * 0.5).sin_cos();
+    let (sin_z, cos_z) = (euler[2].to_radians() * 0.5).sin_cos();
+    Quat::from_xyzw(
+        (sin_x * cos_y * cos_z + cos_x * sin_y * sin_z) as f32,
+        (cos_x * sin_y * cos_z - sin_x * cos_y * sin_z) as f32,
+        (cos_x * cos_y * sin_z + sin_x * sin_y * cos_z) as f32,
+        (cos_x * cos_y * cos_z - sin_x * sin_y * sin_z) as f32,
+    )
+    .normalize()
+}
+
+/// The keyframe pair straddling `time`, and the interpolant between them.
+/// glTF samplers clamp outside the key range, which is what the ends return.
+fn key_span(keys: &[KeySource], time: f64) -> (usize, usize, f32) {
+    assert!(!keys.is_empty(), "every track carries keyframes");
+    if time <= keys[0].time {
+        return (0, 0, 0.0);
+    }
+    match keys.iter().position(|key| key.time >= time) {
+        Some(hi) if hi > 0 => {
+            let lo = hi - 1;
+            let span = keys[hi].time - keys[lo].time;
+            let fraction = if span > 0.0 {
+                (time - keys[lo].time) / span
+            } else {
+                0.0
+            };
+            (lo, hi, fraction as f32)
+        }
+        _ => (keys.len() - 1, keys.len() - 1, 0.0),
+    }
+}
+
+/// Local translation and rotation of every bone in the authored rest pose.
+/// Rest rotations are identity by construction.
+fn rest_pose(rig: &RigSource) -> Vec<(Vec3, Quat)> {
+    rig.bones
+        .iter()
+        .map(|bone| (triple(bone.translation), Quat::IDENTITY))
+        .collect()
+}
+
+/// Local translation and rotation of every bone at `time` of `clip`.
+/// `Translation` keys are offsets from the rest translation, exactly as
+/// `assetgen::push_animations` bakes them.
+fn clip_pose(rig: &RigSource, clip: &ClipSource, time: f64) -> Vec<(Vec3, Quat)> {
+    let mut pose = rest_pose(rig);
+    for track in &clip.tracks {
+        let index = bone_index(rig, &track.bone);
+        let (lo, hi, fraction) = key_span(&track.keys, time);
+        match track.channel {
+            ChannelSource::Translation => {
+                let offset =
+                    triple(track.keys[lo].value).lerp(triple(track.keys[hi].value), fraction);
+                pose[index].0 = triple(rig.bones[index].translation) + offset;
+            }
+            ChannelSource::Rotation => {
+                let from = euler_degrees_to_quat(track.keys[lo].value);
+                let to = euler_degrees_to_quat(track.keys[hi].value);
+                pose[index].1 = from.slerp(to, fraction);
+            }
+        }
+    }
+    pose
+}
+
+fn bone_index(rig: &RigSource, name: &str) -> usize {
+    rig.bones
+        .iter()
+        .position(|bone| bone.name == name)
+        .unwrap_or_else(|| panic!("{name} is not a declared bone"))
+}
+
+/// Rest-pose world origin of every bone, which is what the inverse bind
+/// matrices carry.
+fn rest_bone_origins(rig: &RigSource) -> Vec<Vec3> {
+    let mut origins = Vec::with_capacity(rig.bones.len());
+    for bone in &rig.bones {
+        let local = triple(bone.translation);
+        let origin = match &bone.parent {
+            None => local,
+            Some(parent) => origins[bone_index(rig, parent)] + local,
+        };
+        origins.push(origin);
+    }
+    origins
+}
+
+/// Widens `envelope` by every rigidly skinned shape corner of `pose`.
+fn accumulate_pose(
+    module: &ModuleSource,
+    rig: &RigSource,
+    rest: &[Vec3],
+    pose: &[(Vec3, Quat)],
+    envelope: &mut TechnicianEnvelope,
+) {
+    let mut globals: Vec<Mat4> = Vec::with_capacity(rig.bones.len());
+    for (index, bone) in rig.bones.iter().enumerate() {
+        let local = Mat4::from_rotation_translation(pose[index].1, pose[index].0);
+        let global = match &bone.parent {
+            None => local,
+            Some(parent) => globals[bone_index(rig, parent)] * local,
+        };
+        globals.push(global);
+    }
+
+    for shape in &module.shapes {
+        assert!(
+            shape.repeat.is_empty(),
+            "{} repeats; the envelope would miss its instances",
+            shape.name
+        );
+        let bone = shape
+            .bone
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} is not skinned to a bone", shape.name));
+        let index = bone_index(rig, bone);
+        // Rigid skinning: the inverse bind matrix is the rest origin, so a rest
+        // shape corner rides its bone from the rest pose to the animated one.
+        let skin = globals[index] * Mat4::from_translation(-rest[index]);
+
+        let (center, half) = match shape.primitive {
+            PrimitiveSource::Box {
+                center,
+                half_extents,
+            } => (triple(center), triple(half_extents)),
+            PrimitiveSource::Cylinder {
+                center,
+                radius,
+                half_height,
+                axis,
+                ..
+            } => {
+                let radius = radius as f32;
+                let half_height = half_height as f32;
+                let half = match axis {
+                    Axis::X => Vec3::new(half_height, radius, radius),
+                    Axis::Y => Vec3::new(radius, half_height, radius),
+                    Axis::Z => Vec3::new(radius, radius, half_height),
+                };
+                (triple(center), half)
+            }
+        };
+        // The cel outline is an inverted hull expanded by this much, so it is
+        // part of what the camera actually has to frame.
+        let half = half + Vec3::splat(shape.outline.unwrap_or(0.0) as f32);
+
+        for x in [-1.0_f32, 1.0] {
+            for y in [-1.0_f32, 1.0] {
+                for z in [-1.0_f32, 1.0] {
+                    let point = skin.transform_point3(center + half * Vec3::new(x, y, z));
+                    envelope.radius = envelope.radius.max(point.x.hypot(point.z));
+                    envelope.min_y = envelope.min_y.min(point.y);
+                    envelope.max_y = envelope.max_y.max(point.y);
+                }
+            }
+        }
+    }
+}
+
+/// The union of the generated rest pose and every pose of every generated clip,
+/// so the framing gate is measured against the widest the technician ever gets.
+fn technician_envelope() -> TechnicianEnvelope {
+    let source = load_source(&repo_root(), "technician").expect("the technician source parses");
+    let module = source
+        .modules
+        .iter()
+        .find(|module| module.name == "technician")
+        .expect("the technician module exists");
+    let rig = module.rig.as_ref().expect("the technician is rigged");
+    assert_eq!(rig.bones.len(), TECHNICIAN_BONES.len());
+    assert_eq!(rig.clips.len(), PlayerClip::ALL.len());
+
+    let rest = rest_bone_origins(rig);
+    let mut envelope = TechnicianEnvelope {
+        radius: 0.0,
+        min_y: f32::MAX,
+        max_y: f32::MIN,
+    };
+    accumulate_pose(module, rig, &rest, &rest_pose(rig), &mut envelope);
+
+    for clip in &rig.clips {
+        let mut times = clip
+            .tracks
+            .iter()
+            .flat_map(|track| track.keys.iter().map(|key| key.time))
+            .collect::<Vec<_>>();
+        // Linear samplers put the extremes on the keyframes, but sampling
+        // between them proves no interpolated pose escapes the envelope.
+        times.extend((0..=240).map(|step| clip.duration * f64::from(step) / 240.0));
+        for time in times {
+            accumulate_pose(
+                module,
+                rig,
+                &rest,
+                &clip_pose(rig, clip, time),
+                &mut envelope,
+            );
+        }
+    }
+    envelope
+}
+
+/// Drives the camera to an exact tween sample of the turn that leaves
+/// `heading` in the direction `key` names.
+///
+/// `frames` is the number of fixed steps of the tween that have elapsed when
+/// this returns, so `elapsed == frames * FIXED_STEP` exactly and
+/// `frames == QUARTER_TURN_FRAMES / 2` is the true halfway point. [`tap`] runs
+/// the first of those frames itself -- the press is read in `ReadInput` and the
+/// tween advances in `UpdateOrbitIntent` of that same frame -- so the pump is
+/// one frame shorter and there is no trailing `app.update()` to over-count.
+fn orbit_towards(app: &mut App, heading: CameraHeading, key: KeyCode, frames: usize) {
     app.world_mut()
         .insert_resource(CameraOrbit::settled(heading));
-    if frames > 0 {
-        tap(app, &[KeyCode::KeyE]);
-        pump(app, frames - 1);
+    if frames == 0 {
+        app.update();
+        return;
     }
-    app.update();
+    tap(app, &[key]);
+    pump(app, frames - 1);
+}
+
+/// Drives the camera clockwise off `heading` for exactly `frames` tween steps.
+fn orbit_to(app: &mut App, heading: CameraHeading, frames: usize) {
+    orbit_towards(app, heading, KeyCode::KeyE, frames);
+}
+
+/// Raw, un-eased progress through the current turn.
+fn tween_fraction(orbit: CameraOrbit) -> f32 {
+    let duration = orbit.duration_seconds();
+    assert!(duration > 0.0, "a settled orbit has no tween fraction");
+    (duration - orbit.remaining_seconds()) / duration
+}
+
+/// Yaw of the real camera entity, recovered from its transform.
+fn camera_yaw_degrees(app: &mut App) -> f32 {
+    let target = camera_ground_target(app);
+    let (transform, _) = camera_placement(app);
+    let offset = transform.translation - Vec3::new(target.x, 0.0, target.y);
+    offset.x.atan2(offset.z).to_degrees().rem_euclid(360.0)
+}
+
+/// Signed shortest difference between two yaws, in degrees.
+fn yaw_difference_degrees(actual: f32, expected: f32) -> f32 {
+    (actual - expected + 540.0).rem_euclid(360.0) - 180.0
+}
+
+/// Stops the virtual clock so a batch of samples is evaluated at one immutable
+/// orbit state. `app.update()` otherwise advances the tween between samples,
+/// which lets a requested mid-tween yaw settle part way through a loop.
+fn freeze_time(app: &mut App) {
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+}
+
+/// Restores the fixed test step after [`freeze_time`].
+fn resume_time(app: &mut App) {
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+        FIXED_STEP,
+    )));
 }
 
 #[test]
 fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
     let mut app = walking_hall(&repo_assets());
+    let envelope = technician_envelope();
     let coverage = RENDER_COVERAGE_SIZE * 0.5;
     let half_room = ROOM_SIZE * 0.5;
 
@@ -3207,7 +3519,12 @@ fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
         // A settled heading, then the exact midpoint of the turn that leaves it.
         for frames in [0, QUARTER_TURN_FRAMES / 2, QUARTER_TURN_FRAMES / 4] {
             orbit_to(&mut app, heading, frames);
-            let yaw = orbit(&app).yaw_radians();
+            // Every sample below runs a real frame, and a real frame would
+            // otherwise advance the tween and settle it part way through the
+            // batch. Freeze the clock so the whole batch is one orbit state.
+            freeze_time(&mut app);
+            let frozen = orbit(&app);
+            let yaw = frozen.yaw_radians();
             let bounds = camera_target_bounds(RENDER_COVERAGE_SIZE, yaw);
             let (min, max) = bounds.unwrap_or_else(|| {
                 panic!("yaw {} has no legal target rectangle", yaw.to_degrees())
@@ -3221,7 +3538,17 @@ fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
             for sample in framing_samples() {
                 place_player(&mut app, sample);
                 app.update();
-                let yaw = orbit(&app).yaw_radians();
+                assert_eq!(
+                    orbit(&app),
+                    frozen,
+                    "the orbit drifted mid-batch: every sample of this batch must be measured at yaw {}",
+                    yaw.to_degrees()
+                );
+                assert_eq!(
+                    orbit(&app).yaw_radians().to_bits(),
+                    yaw.to_bits(),
+                    "the sampled yaw must be bit-identical across the whole batch"
+                );
                 let target = camera_ground_target(&mut app);
                 let expected = clamp_follow_target(sample, RENDER_COVERAGE_SIZE, yaw);
                 assert!(
@@ -3244,13 +3571,17 @@ fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
                     );
                 }
 
-                let margin = framing_margin(&mut app, sample);
-                assert!(
-                    margin >= FRAMING_MARGIN_PIXELS,
-                    "yaw {} framed {sample:?} with only {margin} px of margin",
-                    yaw.to_degrees()
-                );
+                // Not the ground origin: the whole body, hard hat included.
+                for point in envelope.corners(sample) {
+                    let margin = world_framing_margin(&mut app, point);
+                    assert!(
+                        margin >= FRAMING_MARGIN_PIXELS,
+                        "yaw {} framed the technician envelope point {point:?} at {sample:?} with only {margin} px of margin",
+                        yaw.to_degrees()
+                    );
+                }
             }
+            resume_time(&mut app);
         }
     }
 }
@@ -3258,6 +3589,7 @@ fn camera_orbit_clamps_the_follow_target_and_keeps_the_technician_framed() {
 #[test]
 fn camera_orbit_frames_every_room_corner_with_the_reviewed_margin() {
     let mut app = walking_hall(&repo_assets());
+    let envelope = technician_envelope();
     let size = viewport_size(&mut app);
     let centre_margin = size.x.min(size.y) * 0.5;
 
@@ -3291,11 +3623,17 @@ fn camera_orbit_frames_every_room_corner_with_the_reviewed_margin() {
                     );
                 }
 
-                for point in [corner, wall] {
-                    let margin = framing_margin(&mut app, point);
+                // The framing contract is the whole body at both corners, not a
+                // ground point: the hard hat, the boots, and the swung wrench
+                // all have to stay 32 px inside the viewport.
+                for point in [corner, wall]
+                    .into_iter()
+                    .flat_map(|ground| envelope.corners(ground))
+                {
+                    let margin = world_framing_margin(&mut app, point);
                     assert!(
                         margin >= FRAMING_MARGIN_PIXELS,
-                        "yaw {} framed room corner {point:?} with only {margin} px of margin",
+                        "yaw {} framed room corner envelope point {point:?} with only {margin} px of margin",
                         yaw.to_degrees()
                     );
                 }
@@ -3317,6 +3655,395 @@ fn camera_orbit_frames_every_room_corner_with_the_reviewed_margin() {
             }
         }
     }
+}
+
+#[test]
+fn camera_framing_margin_is_calibrated_against_the_real_pixel_to_world_scale() {
+    let mut app = camera_app(&repo_assets());
+    let size = viewport_size(&mut app);
+
+    // One independent calibration of the whole pixel-to-world chain. If the
+    // zoom, the viewport, the elevation, the margin constant, or the helper's
+    // edge arithmetic drifts, the measured margin stops being 32 px, because
+    // these offsets are derived from the reviewed numbers and not from the
+    // projection they are checked against.
+    let pixels_per_metre = size.x / ORTHOGRAPHIC_WIDTH;
+    assert!(
+        (size.y / ORTHOGRAPHIC_HEIGHT - pixels_per_metre).abs() < 1.0e-3,
+        "the reviewed rectangle must map to square pixels, got {} by {}",
+        pixels_per_metre,
+        size.y / ORTHOGRAPHIC_HEIGHT
+    );
+    assert!(
+        (pixels_per_metre - 49.230_77).abs() < 1.0e-3,
+        "1280 px over 26 m is 49.23077 px/m, got {pixels_per_metre}"
+    );
+
+    // Screen horizontal is world horizontal; screen vertical is foreshortened
+    // by the fixed elevation, which is why the two offsets differ.
+    let across = (size.x * 0.5 - FRAMING_MARGIN_PIXELS) / pixels_per_metre;
+    let along = (size.y * 0.5 - FRAMING_MARGIN_PIXELS)
+        / (pixels_per_metre * CAMERA_ELEVATION_DEGREES.to_radians().sin());
+    assert!(
+        (across - 12.35).abs() < 1.0e-3,
+        "608 px of half viewport is 12.35 m across, got {across}"
+    );
+    assert!(
+        (along - 7.944_1).abs() < 1.0e-3,
+        "328 px of half viewport is 7.9441 m along the ground, got {along}"
+    );
+
+    for heading in CameraHeading::ALL {
+        for frames in [0, QUARTER_TURN_FRAMES / 2] {
+            orbit_to(&mut app, heading, frames);
+            freeze_time(&mut app);
+            let yaw = orbit(&app).yaw_radians();
+            let basis = ViewBasis::from_yaw_radians(yaw);
+            let target = camera_ground_target(&mut app);
+
+            for (label, offset) in [
+                ("right", basis.right() * across),
+                ("left", -basis.right() * across),
+                ("up", basis.forward() * along),
+                ("down", -basis.forward() * along),
+            ] {
+                let point = target + offset;
+                let margin = framing_margin(&mut app, point);
+                assert!(
+                    (margin - FRAMING_MARGIN_PIXELS).abs() < 0.05,
+                    "yaw {} calibration point {label} must project exactly {FRAMING_MARGIN_PIXELS} px inside the edge, got {margin}",
+                    yaw.to_degrees()
+                );
+            }
+
+            // A hair further out and the same point is outside the gate, so the
+            // calibration is a knife edge rather than a comfortable pass.
+            let outside = target + basis.right() * (across + 1.0 / pixels_per_metre);
+            let margin = framing_margin(&mut app, outside);
+            assert!(
+                margin < FRAMING_MARGIN_PIXELS,
+                "one metre-pixel past the calibration point must fail the gate, got {margin}"
+            );
+            resume_time(&mut app);
+        }
+    }
+}
+
+#[test]
+fn camera_frames_the_generated_technician_envelope_it_measures() {
+    // The envelope the framing gates use is derived from the generated source,
+    // so it has to agree with the rig the running app actually loaded, and it
+    // has to be a body rather than a point.
+    let envelope = technician_envelope();
+    let source = load_source(&repo_root(), "technician").expect("the technician source parses");
+    let rig = source.modules[0]
+        .rig
+        .as_ref()
+        .expect("the technician is rigged");
+
+    let mut app = walking_hall(&repo_assets());
+    let transform = technician_transform(&mut app);
+    assert_eq!(
+        transform.scale,
+        Vec3::ONE,
+        "a scaled technician would invalidate the measured envelope"
+    );
+    for (name, live, rest) in part_transforms(&mut app) {
+        let Some(bone) = rig.bones.iter().find(|bone| bone.name == name) else {
+            continue;
+        };
+        assert!(
+            (rest.translation - triple(bone.translation))
+                .abs()
+                .max_element()
+                < 1.0e-5,
+            "{name} loaded at rest {:?}, but the source authors {:?}",
+            rest.translation,
+            triple(bone.translation)
+        );
+        assert!(live.translation.is_finite());
+    }
+
+    // Rest alone is not the widest pose: Repair swings the wrench arm back.
+    let rest_only = {
+        let module = &source.modules[0];
+        let rest = rest_bone_origins(rig);
+        let mut only = TechnicianEnvelope {
+            radius: 0.0,
+            min_y: f32::MAX,
+            max_y: f32::MIN,
+        };
+        accumulate_pose(module, rig, &rest, &rest_pose(rig), &mut only);
+        only
+    };
+    assert!(
+        envelope.radius > rest_only.radius + 0.1,
+        "the animated envelope must be wider than the rest pose, {} vs {}",
+        envelope.radius,
+        rest_only.radius
+    );
+    // Pinned numerically, so dropping a clip, an outline hull, a bone rotation,
+    // or the height axis changes a measured number rather than passing quietly.
+    for (label, measured, expected) in [
+        ("rest radius", rest_only.radius, 0.311_004_9_f32),
+        ("rest floor", rest_only.min_y, -0.012),
+        ("rest crown", rest_only.max_y, 1.944),
+        ("animated radius", envelope.radius, 0.799_812_1),
+        ("animated floor", envelope.min_y, -0.042),
+        ("animated crown", envelope.max_y, 1.970_412_4),
+    ] {
+        assert!(
+            (measured - expected).abs() < 1.0e-4,
+            "the {label} of the generated technician is {expected} m, measured {measured}"
+        );
+    }
+    assert!(
+        envelope.max_y > 1.9,
+        "the envelope must include height, not just a ground footprint"
+    );
+}
+
+#[test]
+fn camera_orbit_tween_samples_land_on_the_exact_requested_fraction() {
+    let mut app = camera_app(&repo_assets());
+
+    // The halfway sample really is halfway, in every direction the orbit can
+    // turn, including both wraparounds through zero. `smoothstep(0.5) == 0.5`,
+    // so the eased yaw at the midpoint is the plain arithmetic midpoint.
+    let cases = [
+        (
+            CameraHeading::NorthEast,
+            KeyCode::KeyE,
+            CameraHeading::SouthEast,
+            90.0_f32,
+        ),
+        (
+            CameraHeading::SouthEast,
+            KeyCode::KeyQ,
+            CameraHeading::NorthEast,
+            90.0,
+        ),
+        (
+            CameraHeading::SouthWest,
+            KeyCode::KeyE,
+            CameraHeading::NorthWest,
+            270.0,
+        ),
+        // 315 -> 405 wraps through zero going clockwise.
+        (
+            CameraHeading::NorthWest,
+            KeyCode::KeyE,
+            CameraHeading::NorthEast,
+            0.0,
+        ),
+        // 45 -> -45 wraps through zero going counter-clockwise.
+        (
+            CameraHeading::NorthEast,
+            KeyCode::KeyQ,
+            CameraHeading::NorthWest,
+            0.0,
+        ),
+    ];
+
+    for (start, key, target, halfway) in cases {
+        orbit_towards(&mut app, start, key, QUARTER_TURN_FRAMES / 2);
+        let sampled = orbit(&app);
+
+        assert_eq!(sampled.heading(), target, "{start:?} + {key:?}");
+        assert!(
+            !sampled.is_settled(),
+            "{start:?} + {key:?} settled before the midpoint"
+        );
+        let fraction = tween_fraction(sampled);
+        assert!(
+            (fraction - 0.5).abs() < 1.0e-4,
+            "{start:?} + {key:?} sampled elapsed/duration {fraction}, not 0.5"
+        );
+        assert!(
+            (sampled.progress() - 0.5).abs() < 1.0e-4,
+            "smoothstep(0.5) must be 0.5, got {}",
+            sampled.progress()
+        );
+        let drift = yaw_difference_degrees(sampled.yaw_degrees(), halfway);
+        assert!(
+            drift.abs() < 1.0e-2,
+            "{start:?} + {key:?} should sit at {halfway} degrees, got {} ({drift} off)",
+            sampled.yaw_degrees()
+        );
+        // The real camera entity, not just the resource that drives it.
+        let camera_drift = yaw_difference_degrees(camera_yaw_degrees(&mut app), halfway);
+        assert!(
+            camera_drift.abs() < 1.0e-2,
+            "{start:?} + {key:?} left the camera entity at {} degrees, not {halfway}",
+            camera_yaw_degrees(&mut app)
+        );
+
+        // One frame more is 10/18 of the turn, which is the 0.556 the helper
+        // used to advertise as its midpoint.
+        pump(&mut app, 1);
+        let late = tween_fraction(orbit(&app));
+        assert!(
+            (late - 10.0 / 18.0).abs() < 1.0e-3,
+            "one frame past the midpoint should be 0.5556, got {late}"
+        );
+        assert!(
+            (late - 0.5).abs() > 1.0e-2,
+            "an off-by-one frame must be visible in the sampled fraction"
+        );
+    }
+
+    // Every requested sample is exactly `frames / QUARTER_TURN_FRAMES` of the
+    // turn, and a whole quarter turn settles exactly.
+    for frames in [1_usize, 4, 6, 9, 12, 17] {
+        orbit_towards(&mut app, CameraHeading::NorthEast, KeyCode::KeyE, frames);
+        let sampled = tween_fraction(orbit(&app));
+        let expected = frames as f32 / QUARTER_TURN_FRAMES as f32;
+        assert!(
+            (sampled - expected).abs() < 1.0e-4,
+            "{frames} of {QUARTER_TURN_FRAMES} frames should be {expected} of the turn, got {sampled}"
+        );
+    }
+    orbit_towards(
+        &mut app,
+        CameraHeading::NorthEast,
+        KeyCode::KeyE,
+        QUARTER_TURN_FRAMES,
+    );
+    assert!(
+        orbit(&app).is_settled(),
+        "{QUARTER_TURN_FRAMES} frames is exactly one settled quarter turn"
+    );
+    assert_eq!(orbit(&app).heading(), CameraHeading::SouthEast);
+}
+
+/// Ground position the test harness pins the technician to, after movement has
+/// run and before the camera follows it.
+#[derive(Resource, Clone, Copy, Debug)]
+struct ForcedPosition(Vec2);
+
+/// Places the technician wherever the test asks, between `MovePlayer` and
+/// `FollowCamera`. `move_player` clamps to the walkable room every frame, so
+/// this is the only way to hand the follow clamp a position outside it -- which
+/// is the only kind of position the follow clamp ever actually engages for.
+fn force_position(
+    forced: Res<ForcedPosition>,
+    mut technicians: Query<&mut Transform, With<Technician>>,
+) {
+    if let Ok(mut transform) = technicians.single_mut() {
+        transform.translation.x = forced.0.x;
+        transform.translation.z = forced.0.y;
+    }
+}
+
+/// A blueprint that is identical to the authored hall except for its rendered
+/// coverage, apron included, so it validates exactly as the authored one does.
+fn blueprint_with_coverage(coverage: Vec2) -> SceneBlueprint {
+    let mut blueprint = SceneBlueprint::v0();
+    blueprint.room.coverage = coverage;
+    let apron = blueprint
+        .visuals
+        .iter_mut()
+        .find(|visual| visual.id.as_str() == "render-apron")
+        .expect("the authored blueprint carries the apron");
+    apron.transform.scale = Vec3::new(coverage.x, 1.0, coverage.y);
+    assert_eq!(
+        blueprint.validate(),
+        Vec::<SceneValidationError>::new(),
+        "the override must be a valid hall, not a broken one"
+    );
+    blueprint
+}
+
+#[test]
+fn camera_follow_clamps_against_the_active_blueprint_coverage_not_the_constant() {
+    let mut app = walking_hall(&repo_assets());
+    app.insert_resource(ForcedPosition(Vec2::ZERO)).add_systems(
+        Update,
+        force_position
+            .after(CellShiftSet::MovePlayer)
+            .before(CellShiftSet::FollowCamera),
+    );
+
+    // Three halls: the authored one the camera falls back to when no blueprint
+    // resource exists, and two valid overrides whose coverage is neither the
+    // constant nor each other.
+    let overrides = [Vec2::new(76.0, 76.0), Vec2::new(88.0, 80.0)];
+    for coverage in overrides {
+        assert_ne!(coverage, RENDER_COVERAGE_SIZE);
+        assert!(coverage_holds_room(ROOM_SIZE, coverage, 0.0));
+    }
+
+    let probes = [
+        Vec2::new(30.0, 30.0),
+        Vec2::new(-30.0, 25.0),
+        Vec2::new(21.0, -60.0),
+        Vec2::new(19.65, 19.65),
+    ];
+
+    for active in [None, Some(overrides[0]), Some(overrides[1])] {
+        match active {
+            None => {
+                app.world_mut().remove_resource::<HallBlueprint>();
+            }
+            Some(coverage) => {
+                let blueprint = HallBlueprint(blueprint_with_coverage(coverage));
+                assert_eq!(active_coverage(Some(&blueprint)), coverage);
+                app.insert_resource(blueprint);
+            }
+        }
+        let coverage = active.unwrap_or(RENDER_COVERAGE_SIZE);
+
+        for heading in CameraHeading::ALL {
+            for frames in [0, QUARTER_TURN_FRAMES / 2] {
+                orbit_to(&mut app, heading, frames);
+                freeze_time(&mut app);
+                let frozen = orbit(&app);
+                let yaw = frozen.yaw_radians();
+
+                for probe in probes {
+                    app.insert_resource(ForcedPosition(probe));
+                    app.update();
+                    assert_eq!(orbit(&app), frozen, "the orbit drifted mid-batch");
+                    assert_eq!(
+                        player_position(&mut app),
+                        probe,
+                        "the harness must hand the follow clamp the probe itself"
+                    );
+
+                    let target = camera_ground_target(&mut app);
+                    let expected = clamp_follow_target(probe, coverage, yaw);
+                    assert!(
+                        (target - expected).abs().max_element() < 1.0e-3,
+                        "yaw {} with {coverage:?} of coverage followed {probe:?} to {target:?}, expected {expected:?}",
+                        yaw.to_degrees()
+                    );
+
+                    // And it is genuinely a different answer from the constant,
+                    // so the assertion above cannot pass by coincidence.
+                    let constant = clamp_follow_target(probe, RENDER_COVERAGE_SIZE, yaw);
+                    if coverage != RENDER_COVERAGE_SIZE && probe.abs().max_element() > 25.0 {
+                        assert!(
+                            (target - constant).abs().max_element() > 1.0,
+                            "yaw {} followed {probe:?} to {target:?}, which is what the {RENDER_COVERAGE_SIZE:?} constant would have produced",
+                            yaw.to_degrees()
+                        );
+                    }
+                }
+                resume_time(&mut app);
+            }
+        }
+    }
+
+    // A legal standing position is followed exactly whatever the coverage is,
+    // because every valid coverage holds the whole walkable room.
+    app.insert_resource(ForcedPosition(Vec2::new(19.65, 19.65)));
+    app.update();
+    assert!(
+        (camera_ground_target(&mut app) - Vec2::new(19.65, 19.65))
+            .abs()
+            .max_element()
+            < 1.0e-3
+    );
 }
 
 #[test]
