@@ -14,7 +14,10 @@ The gate proves, independently:
 * trusted Arrow/Q/E/Space input while the canvas is focused does not scroll a
   page that a neutral focus probe has just proved is genuinely scrollable;
 * the canvas region of a real screenshot is nonblank and carries at least
-  three approved palette classes with real variance.
+  three approved palette classes with real variance;
+* the same package still reaches ready, captures no error, and presents a
+  16:9 canvas when the published hub embeds it in the iframe the site
+  generator really renders.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass
@@ -36,6 +40,12 @@ from pathlib import Path
 
 READY_TIMEOUT_SECONDS = 30
 BROWSER_TIMEOUT_SECONDS = 30
+# The whole DevTools conversation is bounded, not just each answer inside it.
+# Every phase below has its own budget, but a browser that answers each call
+# slowly and none of them never enough to trip one would otherwise keep the
+# gate alive indefinitely. Past this the session is over, whatever it was
+# doing, and the failure names the phase it was in.
+SESSION_BUDGET_SECONDS = 300
 # A DevTools answer is a JSON document; a screenshot is the largest one the
 # gate ever asks for. Anything past this is a confused browser, not a message.
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -276,19 +286,45 @@ class WebSocket:
         except OSError:
             pass
 
+    def set_timeout(self, timeout: float) -> None:
+        """Bounds how long one read may block, in seconds."""
+        self._socket.settimeout(max(timeout, 0.0))
+
 
 class DevTools:
     """A single-target Chrome DevTools Protocol session."""
 
-    def __init__(self, websocket_url: str) -> None:
+    def __init__(
+        self, websocket_url: str, budget: float = SESSION_BUDGET_SECONDS
+    ) -> None:
         self._socket = WebSocket(websocket_url)
         self._next_id = 0
+        self._budget = budget
+        self._deadline = time.monotonic() + budget
+
+    def remaining(self) -> float:
+        """Seconds left in the whole session, which may be negative."""
+        return self._deadline - time.monotonic()
 
     def call(self, method: str, params: dict | None = None, timeout: float = BROWSER_TIMEOUT_SECONDS) -> dict:
+        # No single call may outlive the session it belongs to. Without this a
+        # browser that answers every call just inside its own timeout keeps
+        # the gate alive for as long as it likes.
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise GateFailure(
+                f"the browser session ran past its {self._budget:.0f}s budget "
+                f"before {method} could be answered"
+            )
+        bounded = min(timeout, remaining)
         self._next_id += 1
         message_id = self._next_id
         self._socket.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
-        deadline = time.monotonic() + timeout
+        # A read is bounded too, not just the loop around it: a browser that
+        # sends nothing at all would otherwise hold one blocking read for the
+        # socket's own timeout, long past the budget this call was given.
+        self._socket.set_timeout(bounded)
+        deadline = time.monotonic() + bounded
         while time.monotonic() < deadline:
             message = json.loads(self._socket.receive())
             if message.get("id") != message_id:
@@ -296,7 +332,7 @@ class DevTools:
             if "error" in message:
                 raise GateFailure(f"{method} failed: {message['error']}")
             return message.get("result", {})
-        raise GateFailure(f"{method} did not answer within {timeout:.0f}s")
+        raise GateFailure(f"{method} did not answer within {bounded:.0f}s")
 
     def evaluate(self, expression: str) -> object:
         result = self.call(
@@ -412,7 +448,14 @@ def _paeth(left: int, up: int, upper_left: int) -> int:
 
 
 def read_palette(design_source: Path) -> dict[str, tuple[int, int, int]]:
-    """Reads the approved cel-shift palette straight from the Rust source."""
+    """Reads the approved cel-shift palette straight from the Rust source.
+
+    The roster is derived, never assumed: ``PaletteRole::ALL`` is the game's
+    own declaration of which roles exist, so the constants parsed here have to
+    be exactly the ones it names. A role added to the enum and forgotten in the
+    constants — or the reverse — fails here instead of quietly shrinking the
+    set of colours the canvas is allowed to be judged against.
+    """
     text = design_source.read_text(encoding="utf-8")
     pattern = re.compile(
         r"pub const (?P<name>[A-Z0-9_]+): Srgba = srgba_u8!\("
@@ -426,11 +469,36 @@ def read_palette(design_source: Path) -> dict[str, tuple[int, int, int]]:
         )
         for match in pattern.finditer(text)
     }
-    if len(palette) != 17:
+    declared = read_palette_roles(design_source, text)
+    missing = sorted(declared - set(palette))
+    extra = sorted(set(palette) - declared)
+    if missing or extra:
         raise GateFailure(
-            f"expected the 17 approved palette roles in {design_source}, found {len(palette)}"
+            f"the approved palette in {design_source} does not match the roles "
+            f"PaletteRole::ALL declares: missing {missing}, unexpected {extra}"
         )
     return palette
+
+
+def read_palette_roles(design_source: Path, text: str | None = None) -> set[str]:
+    """The constant names ``PaletteRole::ALL`` declares, in the game's source.
+
+    ``Self::WorkerHiVis`` names the ``WORKER_HI_VIS`` constant, so the enum
+    roster is translated into constant names rather than counted.
+    """
+    text = design_source.read_text(encoding="utf-8") if text is None else text
+    match = re.search(
+        r"pub const ALL: \[Self; (?P<count>\d+)\] = \[(?P<body>.*?)\];", text, re.DOTALL
+    )
+    if not match:
+        raise GateFailure(f"{design_source} declares no PaletteRole::ALL roster")
+    variants = re.findall(r"Self::([A-Za-z0-9]+)", match.group("body"))
+    if len(variants) != int(match.group("count")):
+        raise GateFailure(
+            f"PaletteRole::ALL in {design_source} claims {match.group('count')} "
+            f"roles and lists {len(variants)}"
+        )
+    return {re.sub(r"(?<!^)(?=[A-Z])", "_", variant).upper() for variant in variants}
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +506,20 @@ def read_palette(design_source: Path) -> dict[str, tuple[int, int, int]]:
 # ---------------------------------------------------------------------------
 
 
+def resolve_url(base_url: str, relative: str) -> str:
+    """Joins a served path onto a base URL with every segment quoted.
+
+    A packaged file name is a file-system name, not a URL: a space or a `#` in
+    one would silently address a different resource, or none at all.
+    """
+    quoted = "/".join(
+        urllib.parse.quote(segment, safe="") for segment in relative.lstrip("/").split("/")
+    )
+    return f"{base_url.rstrip('/')}/{quoted}" if quoted else f"{base_url.rstrip('/')}/"
+
+
 def require_http_200(base_url: str, relative: str) -> None:
-    url = f"{base_url.rstrip('/')}/{relative.lstrip('/')}"
+    url = resolve_url(base_url, relative)
     request = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=BROWSER_TIMEOUT_SECONDS) as response:
@@ -477,7 +557,8 @@ def open_page(cdp_port: int, url: str) -> DevTools:
         raise GateFailure(f"the browser never opened a DevTools endpoint on port {cdp_port}")
 
     new_target = urllib.request.Request(
-        f"http://127.0.0.1:{cdp_port}/json/new?{url}", method="PUT"
+        f"http://127.0.0.1:{cdp_port}/json/new?{urllib.parse.quote(url, safe=':/?&=%')}",
+        method="PUT",
     )
     with urllib.request.urlopen(new_target, timeout=BROWSER_TIMEOUT_SECONDS) as response:
         target = json.loads(response.read())
@@ -506,15 +587,18 @@ def wait_for_ready(session: DevTools, diagnostics: Path) -> float:
 
 def write_diagnostics(session: DevTools, diagnostics: Path) -> None:
     diagnostics.mkdir(parents=True, exist_ok=True)
+    # Diagnostics are written from a session that has already failed, so every
+    # capture is best effort: whatever went wrong with the browser must not
+    # also swallow the page and the screenshot that explain it.
     try:
         html = session.evaluate("document.documentElement.outerHTML")
         (diagnostics / "page.html").write_text(str(html), encoding="utf-8")
-    except GateFailure:
+    except Exception:  # noqa: BLE001 - a failed capture is never the failure
         pass
     try:
         shot = session.call("Page.captureScreenshot", {"format": "png"})
         (diagnostics / "page.png").write_bytes(base64.b64decode(shot["data"]))
-    except GateFailure:
+    except Exception:  # noqa: BLE001 - a failed capture is never the failure
         pass
 
 
@@ -638,6 +722,16 @@ FOCUS_CANVAS_JS = """
 CANVAS_STILL_FOCUSED_JS = (
     "document.activeElement === document.getElementById('game-canvas')"
 )
+
+# The positive control only proves anything about an unfocused canvas while the
+# neutral probe is still the element receiving the keys. A page that moved
+# focus part way through the sequence measured something else entirely.
+PROBE_STILL_FOCUSED_JS = """
+(() => {
+  const probe = document.querySelector("[data-scroll-probe]");
+  return probe !== null && document.activeElement === probe;
+})()
+"""
 
 
 def scroll_report(session: DevTools) -> dict:
@@ -768,6 +862,13 @@ def check_control_keys_do_not_scroll(session: DevTools) -> dict:
         )
 
     unfocused = press_control_keys(session)
+    if not session.evaluate(PROBE_STILL_FOCUSED_JS):
+        raise GateFailure(
+            f"the scroll probe {probe['probe']} did not still own keyboard focus "
+            "after the positive control, so the keys that moved the page were "
+            "not the ones an unfocused canvas is judged against: "
+            + describe_scroll(session, unfocused)
+        )
     inert = [code for code in POSITIVE_CONTROL_KEYS if unfocused.get(code, 0.0) <= 0.0]
     if inert:
         raise GateFailure(
@@ -903,42 +1004,210 @@ def check_canvas_pixels(
 
 
 # ---------------------------------------------------------------------------
+# The published hub embed
+# ---------------------------------------------------------------------------
+
+# The site embeds this same package in an iframe. That markup is not written
+# out again here: it is read from the generator that renders it, so this phase
+# proves the package inside the element the site really ships rather than
+# inside a copy of it that can drift.
+PLAY_EMBED_PATTERN = re.compile(
+    r'<iframe class="(?P<class>[A-Za-z0-9_-]+)" src="(?P<src>[^"]+)"[^>]*></iframe>'
+)
+
+
+@dataclass(frozen=True)
+class PlayEmbed:
+    """The hub's playable iframe, exactly as the site generator renders it."""
+
+    class_name: str
+    src: str
+    tag: str
+
+
+def read_play_embed(sitegen_source: Path) -> PlayEmbed:
+    text = sitegen_source.read_text(encoding="utf-8")
+    matches = list(PLAY_EMBED_PATTERN.finditer(text))
+    if len(matches) != 1:
+        raise GateFailure(
+            f"{sitegen_source} renders {len(matches)} playable iframes; the hub "
+            "embed has to be exactly one for this gate to prove the published one"
+        )
+    match = matches[0]
+    return PlayEmbed(
+        class_name=match.group("class"), src=match.group("src"), tag=match.group(0)
+    )
+
+
+HUB_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hub embed harness</title>
+<style>
+body {{ margin: 0; background: #101418; }}
+.{class_name} {{ display: block; border: 0; width: 1152px; height: 648px; }}
+</style>
+</head>
+<body>
+{tag}
+</body>
+</html>
+"""
+
+
+def write_hub_page(path: Path, embed: PlayEmbed) -> None:
+    """Writes the host document the embedded package is proved inside.
+
+    The page around the element is this gate's harness; the element itself is
+    not. The iframe tag is the one the generator emits, character for
+    character, and the harness only gives it a box to be measured in because
+    the real hub sizes it from a stylesheet that never ships in the package.
+    """
+    if path.exists():
+        raise GateFailure(f"refusing to overwrite {path} with the hub embed harness")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        HUB_PAGE_TEMPLATE.format(class_name=embed.class_name, tag=embed.tag),
+        encoding="utf-8",
+    )
+
+
+HUB_EMBED_JS = """
+(() => {
+  const frames = document.querySelectorAll('iframe.CLASS_NAME');
+  if (frames.length !== 1) return { count: frames.length };
+  const frame = frames[0];
+  const doc = frame.contentDocument;
+  if (!doc) return { count: 1, sameOrigin: false, resolved: frame.src };
+  const canvas = doc.getElementById("game-canvas");
+  const style = canvas ? frame.contentWindow.getComputedStyle(canvas) : null;
+  const rect = canvas ? canvas.getBoundingClientRect() : null;
+  const sink = doc.getElementById("browser-errors");
+  return {
+    count: 1,
+    sameOrigin: true,
+    resolved: frame.src,
+    state: doc.body ? doc.body.dataset.gameState || "missing" : "missing",
+    errors: sink ? sink.textContent || "" : "",
+    canvas: rect === null ? null : {
+      width: rect.width,
+      height: rect.height,
+      bufferWidth: canvas.width,
+      bufferHeight: canvas.height,
+      visible: style.visibility !== "hidden" && style.display !== "none",
+    },
+  };
+})()
+"""
+
+
+def check_hub_embed(
+    session: DevTools, embed: PlayEmbed, expected_url: str, diagnostics: Path
+) -> dict:
+    """Proves the package still runs inside the hub's own iframe.
+
+    The standalone page is served from the package root; the hub serves it one
+    directory down, inside a frame, from a document that is not the package's
+    own. A relative path that only resolved at the root, or a game that only
+    reached ready as a top-level document, passes every other phase and fails
+    here.
+    """
+    expression = HUB_EMBED_JS.replace("CLASS_NAME", embed.class_name)
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    report: dict = {}
+    while True:
+        report = dict(session.evaluate(expression))
+        if report.get("count") != 1:
+            raise GateFailure(
+                f"the hub renders {report.get('count')} iframe.{embed.class_name} "
+                "elements; the published embed has to be exactly one"
+            )
+        if not report.get("sameOrigin"):
+            raise GateFailure(
+                f"the hub embed at {report.get('resolved')!r} is not readable from "
+                "the hub document, so the published game cannot be proved in it"
+            )
+        if report.get("resolved") != expected_url:
+            raise GateFailure(
+                f"the hub embed resolves to {report.get('resolved')!r}, not to the "
+                f"published package at {expected_url!r}"
+            )
+        if report.get("state") == "ready":
+            break
+        if report.get("state") == "error" or time.monotonic() >= deadline:
+            write_diagnostics(session, diagnostics)
+            raise GateFailure(
+                f"the embedded game reported data-game-state={report.get('state')!r} "
+                f"instead of 'ready' within {READY_TIMEOUT_SECONDS}s; captured: "
+                f"{report.get('errors')!r}"
+            )
+        time.sleep(0.25)
+
+    if str(report.get("errors", "")).strip():
+        raise GateFailure(f"the embedded game captured errors: {report['errors']!r}")
+    geometry = report.get("canvas")
+    if not geometry:
+        raise GateFailure("the embedded play page has no #game-canvas element")
+    check_canvas(geometry)
+    return {
+        "class": embed.class_name,
+        "src": embed.src,
+        "resolved": report["resolved"],
+        "canvas": {
+            "width": geometry["width"],
+            "height": geometry["height"],
+            "buffer": [geometry["bufferWidth"], geometry["bufferHeight"]],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def gate_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--cdp-port", type=int, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--design-source", type=Path, required=True)
     parser.add_argument("--diagnostics", type=Path, required=True)
-    arguments = parser.parse_args()
+    parser.add_argument(
+        "--sitegen-source",
+        type=Path,
+        help="the site generator whose hub iframe markup is proved",
+    )
+    parser.add_argument(
+        "--hub-page", type=Path, help="where the hub embed harness is written"
+    )
+    parser.add_argument("--hub-url", help="the URL that harness is served from")
+    arguments = parser.parse_args(argv)
+    hub = (arguments.sitegen_source, arguments.hub_page, arguments.hub_url)
+    if any(hub) and not all(hub):
+        parser.error("--sitegen-source, --hub-page and --hub-url are used together")
+    return arguments
 
+
+def run_gate(arguments: argparse.Namespace, sessions: list[DevTools]) -> dict:
+    """Runs every phase, recording each opened session so main can close it."""
     palette = read_palette(arguments.design_source)
 
     for relative in ["", *packaged_urls(arguments.package)]:
         require_http_200(arguments.base_url, relative)
 
-    session = open_page(arguments.cdp_port, arguments.base_url.rstrip("/") + "/")
-    try:
-        session.call("Page.enable")
-        session.call("Runtime.enable")
-        elapsed = wait_for_ready(session, arguments.diagnostics)
-        check_no_browser_errors(session)
-        geometry = canvas_geometry(session)
-        check_canvas(geometry)
-        scroll = check_control_keys_do_not_scroll(session)
-        check_no_browser_errors(session)
-        pixels = check_canvas_pixels(session, palette, arguments.diagnostics)
-    except GateFailure as failure:
-        write_diagnostics(session, arguments.diagnostics)
-        print(f"browser gate failed: {failure}", file=sys.stderr)
-        session.close()
-        return 1
-    finally:
-        pass
+    session = open_page(arguments.cdp_port, resolve_url(arguments.base_url, ""))
+    sessions.append(session)
+    session.call("Page.enable")
+    session.call("Runtime.enable")
+    elapsed = wait_for_ready(session, arguments.diagnostics)
+    check_no_browser_errors(session)
+    geometry = canvas_geometry(session)
+    check_canvas(geometry)
+    scroll = check_control_keys_do_not_scroll(session)
+    check_no_browser_errors(session)
+    pixels = check_canvas_pixels(session, palette, arguments.diagnostics)
 
     summary = {
         "ready_seconds": round(elapsed, 2),
@@ -950,12 +1219,60 @@ def main() -> int:
         "pixels": pixels,
         "scroll": scroll,
     }
+
+    if arguments.hub_url:
+        embed = read_play_embed(arguments.sitegen_source)
+        expected = resolve_url(arguments.base_url, "index.html")
+        declared = urllib.parse.urljoin(arguments.hub_url, embed.src)
+        if declared != expected:
+            raise GateFailure(
+                f"the hub embed source {embed.src!r} resolves to {declared!r}, but "
+                f"the package is published at {expected!r}"
+            )
+        write_hub_page(arguments.hub_page, embed)
+        require_http_200(arguments.hub_url, "")
+        hub = open_page(arguments.cdp_port, resolve_url(arguments.hub_url, ""))
+        sessions.append(hub)
+        hub.call("Page.enable")
+        hub.call("Runtime.enable")
+        summary["hub"] = check_hub_embed(hub, embed, expected, arguments.diagnostics)
+
+    return summary
+
+
+def report_failure(sessions: list[DevTools], diagnostics: Path, message: str) -> int:
+    """Captures whatever the failed session can still show, then gives up."""
+    if sessions:
+        write_diagnostics(sessions[-1], diagnostics)
+    print(f"browser gate failed: {message}", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = gate_arguments(argv)
+    sessions: list[DevTools] = []
+    try:
+        summary = run_gate(arguments, sessions)
+    except GateFailure as failure:
+        return report_failure(sessions, arguments.diagnostics, str(failure))
+    # A driver defect is not a passing gate. Anything the phases above did not
+    # anticipate is reported like any other failure, with the same diagnostics
+    # written and the same sessions closed below.
+    except Exception as failure:  # noqa: BLE001
+        return report_failure(
+            sessions,
+            arguments.diagnostics,
+            f"unexpected {type(failure).__name__}: {failure}",
+        )
+    finally:
+        for session in sessions:
+            session.close()
+
     arguments.diagnostics.mkdir(parents=True, exist_ok=True)
     (arguments.diagnostics / "browser-gate.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
-    session.close()
     return 0
 
 

@@ -8,6 +8,11 @@
 # endpoint to the repository-owned Python gate. Diagnostics are retained on
 # failure and the exact server and browser PIDs are always terminated.
 #
+# The package is served twice over: at the project prefix the standalone play
+# page is published under, and inside a generated host document at the hub root
+# that embeds it with the iframe the site generator itself renders. The second
+# one proves the published homepage embed rather than only the direct link.
+#
 # The diagnostics directory is destructive, so it is canonicalized, contained
 # to the repository build root or the workflow runner temporary directory, and
 # only ever cleaned when a previous run of this script created it.
@@ -35,12 +40,6 @@ else
   caller_supplied=0
 fi
 sentinel=".midcreek-web-smoke"
-case "$diagnostics_input" in
-  "")
-    echo "refusing an empty path as a diagnostics directory" >&2
-    exit 1
-    ;;
-esac
 if [[ -L "$diagnostics_input" ]]; then
   echo "refusing the symbolic link $diagnostics_input as a diagnostics directory" >&2
   exit 1
@@ -157,6 +156,7 @@ python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$serve_root" \
 server_pid=$!
 
 base_url="http://127.0.0.1:$http_port/$prefix/play"
+hub_url="http://127.0.0.1:$http_port/$prefix/"
 for _ in $(seq 1 100); do
   if curl -fsS -o /dev/null "$base_url/index.html"; then
     break
@@ -196,4 +196,7 @@ python3 "$repository/scripts/browser_gate.py" \
   --cdp-port "$cdp_port" \
   --package "$package" \
   --design-source "$repository/src/design.rs" \
-  --diagnostics "$diagnostics"
+  --diagnostics "$diagnostics" \
+  --sitegen-source "$repository/src/sitegen.rs" \
+  --hub-page "$serve_root/$prefix/index.html" \
+  --hub-url "$hub_url"

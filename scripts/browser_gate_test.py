@@ -9,8 +9,10 @@ reassembly is proved end to end rather than asserted about in the abstract.
 from __future__ import annotations
 
 import socket
+import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -360,6 +362,8 @@ class FakePage:
             return self.canvas_takes_focus
         if expression == browser_gate.CANVAS_STILL_FOCUSED_JS:
             return self.canvas_keeps_focus and self.active == "canvas"
+        if expression == browser_gate.PROBE_STILL_FOCUSED_JS:
+            return self.probe is not None and self.active == self.probe
         raise AssertionError(f"the fake page cannot answer {expression!r}")
 
     # -- assertions helpers ------------------------------------------------
@@ -533,6 +537,25 @@ class KeyboardOwnershipTest(unittest.TestCase):
 
         self.assertIn("lost focus", str(failure.exception))
 
+    def test_a_probe_that_loses_focus_during_the_positive_control_fails(self) -> None:
+        """The positive control only measures what the probe actually received.
+
+        A page that moved focus part way through the sequence scrolled for some
+        other reason, so the focused no-scroll phase that follows would be
+        compared against a measurement of something else.
+        """
+
+        class DriftingPage(FakePage):
+            def evaluate(self, expression: str) -> object:
+                if expression == browser_gate.PROBE_STILL_FOCUSED_JS:
+                    return False
+                return super().evaluate(expression)
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.check_control_keys_do_not_scroll(DriftingPage())
+
+        self.assertIn("did not still own keyboard focus", str(failure.exception))
+
     def test_a_page_that_will_not_return_to_the_top_fails_loudly(self) -> None:
         class StuckPage(FakePage):
             def evaluate(self, expression: str) -> object:
@@ -594,7 +617,14 @@ class KeyboardOwnershipSourceTest(unittest.TestCase):
 
     SOURCE = (Path(__file__).resolve().parent / "browser_gate.py").read_text(encoding="utf-8")
 
-    def test_there_is_exactly_one_key_dispatch_call_site(self) -> None:
+    def test_every_key_dispatch_goes_through_the_single_press_helper(self) -> None:
+        """One keystroke helper, and the three events one keystroke really is.
+
+        The three dispatch calls are the raw key down, the character event, and
+        the key up of a single press, all inside `press_control_key`. A fourth
+        would be a second way to send a key, which is how the focused and
+        unfocused phases start proving different things.
+        """
         self.assertEqual(self.SOURCE.count('session.call("Input.dispatchKeyEvent"'), 3)
         self.assertEqual(self.SOURCE.count("def press_control_key("), 1)
         self.assertEqual(self.SOURCE.count("def press_control_keys("), 1)
@@ -606,6 +636,440 @@ class KeyboardOwnershipSourceTest(unittest.TestCase):
 
     def test_the_positive_control_names_the_keys_the_browser_guarantees(self) -> None:
         self.assertEqual(browser_gate.POSITIVE_CONTROL_KEYS, ("ArrowDown", "Space"))
+
+
+# ---------------------------------------------------------------------------
+# Session budget
+# ---------------------------------------------------------------------------
+
+
+class SessionBudgetTest(unittest.TestCase):
+    """Every DevTools call is bounded by what is left of the whole session."""
+
+    def session(self, payload: bytes, budget: float) -> browser_gate.DevTools:
+        server = FrameServer(payload)
+        self.addCleanup(server.close)
+        self.server = server
+        session = browser_gate.DevTools(server.url, budget=budget)
+        self.addCleanup(session.close)
+        return session
+
+    def test_a_call_past_the_budget_never_reaches_the_browser(self) -> None:
+        session = self.session(b"", budget=0.0)
+
+        with self.assertRaises(GateFailure) as failure:
+            session.call("Page.enable")
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertEqual(
+            len(self.server.received), 0, "an expired session sends nothing"
+        )
+
+    def test_a_call_is_bounded_by_the_remaining_budget_not_its_own_timeout(self) -> None:
+        """The defect this guards: a browser that answers, but never the caller.
+
+        Every answer here belongs to somebody else and then the browser goes
+        quiet, so the call's own thirty second timeout — and the blocking read
+        inside it — would keep the gate waiting far past the session budget.
+        """
+        chatter = frame(TEXT, b'{"id":9999}') * 2000
+        session = self.session(chatter, budget=0.2)
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure):
+            session.call("Page.enable", timeout=browser_gate.BROWSER_TIMEOUT_SECONDS)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed,
+            5.0,
+            "the call waited on its own timeout instead of the session budget",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Derived contracts
+# ---------------------------------------------------------------------------
+
+
+class PaletteRosterTest(unittest.TestCase):
+    """The approved palette is the game's declared roster, never a count."""
+
+    ROLES = """
+        pub const RACK_WHITE: Srgba = srgba_u8!(0xFB, 0xFC, 0xFD);
+        pub const WORKER_HI_VIS: Srgba = srgba_u8!(0xC8, 0xD9, 0x4A);
+        impl PaletteRole {
+            pub const ALL: [Self; 2] = [
+                Self::RackWhite,
+                Self::WorkerHiVis,
+            ];
+        }
+    """
+
+    def source(self, text: str) -> Path:
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "design.rs"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_the_declared_roster_becomes_the_expected_constant_names(self) -> None:
+        roles = browser_gate.read_palette_roles(self.source(self.ROLES))
+
+        self.assertEqual(roles, {"RACK_WHITE", "WORKER_HI_VIS"})
+
+    def test_the_real_design_source_matches_its_own_roster(self) -> None:
+        design = Path(__file__).resolve().parent.parent / "src" / "design.rs"
+
+        palette = browser_gate.read_palette(design)
+
+        self.assertEqual(set(palette), browser_gate.read_palette_roles(design))
+
+    def test_a_role_without_a_constant_fails_instead_of_shrinking_the_palette(self) -> None:
+        text = self.ROLES.replace(
+            "pub const WORKER_HI_VIS: Srgba = srgba_u8!(0xC8, 0xD9, 0x4A);", ""
+        )
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_palette(self.source(text))
+
+        self.assertIn("WORKER_HI_VIS", str(failure.exception))
+
+    def test_a_constant_outside_the_roster_fails_instead_of_being_judged_against(self) -> None:
+        text = self.ROLES + "\npub const STRAY_PINK: Srgba = srgba_u8!(0xFF, 0x00, 0xFF);\n"
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_palette(self.source(text))
+
+        self.assertIn("STRAY_PINK", str(failure.exception))
+
+    def test_a_roster_that_miscounts_itself_is_refused(self) -> None:
+        text = self.ROLES.replace("[Self; 2]", "[Self; 3]")
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_palette_roles(self.source(text))
+
+        self.assertIn("claims 3", str(failure.exception))
+
+
+class ServedUrlTest(unittest.TestCase):
+    """A packaged file name is a file name; a served path is a URL."""
+
+    def test_every_segment_is_quoted_and_the_separators_are_not(self) -> None:
+        url = browser_gate.resolve_url("http://127.0.0.1:9/site/play", "a b/c#d.html")
+
+        self.assertEqual(url, "http://127.0.0.1:9/site/play/a%20b/c%23d.html")
+
+    def test_the_package_root_is_the_base_url_itself(self) -> None:
+        self.assertEqual(
+            browser_gate.resolve_url("http://127.0.0.1:9/site/play", ""),
+            "http://127.0.0.1:9/site/play/",
+        )
+
+
+# ---------------------------------------------------------------------------
+# The published hub embed
+# ---------------------------------------------------------------------------
+
+
+HUB_SOURCE = (
+    'format!(r#"<div class="play-frame">\n'
+    '  <iframe class="play-embed" src="play/index.html" title="Playable build" '
+    'loading="lazy"></iframe>\n'
+    "</div>"#)\n"
+)
+
+
+class HubEmbedContractTest(unittest.TestCase):
+    """The embed under test is read from the generator that publishes it."""
+
+    def source(self, text: str) -> Path:
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "sitegen.rs"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_the_embed_is_read_out_of_the_generator(self) -> None:
+        embed = browser_gate.read_play_embed(self.source(HUB_SOURCE))
+
+        self.assertEqual(embed.class_name, "play-embed")
+        self.assertEqual(embed.src, "play/index.html")
+        self.assertIn('loading="lazy"', embed.tag)
+
+    def test_the_real_generator_still_renders_exactly_one_embed(self) -> None:
+        sitegen = Path(__file__).resolve().parent.parent / "src" / "sitegen.rs"
+
+        embed = browser_gate.read_play_embed(sitegen)
+
+        self.assertEqual(embed.class_name, "play-embed")
+        self.assertEqual(embed.src, "play/index.html")
+
+    def test_a_generator_with_no_embed_is_refused(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_play_embed(self.source("fn render_play() {}"))
+
+        self.assertIn("0 playable iframes", str(failure.exception))
+
+    def test_a_generator_with_two_embeds_is_refused(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_play_embed(self.source(HUB_SOURCE + HUB_SOURCE))
+
+        self.assertIn("2 playable iframes", str(failure.exception))
+
+    def test_the_harness_hosts_the_generators_own_tag(self) -> None:
+        embed = browser_gate.read_play_embed(self.source(HUB_SOURCE))
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        page = directory / "index.html"
+
+        browser_gate.write_hub_page(page, embed)
+
+        written = page.read_text(encoding="utf-8")
+        self.assertIn(embed.tag, written)
+        self.assertIn(".play-embed {", written)
+
+    def test_the_harness_never_overwrites_a_published_page(self) -> None:
+        embed = browser_gate.read_play_embed(self.source(HUB_SOURCE))
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        page = directory / "index.html"
+        page.write_text("the real hub", encoding="utf-8")
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.write_hub_page(page, embed)
+
+        self.assertIn("refusing to overwrite", str(failure.exception))
+        self.assertEqual(page.read_text(encoding="utf-8"), "the real hub")
+
+
+class FakeHub:
+    """A hub document with one scriptable playable iframe in it."""
+
+    RESOLVED = "http://127.0.0.1:9/site/play/index.html"
+
+    def __init__(
+        self,
+        *,
+        count: int = 1,
+        same_origin: bool = True,
+        resolved: str | None = None,
+        states: tuple[str, ...] = ("ready",),
+        errors: str = "",
+        canvas: dict | None = None,
+    ) -> None:
+        self.count = count
+        self.same_origin = same_origin
+        self.resolved = self.RESOLVED if resolved is None else resolved
+        self.states = list(states)
+        self.errors = errors
+        self.canvas = (
+            {
+                "width": 1152.0,
+                "height": 648.0,
+                "bufferWidth": 1152,
+                "bufferHeight": 648,
+                "visible": True,
+            }
+            if canvas is None
+            else canvas
+        )
+        self.reads = 0
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        if method == "Page.captureScreenshot":
+            raise GateFailure("the fake hub takes no screenshots")
+        raise AssertionError(f"the fake hub should not call {method}")
+
+    def evaluate(self, expression: str) -> object:
+        if expression == "document.documentElement.outerHTML":
+            return "<html></html>"
+        self.reads += 1
+        if self.count != 1:
+            return {"count": self.count}
+        if not self.same_origin:
+            return {"count": 1, "sameOrigin": False, "resolved": self.resolved}
+        state = self.states[min(self.reads, len(self.states)) - 1]
+        return {
+            "count": 1,
+            "sameOrigin": True,
+            "resolved": self.resolved,
+            "state": state,
+            "errors": self.errors,
+            "canvas": self.canvas,
+        }
+
+
+class HubEmbedGateTest(unittest.TestCase):
+    """Drives the real hub phase against the scriptable hub document."""
+
+    EMBED = browser_gate.PlayEmbed(
+        class_name="play-embed",
+        src="play/index.html",
+        tag='<iframe class="play-embed" src="play/index.html"></iframe>',
+    )
+
+    def setUp(self) -> None:
+        self._ready = browser_gate.READY_TIMEOUT_SECONDS
+        browser_gate.READY_TIMEOUT_SECONDS = 0.3
+        self.diagnostics = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.diagnostics, True)
+
+    def tearDown(self) -> None:
+        browser_gate.READY_TIMEOUT_SECONDS = self._ready
+
+    def check(self, hub: FakeHub) -> dict:
+        return browser_gate.check_hub_embed(
+            hub, self.EMBED, FakeHub.RESOLVED, self.diagnostics
+        )
+
+    def test_a_ready_embed_reports_the_element_it_proved(self) -> None:
+        summary = self.check(FakeHub())
+
+        self.assertEqual(summary["class"], "play-embed")
+        self.assertEqual(summary["src"], "play/index.html")
+        self.assertEqual(summary["resolved"], FakeHub.RESOLVED)
+        self.assertEqual(summary["canvas"]["buffer"], [1152, 648])
+
+    def test_an_embed_that_starts_loading_is_waited_for(self) -> None:
+        summary = self.check(FakeHub(states=("loading", "loading", "ready")))
+
+        self.assertEqual(summary["resolved"], FakeHub.RESOLVED)
+
+    def test_a_hub_without_exactly_one_embed_fails(self) -> None:
+        for count in (0, 2):
+            with self.assertRaises(GateFailure) as failure:
+                self.check(FakeHub(count=count))
+            self.assertIn(f"{count} iframe.play-embed", str(failure.exception))
+
+    def test_an_embed_the_hub_cannot_read_fails(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            self.check(FakeHub(same_origin=False))
+
+        self.assertIn("not readable", str(failure.exception))
+
+    def test_an_embed_pointing_somewhere_else_fails(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            self.check(FakeHub(resolved="http://127.0.0.1:9/site/old/index.html"))
+
+        self.assertIn("not to the published package", str(failure.exception))
+
+    def test_an_embed_that_never_reaches_ready_fails_with_what_it_captured(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            self.check(FakeHub(states=("loading",), errors="rack.glb failed to load"))
+
+        message = str(failure.exception)
+        self.assertIn("data-game-state='loading'", message)
+        self.assertIn("rack.glb failed to load", message)
+
+    def test_an_embed_that_reported_error_fails_at_once(self) -> None:
+        hub = FakeHub(states=("error",))
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure):
+            self.check(hub)
+
+        self.assertLess(time.monotonic() - started, 0.3)
+
+    def test_an_embed_that_captured_an_error_while_ready_still_fails(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            self.check(FakeHub(errors="unhandled rejection"))
+
+        self.assertIn("captured errors", str(failure.exception))
+
+    def test_an_embed_without_a_canvas_fails(self) -> None:
+        with self.assertRaises(GateFailure) as failure:
+            self.check(FakeHub(canvas={}))
+
+        self.assertIn("no #game-canvas", str(failure.exception))
+
+    def test_an_embedded_canvas_that_is_not_sixteen_by_nine_fails(self) -> None:
+        squashed = {
+            "width": 900.0,
+            "height": 648.0,
+            "bufferWidth": 900,
+            "bufferHeight": 648,
+            "visible": True,
+        }
+
+        with self.assertRaises(GateFailure) as failure:
+            self.check(FakeHub(canvas=squashed))
+
+        self.assertIn("not 16:9", str(failure.exception))
+
+
+# ---------------------------------------------------------------------------
+# Entry point behaviour
+# ---------------------------------------------------------------------------
+
+
+class EntryPointTest(unittest.TestCase):
+    """A driver defect is a failed gate, not a passing one."""
+
+    def arguments(self, extra: list[str] | None = None) -> list[str]:
+        design = Path(__file__).resolve().parent.parent / "src" / "design.rs"
+        package = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, package, True)
+        self.diagnostics = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.diagnostics, True)
+        return [
+            "--base-url",
+            "http://127.0.0.1:9/site/play",
+            "--cdp-port",
+            "9",
+            "--package",
+            str(package),
+            "--design-source",
+            str(design),
+            "--diagnostics",
+            str(self.diagnostics),
+            *(extra or []),
+        ]
+
+    def test_an_unexpected_driver_exception_is_a_failed_gate(self) -> None:
+        def explode(arguments: object, sessions: list) -> dict:
+            raise ZeroDivisionError("the driver divided by zero")
+
+        original = browser_gate.run_gate
+        browser_gate.run_gate = explode
+        self.addCleanup(setattr, browser_gate, "run_gate", original)
+
+        code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 1, "an unexpected exception must not pass the gate")
+        self.assertFalse(
+            (self.diagnostics / "browser-gate.json").exists(),
+            "a failed gate never writes the summary a green run publishes",
+        )
+
+    def test_every_opened_session_is_closed_whatever_happened(self) -> None:
+        closed: list[str] = []
+
+        class Session:
+            def close(self) -> None:
+                closed.append("closed")
+
+        def open_then_fail(arguments: object, sessions: list) -> dict:
+            sessions.append(Session())
+            raise GateFailure("the page never arrived")
+
+        original = browser_gate.run_gate
+        browser_gate.run_gate = open_then_fail
+        self.addCleanup(setattr, browser_gate, "run_gate", original)
+        original_diagnostics = browser_gate.write_diagnostics
+        browser_gate.write_diagnostics = lambda session, path: None
+        self.addCleanup(setattr, browser_gate, "write_diagnostics", original_diagnostics)
+
+        code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(closed, ["closed"])
+
+    def test_the_hub_arguments_are_used_together_or_not_at_all(self) -> None:
+        with self.assertRaises(SystemExit):
+            browser_gate.gate_arguments(
+                self.arguments(["--hub-url", "http://127.0.0.1:9/site/"])
+            )
 
 
 if __name__ == "__main__":
