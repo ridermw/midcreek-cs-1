@@ -38,11 +38,34 @@ pub const WALL_HEIGHT: f32 = 1.2;
 /// area so a player clamped by the room bounds stops flush against them.
 pub const WALL_THICKNESS: f32 = 0.4;
 /// Painted floor markings are thin decals lifted just clear of the floor.
+/// Height of the raised-floor grid above the walkable floor, in metres. It is
+/// above the floor and the apron, and below the yellow floor markings.
+pub const FLOOR_GRID_HEIGHT: f32 = 0.002;
+
 pub const FLOOR_MARKING_WIDTH: f32 = 0.12;
+
+/// Width of the perimeter hazard striping, in metres.
+pub const PERIMETER_MARKING_WIDTH: f32 = 0.24;
+
+/// Distance from the room centre to the perimeter hazard striping, in metres.
+pub const PERIMETER_MARKING_OFFSET: f32 = 19.4;
+
+/// How much shorter than the room each hazard stripe is, so the four stripes
+/// meet at the corners without overlapping.
+pub const PERIMETER_MARKING_INSET: f32 = 1.4;
 /// Height above the floor at which markings are drawn.
 pub const FLOOR_MARKING_HEIGHT: f32 = 0.01;
 /// Height of the overhead cable tray module origin.
-pub const OVERHEAD_TRAY_HEIGHT: f32 = 4.0;
+/// Height of the overhead cable trays above the floor, in metres.
+///
+/// This is not a free choice. An orthographic camera at
+/// [`CAMERA_ELEVATION_DEGREES`] projects anything at height `h` onto the ground
+/// point `cot(57 deg) / sqrt(2) * h` away along each ground axis, so a tray
+/// hung over an aisle appears over a rack row exactly when that per-axis offset
+/// equals half the rack row spacing. At any other height the trays would hang
+/// visually over the walkway and hide the technician at two of the four
+/// headings, which the projected-worker-crop contract refuses.
+pub const OVERHEAD_TRAY_HEIGHT: f32 = 6.54;
 /// Height of the hose drop module origin, so its trunk stops under the tray.
 pub const HOSE_DROP_HEIGHT: f32 = 2.05;
 /// X positions of the four parallel rack rows.
@@ -121,7 +144,7 @@ pub const WORKER_BOOTS: Srgba = srgba_u8!(0x7A, 0x52, 0x33);
 pub const WORKER_HARD_HAT: Srgba = srgba_u8!(0x2C, 0x6F, 0xB8);
 pub const WORKER_SKIN: Srgba = srgba_u8!(0xC9, 0x8F, 0x6A);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum PaletteRole {
     RackWhite,
     RackShadow,
@@ -248,6 +271,9 @@ pub enum AssetKind {
     /// walkable room. It is rendered, never collided with, and never stood on.
     RenderApron,
     Floor,
+    /// The raised access floor: inked panel seams and alternating structural
+    /// bays, drawn over the whole rendered coverage.
+    FloorGrid,
     Wall,
     RackRow,
     CoolingUnit,
@@ -260,9 +286,10 @@ pub enum AssetKind {
 
 impl AssetKind {
     /// Every asset kind, in stable order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::RenderApron,
         Self::Floor,
+        Self::FloorGrid,
         Self::Wall,
         Self::RackRow,
         Self::CoolingUnit,
@@ -278,11 +305,12 @@ impl AssetKind {
     /// sets are disjoint and jointly exhaustive.
     pub const fn primitive(self) -> Option<(PrimitiveShape, PaletteRole)> {
         match self {
-            Self::RenderApron => Some((PrimitiveShape::Quad, PaletteRole::FloorShadow)),
+            Self::RenderApron => Some((PrimitiveShape::Quad, PaletteRole::RackShadow)),
             Self::Floor => Some((PrimitiveShape::Quad, PaletteRole::FloorLight)),
-            Self::Wall => Some((PrimitiveShape::Cuboid, PaletteRole::FloorShadow)),
+            Self::Wall => Some((PrimitiveShape::Cuboid, PaletteRole::RackWhite)),
             Self::FloorMarking => Some((PrimitiveShape::Quad, PaletteRole::SignatureYellow)),
-            Self::RackRow
+            Self::FloorGrid
+            | Self::RackRow
             | Self::CoolingUnit
             | Self::OverheadTray
             | Self::HoseDrop
@@ -507,6 +535,16 @@ impl SceneBlueprint {
             )),
         );
 
+        // The raised access floor sits just above both the walkable floor and
+        // the apron, so one authored grid inks every panel seam the camera can
+        // ever see, inside the room and out across the rendered coverage.
+        visuals.push(VisualSpec::new(
+            "floor-grid",
+            AssetKind::FloorGrid,
+            Vec3::new(0.0, FLOOR_GRID_HEIGHT, 0.0),
+            false,
+        ));
+
         let wall_offset = Vec2::new(
             ROOM_SIZE.x * 0.5 + WALL_THICKNESS * 0.5,
             ROOM_SIZE.y * 0.5 + WALL_THICKNESS * 0.5,
@@ -625,6 +663,45 @@ impl SceneBlueprint {
                     )),
                 );
             }
+        }
+        // Hazard striping just inside the perimeter walls. It is what makes
+        // the room edge readable from the far corners, where no equipment is
+        // in shot at all.
+        for (id, offset) in [
+            ("floor-marking-hazard-north", -PERIMETER_MARKING_OFFSET),
+            ("floor-marking-hazard-south", PERIMETER_MARKING_OFFSET),
+        ] {
+            visuals.push(
+                VisualSpec::new(
+                    id,
+                    AssetKind::FloorMarking,
+                    Vec3::new(0.0, FLOOR_MARKING_HEIGHT, offset),
+                    false,
+                )
+                .with_scale(Vec3::new(
+                    ROOM_SIZE.x - PERIMETER_MARKING_INSET,
+                    1.0,
+                    PERIMETER_MARKING_WIDTH,
+                )),
+            );
+        }
+        for (id, offset) in [
+            ("floor-marking-hazard-west", -PERIMETER_MARKING_OFFSET),
+            ("floor-marking-hazard-east", PERIMETER_MARKING_OFFSET),
+        ] {
+            visuals.push(
+                VisualSpec::new(
+                    id,
+                    AssetKind::FloorMarking,
+                    Vec3::new(offset, FLOOR_MARKING_HEIGHT, 0.0),
+                    false,
+                )
+                .with_scale(Vec3::new(
+                    PERIMETER_MARKING_WIDTH,
+                    1.0,
+                    ROOM_SIZE.y - PERIMETER_MARKING_INSET,
+                )),
+            );
         }
         for (id, z) in [
             ("floor-marking-walkway-north", -14.0),

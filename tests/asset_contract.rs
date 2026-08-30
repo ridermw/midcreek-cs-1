@@ -5,6 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use bevy::color::LinearRgba;
 use midcreek_cs_1::{
     assetgen::{
         ASSET_MODULES, ASSET_NAMES, AssetGenError, GENERATED_DIR, GENERATOR_NAME,
@@ -435,7 +436,8 @@ fn every_asset_uses_only_approved_palette_materials() {
                 .iter()
                 .find(|role| format!("{role:?}") == material.name().unwrap_or_default())
                 .expect("material name should map to a palette role");
-            let color = role.color();
+            // glTF base colours are linear; the typed palette is sRGB.
+            let color = LinearRgba::from(role.color());
             let factor = material.pbr_metallic_roughness().base_color_factor();
             for (actual, expected) in
                 factor
@@ -1253,8 +1255,20 @@ fn equipment_and_props_are_authored_with_the_expected_shape() {
     let infrastructure = asset("infrastructure");
     assert_eq!(
         scene_names(&infrastructure),
-        vec!["overhead-tray", "hose-drop"]
+        vec!["overhead-tray", "hose-drop", "floor-grid"]
     );
+    let grid_roles = node_by_name(&infrastructure, "floor-grid")
+        .mesh()
+        .expect("floor grid mesh")
+        .primitives()
+        .map(|p| p.material().name().unwrap_or_default().to_owned())
+        .collect::<BTreeSet<_>>();
+    for required in [PaletteRole::Ink, PaletteRole::FloorShadow] {
+        assert!(
+            grid_roles.contains(&format!("{required:?}")),
+            "the raised access floor needs {required:?}, got {grid_roles:?}"
+        );
+    }
     let hose_roles = node_by_name(&infrastructure, "hose-drop")
         .mesh()
         .expect("hose mesh")

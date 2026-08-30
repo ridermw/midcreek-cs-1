@@ -9,9 +9,9 @@
             shapes: [
                 (
                     name: "cabinet-body",
-                    role: RackWhite,
+                    role: RackShadow,
                     repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
-                    outline: Some(0.035),
+                    outline: Some(0.055),
                     primitive: Box(
                         center: (0.0, 1.08, -7.0),
                         half_extents: (0.74, 1.05, 0.96),
@@ -27,6 +27,18 @@
                     ),
                 ),
                 (
+                    // The recessed lid panel: the cabinet reads as a white
+                    // lid with a shadowed service panel from every heading,
+                    // instead of a solid white slab from directly above.
+                    name: "cabinet-top-panel",
+                    role: RackShadow,
+                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 2.19, -7.0),
+                        half_extents: (0.60, 0.012, 0.80),
+                    ),
+                ),
+                (
                     name: "cabinet-plinth",
                     role: Ink,
                     repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
@@ -36,21 +48,12 @@
                     ),
                 ),
                 (
-                    name: "cabinet-shadow-face",
-                    role: RackShadow,
-                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
-                    primitive: Box(
-                        center: (-0.748, 1.08, -7.0),
-                        half_extents: (0.008, 1.02, 0.93),
-                    ),
-                ),
-                (
                     name: "cabinet-seam",
-                    role: RackShadow,
-                    repeat: [(count: 8, step: (0.0, 0.0, 2.0))],
+                    role: Ink,
+                    repeat: [(count: 9, step: (0.0, 0.0, 2.0))],
                     primitive: Box(
-                        center: (0.0, 1.08, -7.955),
-                        half_extents: (0.745, 1.05, 0.005),
+                        center: (0.0, 1.08, -7.97),
+                        half_extents: (0.755, 1.05, 0.03),
                     ),
                 ),
                 (
@@ -123,8 +126,8 @@
                     name: "rack-contact-shadow",
                     role: FloorShadow,
                     primitive: Box(
-                        center: (0.30, 0.004, 0.0),
-                        half_extents: (0.95, 0.004, 8.05),
+                        center: (0.35, 0.006, 0.20),
+                        half_extents: (1.30, 0.002, 8.15),
                     ),
                 ),
             ],

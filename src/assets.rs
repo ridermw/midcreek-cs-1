@@ -98,6 +98,7 @@ pub fn generated_modules() -> Vec<GeneratedModule> {
 /// resolve to a cached unit primitive return `None`.
 pub fn module_for(kind: AssetKind) -> Option<GeneratedModule> {
     let module = match kind {
+        AssetKind::FloorGrid => "floor-grid",
         AssetKind::RackRow => "rack-row",
         AssetKind::CoolingUnit => "cooling-unit",
         AssetKind::OverheadTray => "overhead-tray",

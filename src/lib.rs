@@ -6,6 +6,10 @@ pub mod hud;
 pub mod operations;
 pub mod player;
 pub mod sitegen;
+/// Autonomous verification is a native-only gate; the browser build never
+/// carries the harness, the analyzers, or the fixtures.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod verification;
 pub mod web;
 pub mod world;
 
@@ -78,6 +82,48 @@ pub fn run() {
     app.add_plugins(web::WebReadyPlugin);
 
     app.run();
+}
+
+/// Runs the same production game under the scripted verification journey.
+///
+/// Nothing about the game changes: the plugins, systems, hall, rig, scheduler,
+/// and HUD are the ones `run` builds. Only the window presentation and the
+/// deterministic driver are added, and the window is asked for exactly the
+/// captured resolution with no scale factor so a screenshot is the frame the
+/// contract names.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_verification(
+    output: verification::VerifyOutput,
+    fault: Option<verification::VerificationFault>,
+) -> std::process::ExitCode {
+    use bevy::window::{PresentMode, WindowResolution};
+
+    let mut window = primary_window();
+    window.title = "Cell Shift Verification".into();
+    window.resolution = WindowResolution::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        .with_scale_factor_override(1.0);
+    window.present_mode = PresentMode::AutoNoVsync;
+    window.resizable = true;
+
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(window),
+                ..default()
+            })
+            .set(bevy::asset::AssetPlugin {
+                meta_check: bevy::asset::AssetMetaCheck::Never,
+                ..default()
+            }),
+    )
+    .add_plugins(CellShiftPlugin)
+    .add_plugins(verification::VerificationPlugin::new(output, fault));
+
+    match app.run() {
+        AppExit::Success => std::process::ExitCode::SUCCESS,
+        AppExit::Error(code) => std::process::ExitCode::from(code.get()),
+    }
 }
 
 fn primary_window() -> Window {

@@ -8,8 +8,8 @@
             shapes: [
                 (
                     name: "unit-body",
-                    role: RackWhite,
-                    outline: Some(0.035),
+                    role: RackShadow,
+                    outline: Some(0.055),
                     primitive: Box(
                         center: (0.0, 1.30, 0.0),
                         half_extents: (0.98, 1.28, 1.98),
@@ -31,14 +31,7 @@
                         half_extents: (0.94, 0.02, 1.94),
                     ),
                 ),
-                (
-                    name: "unit-shadow-face",
-                    role: RackShadow,
-                    primitive: Box(
-                        center: (-0.985, 1.30, 0.0),
-                        half_extents: (0.008, 1.24, 1.94),
-                    ),
-                ),
+
                 (
                     name: "grille-fin-lit-face",
                     role: Ink,
@@ -120,8 +113,8 @@
                     name: "unit-contact-shadow",
                     role: FloorShadow,
                     primitive: Box(
-                        center: (0.30, 0.004, 0.0),
-                        half_extents: (1.15, 0.004, 2.05),
+                        center: (0.35, 0.006, 0.20),
+                        half_extents: (1.45, 0.002, 2.45),
                     ),
                 ),
             ],

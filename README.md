@@ -67,22 +67,37 @@ handles; `src/world.rs` spawns the hall from the validated blueprint in
 - Generated static detail stays merged inside its module, so no server slot,
   status light, or tray rung becomes a runtime entity.
 
-The fixed 40 m square walkable hall contains 30 authored visuals and 13
-colliders. Only the visual apron lies outside the room; everything else is
-inside it:
+The fixed 40 m square walkable hall contains 35 authored visuals and 13
+colliders. Only the visual apron and the raised access floor extend outside the
+room; everything else is inside it:
 
 | Category | Count | Placement |
 |---|---|---|
 | Rendered-coverage apron | 1 | 72 m x 72 m building shell, 0.05 m below the floor, visual only |
 | Floor | 1 | 40 m x 40 m polished light concrete |
+| Raised access floor | 1 | 72 m x 72 m of inked 2 m panel seams and alternating 4 m structural bays, 2 mm above the floor, visual only |
 | Low perimeter walls | 4 | flush outside the play area, 1.2 m high |
 | Rack rows | 4 | x = -9, -3, 3, 9 |
 | Aisles | 3 | x = -6, 0, 6, z = -12 to 12 |
 | Cooling units | 4 | x = +/-13, z = +/-6 |
-| Overhead trays | 3 | one per aisle at y = 4 |
+| Overhead trays | 3 | one per aisle at y = 6.54 |
 | Hose drops | 3 | hanging from each tray at z = 7 |
 | Utility cart, step stool | 1 each | (-13, -10) and (13, 10) |
-| Yellow floor markings | 8 | six aisle edges plus two cross-hall walkways |
+| Yellow floor markings | 12 | six aisle edges, four perimeter hazard stripes, two cross-hall walkways |
+
+The raised access floor is one merged generated mesh rather than hundreds of
+tile entities, and it is what gives every heading its second diagonal edge
+family: the isometric projection maps the two ground axes onto 40 and 140
+degrees on screen, so a square panel grid is the only thing in the hall that
+draws both. It also keeps the far room corners from rendering as a featureless
+plane.
+
+The tray height is derived, not chosen. An orthographic camera at 57 degrees
+elevation projects a point at height `h` onto the ground point `0.459 * h` away
+along each ground axis, so a tray hung over an aisle appears over a rack row
+exactly when that offset is half the 6 m rack row spacing. At any other height
+the trays hang visually over the walkway and hide the technician at two of the
+four headings.
 
 Visual and collider lists stay separate and are joined only by their stable
 `PropId`; duplicate, missing, and orphan identifiers are all reported in one
@@ -548,6 +563,126 @@ Three containment rules keep publication and the gate from destroying anything:
   is canonicalized, contained to the same trusted roots, and cleaned only when
   a previous run of the script left its `.midcreek-web-smoke` marker there.
 
+## Autonomous verification and the visual hill-climb gate
+
+```bash
+./scripts/check.sh
+```
+
+`midcreek-cs-1 --verify-output <directory>` drives the *same* production game
+through one scripted, deterministic journey, captures fourteen real frames from
+the real renderer, and writes one canonical semantic report. Nothing about the
+game changes: the plugins, hall, rig, seeded scheduler, and HUD are the ones
+`cargo run` builds. Only the window presentation and the driver are added.
+
+### Output safety
+
+An unusable `--verify-output` path exits with code 2 and one line on stderr.
+`VerifyOutput::prepare` refuses an empty path, a path holding a `..` component,
+a filesystem root, a symbolic link, anything that is not a directory, an
+unwritable directory, and any directory where one of the fifteen owned artifact
+names is already something other than a regular file. It creates at most the
+final missing path component, and the only removal it ever performs is of those
+exact fifteen names. No path in the module recursively deletes anything.
+
+### Stage machine
+
+```text
+Boot -> WaitForAssets -> ValidateBlueprint -> HealthyCapture -> SeedThreeFaults
+     -> FaultQueueCapture -> KeyboardJourney -> WalkCapture -> BeginRepair
+     -> RepairCapture -> CompleteRepair -> ResolvedCapture
+     -> OrbitSouthEast -> SettledSouthEastCapture
+     -> OrbitSouthWest -> SettledSouthWestCapture
+     -> OrbitNorthWest -> SettledNorthWestCapture
+     -> MidOrbitCapture -> CornerProbes -> LowResolutionCapture
+     -> AnalyzeReady -> WriteReport -> Success
+
+Any invalid transition, missing entity, asset failure, capture failure, or
+watchdog expiry -> Failure -> AppExit::error()
+```
+
+The only legal transitions are `stage -> stage.next()` and, from a non-terminal
+stage, `stage -> Failure`. The render contract walks all 625 ordered pairs and
+requires every other one to be refused without moving the machine.
+
+### Determinism
+
+- fixed `1/60` second simulated step for every frame;
+- the operations model is reset to a pristine origin once the hall is ready, so
+  ticket 1 always opens on tick 240, ticket 2 on 480, and ticket 3 on 720
+  whatever the disk did during asset loading;
+- every capture costs exactly `CAPTURE_FRAMES` simulated frames and every
+  resize exactly `RESIZE_FRAMES`, so GPU readback latency can never leak into
+  simulated time;
+- MSAA off, tonemapping off, deband dither off, magenta clear colour;
+- the canonical report sorts every map, rounds every float onto the `1e-6`
+  grid, uses relative paths, and carries no wall clock, host, or environment
+  value. Two runs in different output directories produce byte-identical
+  reports and identical semantic hashes.
+
+Real `ButtonInput<KeyCode>` press and release messages drive the journey: arrow
+keys resolved through the live `ViewBasis`, `E` for every orbit, one
+simultaneous `Q` and `E` that the run then requires to have cancelled, and
+`Space` for both the out-of-range rejection and the accepted repair.
+
+### The fourteen frames
+
+`01-healthy-center-ne`, `02-fault-queue-ne`, `03-walk-ne`, `04-repairing-ne`,
+`05-resolved-ne`, `06-settled-se`, `07-settled-sw`, `08-settled-nw`,
+`09-mid-orbit`, `10-corner-ne`, `11-corner-se`, `12-corner-sw`,
+`13-corner-nw`, and `14-low-resolution-queue`. The first thirteen are
+1280x720; the last is the 960x540 three-ticket layout.
+
+### Mandatory frame contracts
+
+Every frame is measured once, in a single traversal that produces the colour
+statistics, the sentinel ratio, the nearest-role histogram, the Sobel edge
+orientation histogram, and every named region at the same time. The key art's
+metrics are measured once and cached for the process.
+
+| Contract | Bound |
+|---|---|
+| Dimensions and artifact names | exact |
+| Magenta sentinel | `<= 0.1%`; any of it means the ground quadrilateral left the 72 m apron |
+| Mean linear luminance | `[0.48, 0.88]`, and within `0.18` of the key art |
+| Approved palette | `>= 60%` of pixels within RGB distance 24 |
+| Floor tones | `>= 20%` |
+| Rack base and shadow | `>= 6%` |
+| Signature yellow | `>= 0.5%` |
+| Ink and hose charcoal | `3%` to `35%` |
+| Diagonal edge bands 30-50 and 130-150 degrees | `>= 8%` of strong-edge mass each, at every settled heading |
+| Worker identity | hard hat and hi-vis pixels inside the projected worker crop |
+| Idle, Walk, and Repair | bounded worker-mask difference between each pair |
+| Same-position captures | `<= 1%` of the frame outside the worker crop may change |
+| Badges | red for open faults, blue during repair, healthy green after |
+| HUD | computed rectangles on screen and carrying the live state colours |
+| Key-art histogram | nearest-palette L1 distance `<= 0.90` |
+| Edge density | `0.35x` to `2.5x` the key art |
+
+### Proving the gate can fail
+
+Generated fixtures prove each analyzer family rejects the frame it targets:
+all-black, gradient noise, a magenta sentinel border, an axis-aligned-only
+frame, the worker colours painted out, the badges painted out, and a blank HUD.
+The last three are also cut from a *real* captured frame, so the mutation is
+proven against the same image the gate accepted a moment earlier.
+
+`--verify-fault` injects the failures the registry names:
+
+- `drop-capture` never records a completed screenshot, so the run fails naming
+  the frame whose callback was lost;
+- `stall` never leaves its stage, so the 45-second app watchdog fails the run
+  naming that stage;
+- `hang` also disables the app watchdog, so the 50-second parent watchdog has
+  to kill that exact child. Frames already captured are kept.
+
+### Diagnosing a failure
+
+The rendered contract keeps everything under
+`target/render-contract/primary`: the fourteen frames, `report.json`,
+`stdout.log`, and `stderr.log`. Every metric failure names the frame, the
+metric, the measured value, and the bound it had to satisfy.
+
 ## Foundation gates
 
 ```bash
@@ -557,6 +692,16 @@ cargo run --bin assetgen -- --write
 cargo run --bin assetgen -- --check
 cargo test
 ```
+
+Render gates:
+
+```bash
+cargo test --test render_contract
+```
+
+The rendered contract needs a real renderer. On a headless Linux machine run it
+under `xvfb-run -a`; `scripts/check.sh` does that automatically and treats a
+missing display or renderer as a hard failure rather than a skip.
 
 Hall gates:
 

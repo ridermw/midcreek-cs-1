@@ -95,17 +95,17 @@
     {
       "id": "autonomous-verification",
       "title": "Build autonomous verification and visual hill-climb gates",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "operations-hud"
       ],
       "summary": "Build deterministic gameplay and render verification.",
-      "completed_commit": null
+      "completed_commit": "HEAD"
     },
     {
       "id": "pages-verification",
       "title": "Publish comparisons, evidence, and verification",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "pages-playable",
         "autonomous-verification"
@@ -205,6 +205,24 @@
       "impact": "The Pages site is published by force-pushing a generated pages-live branch, so every published file must clear GitHub's hard 100 MB blob limit. A stock release build of the full Bevy game for wasm32-unknown-unknown produced a 117.7 MB module, which could never have been pushed, and no amount of retrying the deployment would have revealed the real cause.",
       "approach": "The module was measured section by section rather than guessed at: the WebAssembly name section alone was 49.7 MB and the code section was 59.1 MB. wasm-bindgen now runs with --remove-name-section and --remove-producers-section, the release profile uses fat LTO with one codegen unit and panic=abort, and .cargo/config.toml applies -Copt-level=s only to wasm32-unknown-unknown so the native release build keeps its own optimization level. The same file also supplies the getrandom wasm_js backend the browser target requires.",
       "resolution": "The published game_bg.wasm is 34.5 MB, comfortably inside the blob limit, and scripts/build-web.sh refuses to publish a package that is missing any of index.html, play.js, play.css, game.js, game_bg.wasm, or any of the five generated GLBs, that contains a root-absolute URL, or that leaks a build host path into the generated bindings.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "generated-materials-rendered-far-brighter-than-the-authored-palette",
+      "title": "Every generated surface rendered far brighter than the typed cel-shift palette",
+      "status": "resolved",
+      "impact": "The first real screenshots looked washed out and no frame could ever have met the visual contracts: ink measured 0.07 percent of the frame against a mandatory 3 percent floor, rack shadow measured 0.05 percent, and mean linear luminance sat at 0.743 against a ceiling of 0.572. The cause was invisible from the source data, because the RON palette roles, the GLB material names, and the committed bytes were all exactly right.",
+      "approach": "Sampling the exact rendered colours showed the pattern: white came out white but ink #1F2A33 came out #2F3A43 and teal #2FB8A8 came out #77DDD4, a brightening that only spares saturated whites. That is the signature of an sRGB value being interpreted as linear. glTF defines baseColorFactor in linear space, while the typed palette is sRGB, and the generator was writing the sRGB channels straight through.",
+      "resolution": "assetgen now converts each role with LinearRgba::from before writing baseColorFactor, the asset contract asserts the linear value rather than the sRGB one, and every GLB was regenerated. Palette accuracy went from 90 to 98 percent of pixels within RGB distance 24 of an approved role, and the same fix moved ink, rack shadow, hose charcoal, teal, and yellow onto their authored values in one step.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "the-overhead-trays-hid-the-technician-at-two-of-the-four-headings",
+      "title": "The overhead cable trays hid the technician at two of the four camera headings",
+      "status": "resolved",
+      "impact": "The projected-worker-crop contract found no hard hat and no hi-vis pixels at all in the settled north-west capture and only 0.04 percent in the south-west one. The technician was completely behind a cable tray, which is a real playability failure rather than a measurement artefact: at half the headings the player could not see their own character while standing at a rack.",
+      "approach": "An orthographic camera at 57 degrees elevation projects anything at height h onto the ground point cot(57 deg) / sqrt(2) times h away along each ground axis, which is 0.459h per axis. At the original 4 m the trays landed 1.84 m away, right on top of a technician standing at a rack face. Every height was checked against the 6 m rack row spacing rather than nudged.",
+      "resolution": "OVERHEAD_TRAY_HEIGHT is now 6.54 m, the height whose 3 m per-axis offset is exactly half the rack row spacing, so a tray hung over an aisle always projects over a rack row and never over the walkway. The trays were also narrowed and their hanging hose runs removed. All fourteen frames now carry hard hat and hi-vis pixels inside the projected worker crop, and the constant carries the derivation beside it so it cannot be tuned away.",
       "resolved_commit": "HEAD"
     }
   ]

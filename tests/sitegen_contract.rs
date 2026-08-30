@@ -458,7 +458,7 @@ mod progress_contract {
             assert_eq!(output.status.code(), Some(0));
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                "autonomous-verification\n"
+                "pages-verification\n"
             );
             assert!(output.stderr.is_empty());
         }
@@ -539,14 +539,14 @@ mod progress_contract {
                 ),
                 (
                     "autonomous-verification",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["operations-hud"][..],
                     "Build deterministic gameplay and render verification.",
-                    None,
+                    Some("HEAD"),
                 ),
                 (
                     "pages-verification",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["pages-playable", "autonomous-verification"][..],
                     "Publish comparisons, screenshots, challenges, and test evidence.",
                     None,
@@ -596,6 +596,8 @@ mod progress_contract {
                     "screen-space-badges-that-survive-orbit-and-resize",
                     "a-browser-gate-that-cannot-pass-on-a-blank-page",
                     "a-hundred-megabyte-wasm-game-cannot-be-published",
+                    "generated-materials-rendered-far-brighter-than-the-authored-palette",
+                    "the-overhead-trays-hid-the-technician-at-two-of-the-four-headings",
                 ]
             );
             for challenge in &document.challenges {

@@ -21,6 +21,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use bevy::color::LinearRgba;
 use gltf_json as json;
 use json::validation::{Checked, USize64};
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,10 @@ pub const ASSET_NAMES: [&str; 5] = [
 /// The scene/module names each asset must expose, in declaration order.
 pub const ASSET_MODULES: [(&str, &[&str]); 5] = [
     ("cooling-unit", &["cooling-unit"]),
-    ("infrastructure", &["overhead-tray", "hose-drop"]),
+    (
+        "infrastructure",
+        &["overhead-tray", "hose-drop", "floor-grid"],
+    ),
     ("rack", &["rack-row"]),
     ("technician", &["technician"]),
     ("utility-props", &["utility-cart", "step-stool"]),
@@ -1664,7 +1668,12 @@ fn push_mesh(
     for (role_slot, role_geometry) in &geometry.roles {
         let role = PaletteRole::ALL[*role_slot];
         let material = *materials.entry(*role_slot).or_insert_with(|| {
-            let color = role.color();
+            // glTF stores `baseColorFactor` in linear space, so the typed sRGB
+            // palette has to be converted here. Writing the sRGB channels
+            // straight through would make every generated surface render far
+            // brighter than the authored role, which is exactly what the ink,
+            // shadow, and luminance frame contracts refuse.
+            let color = LinearRgba::from(role.color());
             json::Index::push(
                 &mut builder.root.materials,
                 json::Material {

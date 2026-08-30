@@ -219,6 +219,7 @@ fn design_v0_blueprint_lists_the_authored_hall_in_reviewed_order() {
         [
             "render-apron",
             "floor",
+            "floor-grid",
             "wall-north",
             "wall-south",
             "wall-west",
@@ -245,6 +246,10 @@ fn design_v0_blueprint_lists_the_authored_hall_in_reviewed_order() {
             "floor-marking-aisle-02-east",
             "floor-marking-aisle-03-west",
             "floor-marking-aisle-03-east",
+            "floor-marking-hazard-north",
+            "floor-marking-hazard-south",
+            "floor-marking-hazard-west",
+            "floor-marking-hazard-east",
             "floor-marking-walkway-north",
             "floor-marking-walkway-south",
         ]
@@ -282,6 +287,7 @@ fn design_v0_blueprint_counts_every_authored_category() {
     assert_eq!(scene.aisles.len(), 3);
     assert_eq!(scene.count_of(AssetKind::RenderApron), 1);
     assert_eq!(scene.count_of(AssetKind::Floor), 1);
+    assert_eq!(scene.count_of(AssetKind::FloorGrid), 1);
     assert_eq!(scene.count_of(AssetKind::Wall), 4);
     assert_eq!(scene.count_of(AssetKind::RackRow), 4);
     assert_eq!(scene.count_of(AssetKind::CoolingUnit), 4);
@@ -289,8 +295,8 @@ fn design_v0_blueprint_counts_every_authored_category() {
     assert_eq!(scene.count_of(AssetKind::HoseDrop), 3);
     assert_eq!(scene.count_of(AssetKind::UtilityCart), 1);
     assert_eq!(scene.count_of(AssetKind::StepStool), 1);
-    assert_eq!(scene.count_of(AssetKind::FloorMarking), 8);
-    assert_eq!(scene.visuals.len(), 30);
+    assert_eq!(scene.count_of(AssetKind::FloorMarking), 12);
+    assert_eq!(scene.visuals.len(), 35);
     assert_eq!(scene.colliders.len(), 13);
 }
 
@@ -439,7 +445,7 @@ fn design_v0_blueprint_places_the_room_shell_and_equipment_exactly() {
 
 #[test]
 fn design_every_asset_kind_is_either_a_generated_module_or_a_unit_primitive() {
-    assert_eq!(AssetKind::ALL.len(), 10);
+    assert_eq!(AssetKind::ALL.len(), 11);
     for kind in AssetKind::ALL {
         let primitive = kind.primitive();
         let module = module_for(kind);
@@ -456,7 +462,16 @@ fn design_every_asset_kind_is_either_a_generated_module_or_a_unit_primitive() {
     );
     assert_eq!(
         AssetKind::Wall.primitive(),
-        Some((PrimitiveShape::Cuboid, PaletteRole::FloorShadow))
+        Some((PrimitiveShape::Cuboid, PaletteRole::RackWhite))
+    );
+    assert_eq!(
+        AssetKind::RenderApron.primitive(),
+        Some((PrimitiveShape::Quad, PaletteRole::RackShadow))
+    );
+    assert_eq!(
+        AssetKind::FloorGrid.primitive(),
+        None,
+        "the raised access floor is a generated merged mesh"
     );
     assert_eq!(
         AssetKind::FloorMarking.primitive(),
@@ -1415,7 +1430,7 @@ fn hall_asset_plugin_fails_loudly_when_a_module_scene_binding_is_swapped() {
     // spawns is no longer the module it claims to be.
     let assets = temp_assets("swapped", |generated| {
         let mut source = load_source(&repo_root(), "infrastructure").expect("fixture source");
-        assert_eq!(source.modules.len(), 2);
+        assert_eq!(source.modules.len(), 3);
         let first = source.modules[0].name.clone();
         source.modules[0].name = source.modules[1].name.clone();
         source.modules[1].name = first;
@@ -1570,7 +1585,7 @@ fn hall_spawns_unit_primitives_with_cached_meshes_and_palette_materials() {
         .filter(|visual| visual.asset.primitive().is_some())
         .collect::<Vec<_>>();
     assert_eq!(spawned.len(), primitives.len());
-    assert_eq!(primitives.len(), 14);
+    assert_eq!(primitives.len(), 18);
 
     for visual in primitives {
         let (shape, role) = visual.asset.primitive().expect("primitive kind");
@@ -1603,7 +1618,7 @@ fn hall_spawns_generated_modules_as_shared_scene_roots_without_new_materials() {
         .filter(|visual| module_for(visual.asset).is_some())
         .collect::<Vec<_>>();
     assert_eq!(spawned.len(), modules.len());
-    assert_eq!(modules.len(), 16);
+    assert_eq!(modules.len(), 17);
 
     for visual in &modules {
         let (_, kind, handle) = spawned

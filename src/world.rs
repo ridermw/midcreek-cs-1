@@ -328,8 +328,11 @@ mod tests {
             .count();
 
         assert_eq!(primitives + modules, blueprint.visuals.len());
-        assert_eq!(primitives, 14);
-        assert_eq!(modules, 16);
+        // Ten floor markings, four walls, the floor, the apron, and the two
+        // hazard stripe pairs are primitives; the raised floor grid joins the
+        // sixteen generated modules.
+        assert_eq!(primitives, 18);
+        assert_eq!(modules, 17);
         assert_eq!(
             blueprint
                 .visual("floor")
@@ -340,7 +343,14 @@ mod tests {
             blueprint
                 .visual("render-apron")
                 .map(|visual| visual.asset.primitive()),
-            Some(Some((PrimitiveShape::Quad, PaletteRole::FloorShadow)))
+            Some(Some((PrimitiveShape::Quad, PaletteRole::RackShadow)))
+        );
+        assert_eq!(
+            blueprint
+                .visual("floor-grid")
+                .map(|visual| module_for(visual.asset).map(|module| module.module)),
+            Some(Some("floor-grid")),
+            "the raised access floor is a generated merged mesh, not a primitive"
         );
     }
 

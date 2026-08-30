@@ -1,6 +1,7 @@
-// Cell Shift infrastructure: the overhead cable tray module and the black hose
-// drop module. Both are authored around their own origin so the hall can place
-// them at ceiling and drop height.
+// Cell Shift infrastructure: the overhead cable tray module, the black hose
+// drop module, and the raised-floor grid that gives the hall its cel-shift
+// tile pattern. All three are authored around their own origin so the hall can
+// place them at ceiling, drop, and floor height.
 (
     asset: "infrastructure",
     modules: [
@@ -9,63 +10,63 @@
             shapes: [
                 (
                     name: "tray-base",
-                    role: RackShadow,
+                    role: HoseCharcoal,
                     primitive: Box(
                         center: (0.0, 0.0, 0.0),
-                        half_extents: (0.35, 0.015, 8.0),
+                        half_extents: (0.45, 0.02, 13.0),
                     ),
                 ),
                 (
                     name: "tray-rail",
-                    role: RackShadow,
-                    repeat: [(count: 2, step: (0.68, 0.0, 0.0))],
+                    role: Ink,
+                    repeat: [(count: 2, step: (0.88, 0.0, 0.0))],
                     outline: Some(0.012),
                     primitive: Box(
-                        center: (-0.34, 0.07, 0.0),
-                        half_extents: (0.015, 0.085, 8.0),
+                        center: (-0.44, 0.08, 0.0),
+                        half_extents: (0.022, 0.10, 13.0),
                     ),
                 ),
                 (
                     name: "tray-rung",
-                    role: RackShadow,
-                    repeat: [(count: 17, step: (0.0, 0.0, 1.0))],
+                    role: Ink,
+                    repeat: [(count: 27, step: (0.0, 0.0, 1.0))],
                     primitive: Box(
-                        center: (0.0, 0.02, -8.0),
-                        half_extents: (0.33, 0.010, 0.06),
+                        center: (0.0, 0.03, -13.0),
+                        half_extents: (0.42, 0.012, 0.07),
                     ),
                 ),
                 (
                     name: "tray-hanger",
                     role: HoseCharcoal,
-                    repeat: [(count: 9, step: (0.0, 0.0, 2.0))],
+                    repeat: [(count: 14, step: (0.0, 0.0, 2.0))],
                     primitive: Box(
-                        center: (0.0, 0.50, -8.0),
-                        half_extents: (0.025, 0.42, 0.025),
+                        center: (0.0, 0.50, -13.0),
+                        half_extents: (0.03, 0.42, 0.03),
                     ),
                 ),
                 (
                     name: "tray-bracket",
                     role: Ink,
-                    repeat: [(count: 9, step: (0.0, 0.0, 2.0))],
+                    repeat: [(count: 14, step: (0.0, 0.0, 2.0))],
                     primitive: Box(
-                        center: (0.0, 0.92, -8.0),
-                        half_extents: (0.10, 0.03, 0.10),
+                        center: (0.0, 0.92, -13.0),
+                        half_extents: (0.12, 0.035, 0.12),
                     ),
                 ),
                 (
                     name: "tray-cable-bundle",
                     role: TealAccent,
                     primitive: Box(
-                        center: (-0.10, 0.09, 0.0),
-                        half_extents: (0.11, 0.035, 7.9),
+                        center: (-0.14, 0.11, 0.0),
+                        half_extents: (0.12, 0.04, 12.9),
                     ),
                 ),
                 (
                     name: "tray-cable-accent",
                     role: SignatureYellow,
                     primitive: Box(
-                        center: (0.15, 0.09, 0.0),
-                        half_extents: (0.06, 0.035, 7.9),
+                        center: (0.17, 0.11, 0.0),
+                        half_extents: (0.07, 0.04, 12.9),
                     ),
                 ),
             ],
@@ -123,8 +124,78 @@
                     name: "hose-contact-shadow",
                     role: FloorShadow,
                     primitive: Box(
-                        center: (0.14, -1.996, 0.0),
+                        center: (0.14, -1.992, 0.0),
                         half_extents: (0.28, 0.004, 0.26),
+                    ),
+                ),
+            ],
+        ),
+        (
+            // The raised access floor: two-metre panel seams inked across the
+            // whole rendered coverage, and alternating four-metre structural
+            // bays in the floor shadow tone. This is what gives every heading
+            // its second diagonal edge family and keeps the empty apron from
+            // rendering as a featureless plane.
+            name: "floor-grid",
+            shapes: [
+                (
+                    name: "panel-seam-north-south",
+                    role: Ink,
+                    repeat: [(count: 37, step: (2.0, 0.0, 0.0))],
+                    primitive: Box(
+                        center: (-36.0, 0.0, 0.0),
+                        half_extents: (0.05, 0.0015, 36.0),
+                    ),
+                ),
+                (
+                    name: "panel-seam-east-west",
+                    role: Ink,
+                    repeat: [(count: 37, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 0.0, -36.0),
+                        half_extents: (36.0, 0.0015, 0.05),
+                    ),
+                ),
+                (
+                    name: "panel-sub-seam-north-south",
+                    role: Ink,
+                    repeat: [(count: 36, step: (2.0, 0.0, 0.0))],
+                    primitive: Box(
+                        center: (-35.0, 0.0, 0.0),
+                        half_extents: (0.022, 0.0015, 36.0),
+                    ),
+                ),
+                (
+                    name: "panel-sub-seam-east-west",
+                    role: Ink,
+                    repeat: [(count: 36, step: (0.0, 0.0, 2.0))],
+                    primitive: Box(
+                        center: (0.0, 0.0, -35.0),
+                        half_extents: (36.0, 0.0015, 0.022),
+                    ),
+                ),
+                (
+                    name: "structural-bay-even",
+                    role: FloorShadow,
+                    repeat: [
+                        (count: 9, step: (8.0, 0.0, 0.0)),
+                        (count: 9, step: (0.0, 0.0, 8.0)),
+                    ],
+                    primitive: Box(
+                        center: (-34.0, -0.0005, -34.0),
+                        half_extents: (2.0, 0.001, 2.0),
+                    ),
+                ),
+                (
+                    name: "structural-bay-odd",
+                    role: FloorShadow,
+                    repeat: [
+                        (count: 9, step: (8.0, 0.0, 0.0)),
+                        (count: 9, step: (0.0, 0.0, 8.0)),
+                    ],
+                    primitive: Box(
+                        center: (-30.0, -0.0005, -30.0),
+                        half_extents: (2.0, 0.001, 2.0),
                     ),
                 ),
             ],
