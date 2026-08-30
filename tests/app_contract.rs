@@ -8,7 +8,6 @@ use std::{
 
 use bevy::{
     animation::AnimatedBy,
-    asset::AssetPlugin as BevyAssetPlugin,
     camera::ScalingMode,
     color::palettes::css::BLACK,
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
@@ -77,6 +76,7 @@ use midcreek_cs_1::{
         TECHNICIAN_MODEL_FORWARD, Technician, ViewBasis, arrow_input, required_player_parts,
         update_player_animation,
     },
+    runtime_asset_plugin,
     verification::{SENTINEL_CLEAR, VERIFICATION_MSAA},
     world::{
         HallBlueprint, HallColliders, HallErrors, HallProp, HallRoot, HallState, PlayerSpawnPoint,
@@ -1289,9 +1289,9 @@ fn hall_app(assets: &Path) -> App {
             .disable::<bevy::winit::WinitPlugin>()
             .disable::<bevy::app::PanicHandlerPlugin>()
             .disable::<bevy::app::TerminalCtrlCHandlerPlugin>()
-            .set(BevyAssetPlugin {
+            .set(bevy::asset::AssetPlugin {
                 file_path: assets.to_string_lossy().into_owned(),
-                ..default()
+                ..runtime_asset_plugin()
             })
             .set(RenderPlugin {
                 render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
@@ -1640,6 +1640,30 @@ fn hall_asset_plugin_fails_loudly_when_a_generated_asset_is_corrupt() {
         "failure report must name the corrupt file, got {failures:?}"
     );
     assert!(props(&mut app).is_empty());
+}
+
+#[test]
+fn native_runtime_asset_plugin_checks_metadata_and_fails_closed() {
+    let assets = temp_assets("invalid-meta", |generated| {
+        fs::write(generated.join("rack.glb.meta"), "invalid metadata")
+            .expect("fixture metadata should be writable");
+    });
+    let mut app = hall_app(assets.path());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Failed);
+    let failures = app
+        .world()
+        .resource::<AssetLoadReport>()
+        .failures()
+        .to_vec();
+    assert!(
+        failures.iter().any(|failure| failure.contains("rack.glb")),
+        "failure report must name the asset with invalid metadata, got {failures:?}"
+    );
+    assert!(
+        app.world().get_resource::<AssetReadyProof>().is_none(),
+        "invalid metadata must never publish asset readiness"
+    );
 }
 
 #[test]
