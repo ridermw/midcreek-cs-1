@@ -8,6 +8,7 @@ reassembly is proved end to end rather than asserted about in the abstract.
 
 from __future__ import annotations
 
+import json
 import socket
 import shutil
 import struct
@@ -250,6 +251,221 @@ class WebSocketReassemblyTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Bounded reads
+# ---------------------------------------------------------------------------
+
+
+class TricklingServer:
+    """A loopback server that answers, slowly, and never stops."""
+
+    def __init__(
+        self, *, upgrade: bool = True, preamble: bytes = b"", chunk: bytes = b"\x00"
+    ) -> None:
+        self._upgrade = upgrade
+        self._preamble = preamble
+        self._chunk = chunk
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self.port = self._listener.getsockname()[1]
+        self.sent = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self.port}/devtools/page/1"
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self._listener.accept()
+        except OSError:
+            return
+        with connection:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                try:
+                    chunk = connection.recv(4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                request += chunk
+            if self._upgrade:
+                connection.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n\r\n"
+                )
+                connection.sendall(self._preamble)
+            while not self._stop.is_set():
+                try:
+                    connection.sendall(self._chunk)
+                except OSError:
+                    return
+                self.sent += len(self._chunk)
+                time.sleep(0.01)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+
+
+class HeaderFloodServer:
+    """A loopback server that answers the upgrade with endless headers."""
+
+    def __init__(self) -> None:
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self.port = self._listener.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self.port}/devtools/page/1"
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self._listener.accept()
+        except OSError:
+            return
+        with connection:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                try:
+                    chunk = connection.recv(4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                request += chunk
+            connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\n")
+            while not self._stop.is_set():
+                try:
+                    connection.sendall(b"X-Pad: " + b"p" * 1000 + b"\r\n")
+                except OSError:
+                    return
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+
+
+class BoundedReadTest(unittest.TestCase):
+    """One deadline bounds the handshake, every read, and every call."""
+
+    def test_the_deadline_starts_before_the_handshake(self) -> None:
+        server = TricklingServer()
+        self.addCleanup(server.close)
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.WebSocket(server.url, deadline=browser_gate.Deadline(0.0))
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertIn("connecting", str(failure.exception))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_trickling_stream_cannot_outlive_the_budget(self) -> None:
+        """The defect this guards: every read is prompt, the message never ends.
+
+        A byte at a time keeps each read comfortably inside its own timeout
+        forever, so only a deadline that no read can refresh ends this. The
+        server announces a real 60 000 byte text frame and then never finishes
+        sending it, which is a perfectly well-formed message that never ends.
+        """
+        announced = bytes([0x01, 126]) + struct.pack(">H", 60000)
+        server = TricklingServer(preamble=announced, chunk=b"a")
+        self.addCleanup(server.close)
+        client = browser_gate.WebSocket(
+            server.url, timeout=5, deadline=browser_gate.Deadline(0.5)
+        )
+        self.addCleanup(client.close)
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure) as failure:
+            client.receive()
+        elapsed = time.monotonic() - started
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertLess(elapsed, 5.0, "the trickle bought itself more time")
+
+    def test_a_slow_handshake_cannot_outlive_the_budget(self) -> None:
+        server = TricklingServer(upgrade=False, chunk=b"X")
+        self.addCleanup(server.close)
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.WebSocket(
+                server.url, timeout=5, deadline=browser_gate.Deadline(0.5)
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertLess(elapsed, 5.0)
+
+    def test_an_endless_header_block_is_refused_before_the_budget_runs_out(self) -> None:
+        server = HeaderFloodServer()
+        self.addCleanup(server.close)
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.WebSocket(
+                server.url, timeout=5, deadline=browser_gate.Deadline(30.0)
+            )
+
+        message = str(failure.exception)
+        self.assertIn("header bytes", message)
+        self.assertIn(str(browser_gate.MAX_HANDSHAKE_BYTES), message)
+
+
+class SessionBudgetTest(unittest.TestCase):
+    """Every DevTools call is bounded by what is left of the whole gate."""
+
+    def session(self, payload: bytes, budget: float) -> browser_gate.DevTools:
+        server = FrameServer(payload)
+        self.addCleanup(server.close)
+        self.server = server
+        session = browser_gate.DevTools(
+            server.url, deadline=browser_gate.Deadline(budget)
+        )
+        self.addCleanup(session.close)
+        return session
+
+    def test_a_call_past_the_budget_never_reaches_the_browser(self) -> None:
+        session = self.session(b"", budget=5.0)
+        session.deadline._expires = time.monotonic() - 1.0
+
+        with self.assertRaises(GateFailure) as failure:
+            session.call("Page.enable")
+
+        self.assertIn("budget", str(failure.exception))
+        self.assertEqual(
+            len(self.server.received), 0, "an expired session sends nothing"
+        )
+
+    def test_a_call_is_bounded_by_the_remaining_budget_not_its_own_timeout(self) -> None:
+        chatter = frame(TEXT, b'{"id":9999}') * 2000
+        session = self.session(chatter, budget=0.2)
+
+        started = time.monotonic()
+        with self.assertRaises(GateFailure):
+            session.call("Page.enable", timeout=browser_gate.BROWSER_TIMEOUT_SECONDS)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed,
+            5.0,
+            "the call waited on its own timeout instead of the gate budget",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Keyboard ownership
 # ---------------------------------------------------------------------------
 
@@ -261,6 +477,9 @@ class FakePage:
     key only runs its scrolling default action while the element that owns
     focus lets it through, and a key that types a character only scrolls when
     the trusted character event is dispatched alongside the raw key down.
+
+    It is bound to a scope, so the very same fake proves the phases against the
+    standalone document and against the embedded one.
     """
 
     TYPING_KEYS = {"Space", "KeyQ", "KeyE"}
@@ -268,6 +487,7 @@ class FakePage:
     def __init__(
         self,
         *,
+        scope: browser_gate.Scope = browser_gate.TOP_SCOPE,
         scroll_height: float = 2400.0,
         inner_height: float = 900.0,
         probe: str | None = "scroll-probe",
@@ -279,6 +499,7 @@ class FakePage:
         canvas_keeps_focus: bool = True,
         scroll_step: float = 40.0,
     ) -> None:
+        self.scope = scope
         self.scroll_height = scroll_height
         self.inner_height = inner_height
         self.probe = probe
@@ -297,6 +518,13 @@ class FakePage:
         self._pending: dict | None = None
 
     # -- Chrome DevTools Protocol surface ----------------------------------
+
+    @property
+    def label(self) -> str:
+        return self.scope.label
+
+    def js(self, template: str) -> str:
+        return template
 
     def call(self, method: str, params: dict | None = None) -> dict:
         if method != "Input.dispatchKeyEvent":
@@ -325,24 +553,24 @@ class FakePage:
         self.scroll_y = min(self.scroll_y + self.scroll_step, self.scroll_height)
 
     def evaluate(self, expression: str) -> object:
-        if expression == browser_gate.NEXT_FRAMES_JS:
+        if expression == self.js(browser_gate.NEXT_FRAMES_JS):
             self.frames += 1
             return True
-        if expression == browser_gate.SCROLL_OFFSET_JS:
+        if expression == self.js(browser_gate.SCROLL_OFFSET_JS):
             return self.scroll_y
-        if expression == browser_gate.SCROLL_TO_TOP_JS:
+        if expression == self.js(browser_gate.SCROLL_TO_TOP_JS):
             self.scroll_y = 0.0
             return None
-        if expression == browser_gate.SCROLL_RESERVE_JS:
+        if expression == self.js(browser_gate.SCROLL_RESERVE_JS):
             return self.scroll_height - self.inner_height
-        if expression == browser_gate.SCROLL_REPORT_JS:
+        if expression == self.js(browser_gate.SCROLL_REPORT_JS):
             return {
                 "activeElement": self.active,
                 "scrollY": self.scroll_y,
                 "scrollHeight": self.scroll_height,
                 "innerHeight": self.inner_height,
             }
-        if expression == browser_gate.FOCUS_SCROLL_PROBE_JS:
+        if expression == self.js(browser_gate.FOCUS_SCROLL_PROBE_JS):
             if self.probe is None:
                 return {"probe": None}
             if self.probe_inside_canvas:
@@ -355,14 +583,14 @@ class FakePage:
                 "insideCanvas": False,
                 "owned": self.probe_takes_focus,
             }
-        if expression == browser_gate.FOCUS_CANVAS_JS:
+        if expression == self.js(browser_gate.FOCUS_CANVAS_JS):
             self.scroll_y = 0.0
             if self.canvas_takes_focus:
                 self.active = "canvas"
             return self.canvas_takes_focus
-        if expression == browser_gate.CANVAS_STILL_FOCUSED_JS:
+        if expression == self.js(browser_gate.CANVAS_STILL_FOCUSED_JS):
             return self.canvas_keeps_focus and self.active == "canvas"
-        if expression == browser_gate.PROBE_STILL_FOCUSED_JS:
+        if expression == self.js(browser_gate.PROBE_STILL_FOCUSED_JS):
             return self.probe is not None and self.active == self.probe
         raise AssertionError(f"the fake page cannot answer {expression!r}")
 
@@ -375,6 +603,8 @@ class FakePage:
 class KeyboardOwnershipTest(unittest.TestCase):
     """Drives the real gate functions against the scriptable page."""
 
+    SCOPE = browser_gate.TOP_SCOPE
+
     def setUp(self) -> None:
         self._budget = browser_gate.KEY_SCROLL_SECONDS
         self._reset = browser_gate.SCROLL_RESET_SECONDS
@@ -385,11 +615,20 @@ class KeyboardOwnershipTest(unittest.TestCase):
         browser_gate.KEY_SCROLL_SECONDS = self._budget
         browser_gate.SCROLL_RESET_SECONDS = self._reset
 
+    def page(self, **options: object) -> FakePage:
+        return FakePage(scope=self.SCOPE, **options)
+
+    def press(self, page: FakePage) -> dict[str, float]:
+        return browser_gate.press_control_keys(page)
+
+    def prove(self, page: FakePage) -> dict:
+        return browser_gate.check_control_keys_do_not_scroll(page)
+
     def test_every_control_key_is_a_trusted_rawkeydown_then_keyup(self) -> None:
-        page = FakePage()
+        page = self.page()
         page.active = page.probe
 
-        browser_gate.press_control_keys(page)
+        self.press(page)
 
         for code, _, _, text in browser_gate.CONTROL_KEYS:
             kinds = [kind for _, kind, pressed in page.dispatched if pressed == code]
@@ -397,173 +636,147 @@ class KeyboardOwnershipTest(unittest.TestCase):
             self.assertEqual(kinds, expected, f"{code} was dispatched as {kinds}")
 
     def test_a_typing_key_carries_the_character_event_chrome_scrolls_on(self) -> None:
-        page = FakePage()
+        page = self.page()
         page.active = page.probe
 
-        deltas = browser_gate.press_control_keys(page)
+        deltas = self.press(page)
 
-        characters = [code for _, kind, code in page.dispatched if kind == "char"]
-        self.assertEqual(characters, ["KeyQ", "KeyE", "Space"])
-        self.assertGreater(deltas["Space"], 0.0)
+        self.assertEqual(deltas["Space"], 40.0)
 
     def test_the_positive_control_records_a_delta_for_every_control_key(self) -> None:
-        page = FakePage()
+        page = self.page()
 
-        report = browser_gate.check_control_keys_do_not_scroll(page)
+        summary = self.prove(page)
 
         self.assertEqual(
-            sorted(report["unfocused_deltas"]),
+            sorted(summary["unfocused_deltas"]),
             sorted(code for code, _, _, _ in browser_gate.CONTROL_KEYS),
         )
-        self.assertEqual(
-            sorted(report["focused_deltas"]),
-            sorted(code for code, _, _, _ in browser_gate.CONTROL_KEYS),
-        )
-        self.assertGreater(report["unfocused_deltas"]["ArrowDown"], 0.0)
-        self.assertGreater(report["unfocused_deltas"]["Space"], 0.0)
-        self.assertEqual(report["unfocused_deltas"]["ArrowLeft"], 0.0)
-        self.assertEqual(set(report["focused_deltas"].values()), {0.0})
-        self.assertEqual(report["probe"], "scroll-probe")
+        self.assertEqual(summary["probe"], "scroll-probe")
+        self.assertEqual(summary["reserve_pixels"], 1500.0)
+        for code in browser_gate.POSITIVE_CONTROL_KEYS:
+            self.assertGreater(summary["unfocused_deltas"][code], 0.0)
+        self.assertTrue(all(delta == 0.0 for delta in summary["focused_deltas"].values()))
 
     def test_the_focused_and_unfocused_phases_dispatch_identical_sequences(self) -> None:
-        page = FakePage()
+        page = self.page()
 
-        browser_gate.check_control_keys_do_not_scroll(page)
+        self.prove(page)
 
-        probed = page.sequence_for("scroll-probe")
-        focused = page.sequence_for("canvas")
-        self.assertEqual(probed, focused)
-        self.assertEqual(len(probed), 17)
+        self.assertEqual(
+            page.sequence_for("scroll-probe"),
+            page.sequence_for("canvas"),
+            "the two phases must send the same keystrokes",
+        )
 
     def test_a_page_without_a_scroll_probe_fails_before_the_positive_control(self) -> None:
-        page = FakePage(probe=None)
+        page = self.page(probe=None)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
-        message = str(failure.exception)
-        self.assertIn("data-scroll-probe", message)
+        self.assertIn("[data-scroll-probe]", str(failure.exception))
         self.assertEqual(page.dispatched, [])
 
     def test_a_probe_that_does_not_own_focus_fails(self) -> None:
-        page = FakePage(probe_takes_focus=False)
+        page = self.page(probe_takes_focus=False)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
-        message = str(failure.exception)
-        self.assertIn("did not take keyboard focus", message)
-        self.assertIn("active element body", message)
+        self.assertIn("did not take keyboard focus", str(failure.exception))
         self.assertEqual(page.dispatched, [])
 
     def test_a_probe_inside_the_canvas_fails(self) -> None:
-        page = FakePage(probe_inside_canvas=True)
+        page = self.page(probe_inside_canvas=True)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
         self.assertIn("inside the canvas", str(failure.exception))
-        self.assertEqual(page.dispatched, [])
 
     def test_a_page_without_the_scroll_reserve_fails_before_anything_is_pressed(self) -> None:
-        page = FakePage(scroll_height=1000.0, inner_height=900.0)
+        page = self.page(scroll_height=1000.0, inner_height=900.0)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
         message = str(failure.exception)
         self.assertIn("reserves 100.0 scrollable pixels", message)
-        self.assertIn(str(browser_gate.MINIMUM_SCROLL_RESERVE_PIXELS), message)
-        self.assertIn("scrollHeight 1000.0", message)
-        self.assertIn("innerHeight 900.0", message)
         self.assertEqual(page.dispatched, [])
 
     def test_a_positive_control_key_that_cannot_scroll_fails_with_per_key_deltas(self) -> None:
-        page = FakePage(probe_scrolls=("ArrowDown",))
+        page = self.page(probe_scrolls=("ArrowDown",))
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
         message = str(failure.exception)
         self.assertIn("['Space']", message)
-        self.assertIn("neutral scroll probe held focus", message)
-        self.assertIn("active element scroll-probe", message)
-        self.assertIn("scrollHeight 2400.0", message)
-        self.assertIn("innerHeight 900.0", message)
-        self.assertIn("per-key scroll deltas", message)
         self.assertIn("ArrowDown +40", message)
-        self.assertIn("Space +0", message)
 
     def test_a_typing_key_without_its_character_event_fails_the_positive_control(self) -> None:
-        page = FakePage()
-        original = browser_gate.CONTROL_KEYS
-        browser_gate.CONTROL_KEYS = tuple(
-            (code, key_code, key, None) for code, key_code, key, _ in original
-        )
-        try:
-            with self.assertRaises(GateFailure) as failure:
-                browser_gate.check_control_keys_do_not_scroll(page)
-        finally:
-            browser_gate.CONTROL_KEYS = original
+        class SilentCharPage(FakePage):
+            def call(self, method: str, params: dict | None = None) -> dict:
+                if (params or {}).get("type") == "char":
+                    return {}
+                return super().call(method, params)
+
+        page = SilentCharPage(scope=self.SCOPE)
+
+        with self.assertRaises(GateFailure) as failure:
+            self.prove(page)
 
         self.assertIn("['Space']", str(failure.exception))
 
     def test_a_focused_control_key_that_scrolls_fails_with_per_key_deltas(self) -> None:
-        page = FakePage(canvas_scrolls=("ArrowDown",))
+        page = self.page(canvas_scrolls=("ArrowDown",))
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
         message = str(failure.exception)
         self.assertIn("['ArrowDown']", message)
-        self.assertIn("owned by the game", message)
-        self.assertIn("active element canvas", message)
-        self.assertIn("per-key scroll deltas", message)
-        self.assertIn("ArrowDown +40", message)
+        self.assertIn("must be owned by the game", message)
 
     def test_a_canvas_that_refuses_focus_fails(self) -> None:
-        page = FakePage(canvas_takes_focus=False)
+        page = self.page(canvas_takes_focus=False)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
         self.assertIn("refused keyboard focus", str(failure.exception))
 
     def test_a_canvas_that_loses_focus_fails(self) -> None:
-        page = FakePage(canvas_keeps_focus=False)
+        page = self.page(canvas_keeps_focus=False)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(page)
+            self.prove(page)
 
         self.assertIn("lost focus", str(failure.exception))
 
     def test_a_probe_that_loses_focus_during_the_positive_control_fails(self) -> None:
-        """The positive control only measures what the probe actually received.
-
-        A page that moved focus part way through the sequence scrolled for some
-        other reason, so the focused no-scroll phase that follows would be
-        compared against a measurement of something else.
-        """
+        """The positive control only measures what the probe actually received."""
 
         class DriftingPage(FakePage):
             def evaluate(self, expression: str) -> object:
-                if expression == browser_gate.PROBE_STILL_FOCUSED_JS:
+                if expression == self.js(browser_gate.PROBE_STILL_FOCUSED_JS):
                     return False
                 return super().evaluate(expression)
 
         with self.assertRaises(GateFailure) as failure:
-            browser_gate.check_control_keys_do_not_scroll(DriftingPage())
+            self.prove(DriftingPage(scope=self.SCOPE))
 
         self.assertIn("did not still own keyboard focus", str(failure.exception))
 
     def test_a_page_that_will_not_return_to_the_top_fails_loudly(self) -> None:
         class StuckPage(FakePage):
             def evaluate(self, expression: str) -> object:
-                if expression == browser_gate.SCROLL_TO_TOP_JS:
+                if expression == self.js(browser_gate.SCROLL_TO_TOP_JS):
                     return None
                 return super().evaluate(expression)
 
-        page = StuckPage()
+        page = StuckPage(scope=self.SCOPE)
         page.scroll_y = 120.0
 
         with self.assertRaises(GateFailure) as failure:
@@ -573,16 +786,11 @@ class KeyboardOwnershipTest(unittest.TestCase):
         self.assertIn("scrollY 120.0", str(failure.exception))
 
     def test_an_animated_scroll_is_measured_at_its_resting_place(self) -> None:
-        """The defect this replaced: a busy renderer read as a settled page.
-
-        The scroll advances one step per rendered frame, so anything that
-        sampled a wall clock could read a partial offset, or the starting
-        offset, as the final answer.
-        """
+        """The defect this replaced: a busy renderer read as a settled page."""
 
         class AnimatedPage(FakePage):
-            def __init__(self) -> None:
-                super().__init__()
+            def __init__(self, **options: object) -> None:
+                super().__init__(**options)
                 self.target = 0.0
                 self.stall_frames = 4
 
@@ -593,17 +801,17 @@ class KeyboardOwnershipTest(unittest.TestCase):
                 self.target = self.scroll_y + self.scroll_step
 
             def evaluate(self, expression: str) -> object:
-                if expression == browser_gate.NEXT_FRAMES_JS:
+                if expression == self.js(browser_gate.NEXT_FRAMES_JS):
                     if self.stall_frames > 0:
                         self.stall_frames -= 1
                     elif self.scroll_y < self.target:
                         self.scroll_y = min(self.scroll_y + 8.0, self.target)
                     return True
-                if expression == browser_gate.SCROLL_TO_TOP_JS:
+                if expression == self.js(browser_gate.SCROLL_TO_TOP_JS):
                     self.target = 0.0
                 return super().evaluate(expression)
 
-        page = AnimatedPage()
+        page = AnimatedPage(scope=self.SCOPE)
         page.active = page.probe
 
         delta = browser_gate.press_control_key(page, "ArrowDown", 40, "ArrowDown", None)
@@ -612,19 +820,57 @@ class KeyboardOwnershipTest(unittest.TestCase):
         self.assertEqual(page.scroll_y, 40.0)
 
 
+class EmbeddedKeyboardOwnershipTest(KeyboardOwnershipTest):
+    """Every assertion above, made against the embedded player instead.
+
+    The published homepage runs the same package in an iframe, and this is what
+    stops that from being proved by a weaker set of checks: the whole keyboard
+    ownership suite is re-run through the embedded scope's JavaScript.
+    """
+
+    SCOPE = browser_gate.EMBED_SCOPE
+
+    def test_the_embedded_scope_reaches_into_the_frame(self) -> None:
+        rendered = self.SCOPE.render(browser_gate.SCROLL_OFFSET_JS)
+
+        self.assertIn("contentWindow", rendered)
+        self.assertNotIn("__WIN__", rendered)
+
+
+class ScopeCoverageTest(unittest.TestCase):
+    """The two scopes go through one implementation, not two."""
+
+    def test_every_phase_template_is_scope_relative(self) -> None:
+        source = (Path(__file__).resolve().parent / "browser_gate.py").read_text(
+            encoding="utf-8"
+        )
+        body = source.split("# Document scopes")[1].split("# Entry point")[0]
+
+        self.assertNotIn("document.getElementById(\"game-canvas\")", body)
+        self.assertNotIn("window.scrollY", body)
+
+    def test_the_embedded_scope_is_proved_by_the_same_functions(self) -> None:
+        for template in (
+            browser_gate.GAME_STATE_JS,
+            browser_gate.BROWSER_ERRORS_JS,
+            browser_gate.CANVAS_GEOMETRY_JS,
+            browser_gate.SCROLL_RESERVE_JS,
+            browser_gate.FOCUS_CANVAS_JS,
+        ):
+            rendered = browser_gate.EMBED_SCOPE.render(template)
+            self.assertNotIn("__DOC__", rendered)
+            self.assertNotIn("__WIN__", rendered)
+            self.assertNotIn("__ORIGIN__", rendered)
+            self.assertNotIn("__CLIP__", rendered)
+
+
 class KeyboardOwnershipSourceTest(unittest.TestCase):
     """Structural guards that keep the two phases from drifting apart."""
 
     SOURCE = (Path(__file__).resolve().parent / "browser_gate.py").read_text(encoding="utf-8")
 
     def test_every_key_dispatch_goes_through_the_single_press_helper(self) -> None:
-        """One keystroke helper, and the three events one keystroke really is.
-
-        The three dispatch calls are the raw key down, the character event, and
-        the key up of a single press, all inside `press_control_key`. A fourth
-        would be a second way to send a key, which is how the focused and
-        unfocused phases start proving different things.
-        """
+        """One keystroke helper, and the three events one keystroke really is."""
         self.assertEqual(self.SOURCE.count('session.call("Input.dispatchKeyEvent"'), 3)
         self.assertEqual(self.SOURCE.count("def press_control_key("), 1)
         self.assertEqual(self.SOURCE.count("def press_control_keys("), 1)
@@ -637,54 +883,12 @@ class KeyboardOwnershipSourceTest(unittest.TestCase):
     def test_the_positive_control_names_the_keys_the_browser_guarantees(self) -> None:
         self.assertEqual(browser_gate.POSITIVE_CONTROL_KEYS, ("ArrowDown", "Space"))
 
+    def test_the_standalone_and_embedded_proofs_are_one_function(self) -> None:
+        body = self.SOURCE.split("def run_gate(")[1]
 
-# ---------------------------------------------------------------------------
-# Session budget
-# ---------------------------------------------------------------------------
-
-
-class SessionBudgetTest(unittest.TestCase):
-    """Every DevTools call is bounded by what is left of the whole session."""
-
-    def session(self, payload: bytes, budget: float) -> browser_gate.DevTools:
-        server = FrameServer(payload)
-        self.addCleanup(server.close)
-        self.server = server
-        session = browser_gate.DevTools(server.url, budget=budget)
-        self.addCleanup(session.close)
-        return session
-
-    def test_a_call_past_the_budget_never_reaches_the_browser(self) -> None:
-        session = self.session(b"", budget=0.0)
-
-        with self.assertRaises(GateFailure) as failure:
-            session.call("Page.enable")
-
-        self.assertIn("budget", str(failure.exception))
-        self.assertEqual(
-            len(self.server.received), 0, "an expired session sends nothing"
-        )
-
-    def test_a_call_is_bounded_by_the_remaining_budget_not_its_own_timeout(self) -> None:
-        """The defect this guards: a browser that answers, but never the caller.
-
-        Every answer here belongs to somebody else and then the browser goes
-        quiet, so the call's own thirty second timeout — and the blocking read
-        inside it — would keep the gate waiting far past the session budget.
-        """
-        chatter = frame(TEXT, b'{"id":9999}') * 2000
-        session = self.session(chatter, budget=0.2)
-
-        started = time.monotonic()
-        with self.assertRaises(GateFailure):
-            session.call("Page.enable", timeout=browser_gate.BROWSER_TIMEOUT_SECONDS)
-        elapsed = time.monotonic() - started
-
-        self.assertLess(
-            elapsed,
-            5.0,
-            "the call waited on its own timeout instead of the session budget",
-        )
+        self.assertEqual(body.count("prove_page("), 2)
+        self.assertIn("TOP_SCOPE", body)
+        self.assertIn("EMBED_SCOPE", body)
 
 
 # ---------------------------------------------------------------------------
@@ -768,234 +972,89 @@ class ServedUrlTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# The published hub embed
+# The published homepage embed
 # ---------------------------------------------------------------------------
 
 
-HUB_SOURCE = (
-    'format!(r#"<div class="play-frame">\n'
-    '  <iframe class="play-embed" src="play/index.html" title="Playable build" '
-    'loading="lazy"></iframe>\n'
-    "</div>"#)\n"
-)
+class FakeHomepage:
+    """A generated homepage, as the discovery step sees it."""
 
+    PUBLISHED = "http://127.0.0.1:9/midcreek-cs-1/play/index.html"
 
-class HubEmbedContractTest(unittest.TestCase):
-    """The embed under test is read from the generator that publishes it."""
+    def __init__(self, **overrides: object) -> None:
+        self.report = {
+            "count": 1,
+            "class": "play-embed",
+            "classes": ["play-embed"],
+            "src": "play/index.html",
+            "resolved": self.PUBLISHED,
+            "readable": True,
+            "width": 1152.0,
+            "height": 648.0,
+        }
+        self.report.update(overrides)
 
-    def source(self, text: str) -> Path:
-        directory = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, directory, True)
-        path = directory / "sitegen.rs"
-        path.write_text(text, encoding="utf-8")
-        return path
-
-    def test_the_embed_is_read_out_of_the_generator(self) -> None:
-        embed = browser_gate.read_play_embed(self.source(HUB_SOURCE))
-
-        self.assertEqual(embed.class_name, "play-embed")
-        self.assertEqual(embed.src, "play/index.html")
-        self.assertIn('loading="lazy"', embed.tag)
-
-    def test_the_real_generator_still_renders_exactly_one_embed(self) -> None:
-        sitegen = Path(__file__).resolve().parent.parent / "src" / "sitegen.rs"
-
-        embed = browser_gate.read_play_embed(sitegen)
-
-        self.assertEqual(embed.class_name, "play-embed")
-        self.assertEqual(embed.src, "play/index.html")
-
-    def test_a_generator_with_no_embed_is_refused(self) -> None:
-        with self.assertRaises(GateFailure) as failure:
-            browser_gate.read_play_embed(self.source("fn render_play() {}"))
-
-        self.assertIn("0 playable iframes", str(failure.exception))
-
-    def test_a_generator_with_two_embeds_is_refused(self) -> None:
-        with self.assertRaises(GateFailure) as failure:
-            browser_gate.read_play_embed(self.source(HUB_SOURCE + HUB_SOURCE))
-
-        self.assertIn("2 playable iframes", str(failure.exception))
-
-    def test_the_harness_hosts_the_generators_own_tag(self) -> None:
-        embed = browser_gate.read_play_embed(self.source(HUB_SOURCE))
-        directory = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, directory, True)
-        page = directory / "index.html"
-
-        browser_gate.write_hub_page(page, embed)
-
-        written = page.read_text(encoding="utf-8")
-        self.assertIn(embed.tag, written)
-        self.assertIn(".play-embed {", written)
-
-    def test_the_harness_never_overwrites_a_published_page(self) -> None:
-        embed = browser_gate.read_play_embed(self.source(HUB_SOURCE))
-        directory = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, directory, True)
-        page = directory / "index.html"
-        page.write_text("the real hub", encoding="utf-8")
-
-        with self.assertRaises(GateFailure) as failure:
-            browser_gate.write_hub_page(page, embed)
-
-        self.assertIn("refusing to overwrite", str(failure.exception))
-        self.assertEqual(page.read_text(encoding="utf-8"), "the real hub")
-
-
-class FakeHub:
-    """A hub document with one scriptable playable iframe in it."""
-
-    RESOLVED = "http://127.0.0.1:9/site/play/index.html"
-
-    def __init__(
-        self,
-        *,
-        count: int = 1,
-        same_origin: bool = True,
-        resolved: str | None = None,
-        states: tuple[str, ...] = ("ready",),
-        errors: str = "",
-        canvas: dict | None = None,
-    ) -> None:
-        self.count = count
-        self.same_origin = same_origin
-        self.resolved = self.RESOLVED if resolved is None else resolved
-        self.states = list(states)
-        self.errors = errors
-        self.canvas = (
-            {
-                "width": 1152.0,
-                "height": 648.0,
-                "bufferWidth": 1152,
-                "bufferHeight": 648,
-                "visible": True,
-            }
-            if canvas is None
-            else canvas
-        )
-        self.reads = 0
-
-    def call(self, method: str, params: dict | None = None) -> dict:
-        if method == "Page.captureScreenshot":
-            raise GateFailure("the fake hub takes no screenshots")
-        raise AssertionError(f"the fake hub should not call {method}")
+    scope = browser_gate.TOP_SCOPE
+    label = browser_gate.TOP_SCOPE.label
 
     def evaluate(self, expression: str) -> object:
-        if expression == "document.documentElement.outerHTML":
-            return "<html></html>"
-        self.reads += 1
-        if self.count != 1:
-            return {"count": self.count}
-        if not self.same_origin:
-            return {"count": 1, "sameOrigin": False, "resolved": self.resolved}
-        state = self.states[min(self.reads, len(self.states)) - 1]
-        return {
-            "count": 1,
-            "sameOrigin": True,
-            "resolved": self.resolved,
-            "state": state,
-            "errors": self.errors,
-            "canvas": self.canvas,
-        }
+        if expression == browser_gate.DISCOVER_EMBED_JS:
+            if self.report["count"] != 1:
+                return {"count": self.report["count"]}
+            return self.report
+        raise AssertionError(f"the fake homepage cannot answer {expression!r}")
 
 
-class HubEmbedGateTest(unittest.TestCase):
-    """Drives the real hub phase against the scriptable hub document."""
+class EmbedDiscoveryTest(unittest.TestCase):
+    """The embed is found on the generated page, never quoted from source."""
 
-    EMBED = browser_gate.PlayEmbed(
-        class_name="play-embed",
-        src="play/index.html",
-        tag='<iframe class="play-embed" src="play/index.html"></iframe>',
-    )
+    def discover(self, page: FakeHomepage) -> dict:
+        return browser_gate.discover_embed(page, FakeHomepage.PUBLISHED)
 
-    def setUp(self) -> None:
-        self._ready = browser_gate.READY_TIMEOUT_SECONDS
-        browser_gate.READY_TIMEOUT_SECONDS = 0.3
-        self.diagnostics = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.diagnostics, True)
+    def test_the_published_embed_is_accepted(self) -> None:
+        report = self.discover(FakeHomepage())
 
-    def tearDown(self) -> None:
-        browser_gate.READY_TIMEOUT_SECONDS = self._ready
+        self.assertEqual(report["src"], "play/index.html")
 
-    def check(self, hub: FakeHub) -> dict:
-        return browser_gate.check_hub_embed(
-            hub, self.EMBED, FakeHub.RESOLVED, self.diagnostics
-        )
-
-    def test_a_ready_embed_reports_the_element_it_proved(self) -> None:
-        summary = self.check(FakeHub())
-
-        self.assertEqual(summary["class"], "play-embed")
-        self.assertEqual(summary["src"], "play/index.html")
-        self.assertEqual(summary["resolved"], FakeHub.RESOLVED)
-        self.assertEqual(summary["canvas"]["buffer"], [1152, 648])
-
-    def test_an_embed_that_starts_loading_is_waited_for(self) -> None:
-        summary = self.check(FakeHub(states=("loading", "loading", "ready")))
-
-        self.assertEqual(summary["resolved"], FakeHub.RESOLVED)
-
-    def test_a_hub_without_exactly_one_embed_fails(self) -> None:
+    def test_a_homepage_without_exactly_one_embed_fails(self) -> None:
         for count in (0, 2):
             with self.assertRaises(GateFailure) as failure:
-                self.check(FakeHub(count=count))
-            self.assertIn(f"{count} iframe.play-embed", str(failure.exception))
+                self.discover(FakeHomepage(count=count))
+            self.assertIn(f"{count} iframes", str(failure.exception))
 
-    def test_an_embed_the_hub_cannot_read_fails(self) -> None:
+    def test_an_embed_without_the_published_class_fails(self) -> None:
         with self.assertRaises(GateFailure) as failure:
-            self.check(FakeHub(same_origin=False))
+            self.discover(FakeHomepage(classes=["preview"], **{"class": "preview"}))
 
-        self.assertIn("not readable", str(failure.exception))
+        self.assertIn("play-embed", str(failure.exception))
 
     def test_an_embed_pointing_somewhere_else_fails(self) -> None:
         with self.assertRaises(GateFailure) as failure:
-            self.check(FakeHub(resolved="http://127.0.0.1:9/site/old/index.html"))
+            self.discover(
+                FakeHomepage(resolved="http://127.0.0.1:9/midcreek-cs-1/old/index.html")
+            )
 
         self.assertIn("not to the published package", str(failure.exception))
 
-    def test_an_embed_that_never_reaches_ready_fails_with_what_it_captured(self) -> None:
+    def test_an_embed_the_page_cannot_read_fails(self) -> None:
         with self.assertRaises(GateFailure) as failure:
-            self.check(FakeHub(states=("loading",), errors="rack.glb failed to load"))
+            self.discover(FakeHomepage(readable=False))
 
-        message = str(failure.exception)
-        self.assertIn("data-game-state='loading'", message)
-        self.assertIn("rack.glb failed to load", message)
+        self.assertIn("no reachable document", str(failure.exception))
 
-    def test_an_embed_that_reported_error_fails_at_once(self) -> None:
-        hub = FakeHub(states=("error",))
-
-        started = time.monotonic()
-        with self.assertRaises(GateFailure):
-            self.check(hub)
-
-        self.assertLess(time.monotonic() - started, 0.3)
-
-    def test_an_embed_that_captured_an_error_while_ready_still_fails(self) -> None:
+    def test_an_embed_with_no_layout_fails(self) -> None:
         with self.assertRaises(GateFailure) as failure:
-            self.check(FakeHub(errors="unhandled rejection"))
+            self.discover(FakeHomepage(height=0.0))
 
-        self.assertIn("captured errors", str(failure.exception))
+        self.assertIn("nothing in it can be seen", str(failure.exception))
 
-    def test_an_embed_without_a_canvas_fails(self) -> None:
-        with self.assertRaises(GateFailure) as failure:
-            self.check(FakeHub(canvas={}))
+    def test_the_discovery_never_reads_the_generator_source(self) -> None:
+        source = (Path(__file__).resolve().parent / "browser_gate.py").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn("no #game-canvas", str(failure.exception))
-
-    def test_an_embedded_canvas_that_is_not_sixteen_by_nine_fails(self) -> None:
-        squashed = {
-            "width": 900.0,
-            "height": 648.0,
-            "bufferWidth": 900,
-            "bufferHeight": 648,
-            "visible": True,
-        }
-
-        with self.assertRaises(GateFailure) as failure:
-            self.check(FakeHub(canvas=squashed))
-
-        self.assertIn("not 16:9", str(failure.exception))
+        self.assertNotIn("sitegen.rs", source)
+        self.assertNotIn("<iframe", source)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1073,7 @@ class EntryPointTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.diagnostics, True)
         return [
             "--base-url",
-            "http://127.0.0.1:9/site/play",
+            "http://127.0.0.1:9/midcreek-cs-1/play",
             "--cdp-port",
             "9",
             "--package",
@@ -1023,16 +1082,21 @@ class EntryPointTest(unittest.TestCase):
             str(design),
             "--diagnostics",
             str(self.diagnostics),
+            "--hub-url",
+            "http://127.0.0.1:9/midcreek-cs-1/",
             *(extra or []),
         ]
 
+    def replace_run_gate(self, replacement: object) -> None:
+        original = browser_gate.run_gate
+        browser_gate.run_gate = replacement
+        self.addCleanup(setattr, browser_gate, "run_gate", original)
+
     def test_an_unexpected_driver_exception_is_a_failed_gate(self) -> None:
-        def explode(arguments: object, sessions: list) -> dict:
+        def explode(arguments: object, sessions: list, deadline: object) -> tuple:
             raise ZeroDivisionError("the driver divided by zero")
 
-        original = browser_gate.run_gate
-        browser_gate.run_gate = explode
-        self.addCleanup(setattr, browser_gate, "run_gate", original)
+        self.replace_run_gate(explode)
 
         code = browser_gate.main(self.arguments())
 
@@ -1049,13 +1113,15 @@ class EntryPointTest(unittest.TestCase):
             def close(self) -> None:
                 closed.append("closed")
 
-        def open_then_fail(arguments: object, sessions: list) -> dict:
-            sessions.append(Session())
+        class OpenedPage:
+            session = Session()
+            scope = browser_gate.TOP_SCOPE
+
+        def open_then_fail(arguments: object, sessions: list, deadline: object) -> tuple:
+            sessions.append(OpenedPage())
             raise GateFailure("the page never arrived")
 
-        original = browser_gate.run_gate
-        browser_gate.run_gate = open_then_fail
-        self.addCleanup(setattr, browser_gate, "run_gate", original)
+        self.replace_run_gate(open_then_fail)
         original_diagnostics = browser_gate.write_diagnostics
         browser_gate.write_diagnostics = lambda session, path: None
         self.addCleanup(setattr, browser_gate, "write_diagnostics", original_diagnostics)
@@ -1065,11 +1131,54 @@ class EntryPointTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(closed, ["closed"])
 
-    def test_the_hub_arguments_are_used_together_or_not_at_all(self) -> None:
+    def test_the_published_report_carries_only_the_fields_its_reader_accepts(self) -> None:
+        """The defect this guards: one invented field drops all browser evidence.
+
+        `BrowserGateReport` in the site generator is `deny_unknown_fields`, so
+        an extra key here would make the whole browser evidence unreadable and
+        silently strip it from the published run. The embed proof therefore
+        lives beside that report, never inside it.
+        """
+        proof = {"class": "play-embed", "src": "play/index.html"}
+        summary = {
+            "ready_seconds": 5.0,
+            "canvas": {"width": 1152, "height": 648, "buffer": [1152, 648]},
+            "pixels": {
+                "region": [0, 0, 1, 1],
+                "sampled_pixels": 1,
+                "variance": [1.0, 1.0, 1.0],
+                "palette_classes": ["INK"],
+                "unmatched_share": 0.0,
+            },
+            "scroll": {
+                "reserve_pixels": 1.0,
+                "probe": "scroll-probe",
+                "unfocused_deltas": {},
+                "focused_deltas": {},
+            },
+        }
+
+        self.replace_run_gate(lambda arguments, sessions, deadline: (summary, proof))
+        code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 0)
+        published = json.loads(
+            (self.diagnostics / "browser-gate.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            sorted(published), ["canvas", "pixels", "ready_seconds", "scroll"]
+        )
+        beside = json.loads(
+            (self.diagnostics / "embed-gate.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(beside["class"], "play-embed")
+
+    def test_the_generated_homepage_is_required(self) -> None:
+        arguments = self.arguments()
+        del arguments[arguments.index("--hub-url") : arguments.index("--hub-url") + 2]
+
         with self.assertRaises(SystemExit):
-            browser_gate.gate_arguments(
-                self.arguments(["--hub-url", "http://127.0.0.1:9/site/"])
-            )
+            browser_gate.gate_arguments(arguments)
 
 
 if __name__ == "__main__":

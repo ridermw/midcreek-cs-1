@@ -9,6 +9,13 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# How much history a checkout takes. It has to reach every commit
+# `docs/progress.json` names; `scripts/ensure-history.sh` proves that it does
+# and deepens a bounded number of times if it does not, so this is a starting
+# depth rather than an assumption.
+env:
+  HISTORY_DEPTH: 250
+
 jobs:
   verify:
     name: Verify
@@ -19,16 +26,21 @@ jobs:
     permissions:
       contents: read
     steps:
-      # The published timeline resolves commit references against the whole
-      # repository, so the commit graph has to be complete. Only the graph
-      # does: `blob:none` leaves every historical file body — including the
-      # 34 MB WebAssembly blobs on the generated `pages-live` branch — on the
-      # server, so what this checkout transfers stays flat as history grows.
+      # The published timeline resolves commit references against the checked
+      # out history, so the clone has to reach every commit `docs/progress.json`
+      # names — and no further. `fetch-depth: 0` reached all of them by reaching
+      # everything, including every branch this repository has and the 34 MB
+      # WebAssembly modules on the generated `pages-live` branch. A finite depth
+      # fetches only this branch, and the step below proves that depth really
+      # covers the referenced commits instead of assuming it.
       - name: Check out source
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ env.HISTORY_DEPTH }}
           filter: blob:none
+
+      - name: Prove the checked-out history reaches every referenced commit
+        run: ./scripts/ensure-history.sh
 
       # The runner's temporary directory is a runner fact, and a job-level
       # `env:` is evaluated before a runner exists. It is resolved here, from
@@ -251,6 +263,12 @@ jobs:
 
   build-web:
     name: Build web
+    # Verify is a dependency for ordering, not a precondition. A red native
+    # gate must not delete the web job: Publish reads both measured results to
+    # decide what it publishes, and a job that never ran leaves no gates, no
+    # package, and no browser evidence for it to read. The job still reaches
+    # its own truthful verdict below, so a failed web gate still fails here.
+    if: always()
     needs: verify
     runs-on: ubuntu-24.04
     permissions:
@@ -382,13 +400,16 @@ jobs:
       id-token: write
       actions: read
     steps:
-      # As in Verify: the commit graph has to be complete for the published
-      # timeline, but no historical file body has to travel with it.
+      # As in Verify: a finite depth that is proved to reach every published
+      # commit, rather than an unbounded clone of every branch.
       - name: Check out source
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ env.HISTORY_DEPTH }}
           filter: blob:none
+
+      - name: Prove the checked-out history reaches every referenced commit
+        run: ./scripts/ensure-history.sh
 
       - name: Check out previous Pages site
         id: previous
