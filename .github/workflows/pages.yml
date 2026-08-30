@@ -55,13 +55,11 @@ jobs:
           echo "RESULT=$RUNNER_TEMP/native" >> "$GITHUB_ENV"
           echo "GATES=$RUNNER_TEMP/native/gates.jsonl" >> "$GITHUB_ENV"
 
-      # The history bound and the script that applies it are measured gates
-      # like every other, not preconditions. A short clone is a fact this run
-      # publishes: the later gates still run, the summary still counts them,
-      # and the artifact still travels, instead of the job ending here with
-      # nothing to show for it. These reach no network beyond the repository's
-      # own remote and start no browser.
-      - name: Run the history gates
+      # These cheap, non-rendering gates run before package installation or
+      # renderer discovery can fail. The history bound is measured rather than
+      # treated as a precondition: a short clone is a fact this run publishes,
+      # and the browser client tests exercise loopback and fake sockets only.
+      - name: Run the early non-browser gates
         run: |
           set -uo pipefail
 
@@ -71,6 +69,8 @@ jobs:
           ./scripts/run-gate.sh "$GATES" "History bound tests" -- \
             python3 scripts/ensure_history_test.py
 
+          ./scripts/run-gate.sh "$GATES" "Browser gate unit tests" -- \
+            python3 scripts/browser_gate_test.py
 
       - name: Install Linux build prerequisites
         run: |
@@ -182,7 +182,7 @@ jobs:
           # matrix with one gate silently missing from it. The shortfall becomes
           # a public failed row instead, and the verdict step below concludes on
           # it like any other red gate.
-          expected=14
+          expected=15
           recorded=0
           if [[ -f "$GATES" ]]; then
             recorded="$(grep -c '' "$GATES")"
@@ -449,6 +449,7 @@ jobs:
       # job when it cannot: the generator below decides what it can publish
       # from what it actually has.
       - name: Reach every referenced commit if the history allows it
+        id: history
         continue-on-error: true
         run: ./scripts/ensure-history.sh
 
@@ -511,6 +512,7 @@ jobs:
           NATIVE_DOWNLOAD: ${{ steps.native.outcome }}
           WEB_DOWNLOAD: ${{ steps.web.outcome }}
           PREVIOUS_CHECKOUT: ${{ steps.previous.outcome }}
+          PUBLISH_HISTORY: ${{ steps.history.outcome }}
         run: |
           set -euo pipefail
 
@@ -532,10 +534,10 @@ jobs:
             previous_args=(--previous "$GITHUB_WORKSPACE/previous-pages")
           fi
 
-          # One repository-owned command decides everything this run
-          # publishes: the merged gate matrix, the commit timeline, the
-          # inherited screenshot history, whether the verified evidence really
-          # projects, and whether a complete playable package was earned.
+          # One repository-owned command creates the sanitized inputs both
+          # publication paths trust: the merged gate matrix, commit facts,
+          # inherited screenshot history, projected verification evidence, and
+          # any complete playable package this run earned.
           project_inputs() {
             cargo run --quiet --bin sitegen -- inputs \
               --repository "$GITHUB_WORKSPACE" \
@@ -580,9 +582,20 @@ jobs:
             mv "$pages_root/workflow.retry.json" "$pages_root/workflow.json"
           fi
 
-          cargo run --quiet --bin sitegen -- build \
-            --inputs "$pages_root/inputs.json" \
-            --output "$current"
+          if [[ "$PUBLISH_HISTORY" == "success" ]]; then
+            cargo run --quiet --bin sitegen -- build \
+              --inputs "$pages_root/inputs.json" \
+              --output "$current"
+          else
+            # The strict generator must not be handed an incomplete repository
+            # and told those missing commits are valid. Publish a deliberately
+            # reduced current page instead, carrying only the sanitized
+            # workflow result and the previous verified playable domain.
+            python3 scripts/history_failure_site.py \
+              --workflow "$pages_root/workflow.json" \
+              "${previous_args[@]}" \
+              --output "$current"
+          fi
 
           cargo run --quiet --bin sitegen -- assemble \
             "${previous_args[@]}" \

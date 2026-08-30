@@ -310,13 +310,12 @@ mod workflow_contract {
     }
 
     #[test]
-    fn builds_the_web_game_only_after_verification_passes() {
+    fn builds_the_web_game_after_verify_even_when_verification_fails() {
         let workflow = workflow_source();
         let web = web_job(&workflow);
 
         assert!(web.contains("needs: verify"), "{web}");
-        // A job-level condition sits at four spaces; step conditions are deeper.
-        assert!(!web.contains("\n    if:"), "{web}");
+        assert!(web.contains("\n    if: always()\n"), "{web}");
         assert!(web.contains("permissions:\n      contents: read"), "{web}");
         assert!(!web.contains("contents: write"), "{web}");
     }

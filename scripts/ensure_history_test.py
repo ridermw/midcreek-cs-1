@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "ensure-history.sh"
+FALLBACK = Path(__file__).resolve().parent / "history_failure_site.py"
 
 #: Forty hexadecimal digits that name nothing in any repository here.
 ABSENT = "0" * 39 + "1"
@@ -348,12 +351,143 @@ class CleanGateOrderTest(unittest.TestCase):
         self.assertIn("./scripts/ensure-history.sh", self.CHECK)
         self.assertIn("python3 scripts/ensure_history_test.py", self.CHECK)
 
+    def test_the_browser_gate_unit_suite_runs_before_any_browser_can_launch(self) -> None:
+        unit = self.CHECK.index("python3 scripts/browser_gate_test.py")
+        renderer_probe = self.CHECK.index('render_command=(')
+        browser = self.CHECK.index('step "playable web build and browser gate"')
+
+        self.assertLess(unit, renderer_probe)
+        self.assertLess(unit, browser)
+
     def test_the_workflow_lint_still_runs_before_the_expensive_gates(self) -> None:
         """Preserved from the contract this file's ordering rule sits beside."""
         lint = self.CHECK.index("./scripts/actionlint.sh")
         clippy = self.CHECK.index("cargo clippy")
 
         self.assertLess(lint, clippy)
+
+
+class HistoryFailureSiteTest(unittest.TestCase):
+    """A short Publish checkout still produces an honest current status page."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.workflow = self.root / "workflow.json"
+        self.output = self.root / "current"
+        self.document = {
+            "source_commit": "1" * 40,
+            "run_url": "https://github.com/ridermw/midcreek-cs-1/actions/runs/123",
+            "native": "passed",
+            "web": "failed",
+            "gates": [
+                {
+                    "name": "Workflow lint",
+                    "status": "passed",
+                    "passed": 1,
+                    "failed": 0,
+                    "duration_ms": 12,
+                    "artifact_url": None,
+                },
+                {
+                    "name": "Headless browser gate",
+                    "status": "failed",
+                    "passed": 0,
+                    "failed": 1,
+                    "duration_ms": 34,
+                    "artifact_url": None,
+                },
+            ],
+        }
+        self.workflow.write_text(json.dumps(self.document), encoding="utf-8")
+
+    def run_fallback(
+        self, previous: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            sys.executable,
+            str(FALLBACK),
+            "--workflow",
+            str(self.workflow),
+            "--output",
+            str(self.output),
+        ]
+        if previous is not None:
+            arguments.extend(["--previous", str(previous)])
+        return subprocess.run(arguments, capture_output=True, text=True)
+
+    def test_the_fallback_publishes_current_failure_and_retains_the_last_green_game(
+        self,
+    ) -> None:
+        self.document["web"] = "passed"
+        self.document["gates"][1].update(
+            {"status": "passed", "passed": 1, "failed": 0}
+        )
+        self.workflow.write_text(json.dumps(self.document), encoding="utf-8")
+        previous = self.root / "previous"
+        (previous / "play" / "assets").mkdir(parents=True)
+        for relative in (
+            "play/index.html",
+            "play/play.js",
+            "play/play.css",
+            "play/game.js",
+            "play/game_bg.wasm",
+            "play/assets/rack.glb",
+        ):
+            path = previous / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"retained {relative}", encoding="utf-8")
+        (previous / "last-green.json").write_text(
+            '{"source_commit":"old"}', encoding="utf-8"
+        )
+        (previous / "index.html").write_text(
+            "STALE STATUS MUST NOT SURVIVE", encoding="utf-8"
+        )
+
+        result = self.run_fallback(previous)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (self.output / "index.html").read_text(encoding="utf-8")
+        self.assertIn("Publication history unavailable", page)
+        self.assertIn("11111111", page)
+        self.assertIn('Native</span><strong class="passed">Passed', page)
+        self.assertIn('Web</span><strong class="passed">Passed', page)
+        self.assertIn("Publish history bound", page)
+        self.assertIn("Headless browser gate", page)
+        self.assertNotIn("STALE STATUS MUST NOT SURVIVE", page)
+        self.assertEqual(
+            (self.output / "play" / "game_bg.wasm").read_text(encoding="utf-8"),
+            "retained play/game_bg.wasm",
+        )
+        self.assertEqual(
+            (self.output / "last-green.json").read_text(encoding="utf-8"),
+            '{"source_commit":"old"}',
+        )
+
+    def test_a_first_run_failure_publishes_status_without_inventing_a_game(
+        self,
+    ) -> None:
+        result = self.run_fallback()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (self.output / "index.html").read_text(encoding="utf-8")
+        self.assertIn("No previous verified game was available", page)
+        self.assertIn('Web</span><strong class="failed">Failed', page)
+        self.assertFalse((self.output / "play").exists())
+        self.assertFalse((self.output / "last-green.json").exists())
+
+    def test_a_symlinked_retained_game_is_refused(self) -> None:
+        previous = self.root / "previous"
+        previous.mkdir()
+        target = self.root / "outside"
+        target.mkdir()
+        (previous / "play").symlink_to(target, target_is_directory=True)
+
+        result = self.run_fallback(previous)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symbolic link", result.stderr)
+        self.assertFalse((self.output / "index.html").exists())
 
 
 class WorkflowGateOrderTest(unittest.TestCase):
@@ -364,10 +498,14 @@ class WorkflowGateOrderTest(unittest.TestCase):
     ).read_text(encoding="utf-8")
 
     def job(self, name: str) -> str:
-        start = self.WORKFLOW.index(f"\n  {name}:\n")
-        rest = self.WORKFLOW[start + 1 :]
-        end = rest.find("\n  publish:\n") if name != "publish" else -1
-        return rest if end < 0 else rest[:end]
+        jobs = self.WORKFLOW[self.WORKFLOW.index("\njobs:\n") :]
+        headers = list(re.finditer(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):\n", jobs))
+        for index, header in enumerate(headers):
+            if header.group(1) != name:
+                continue
+            end = headers[index + 1].start() if index + 1 < len(headers) else len(jobs)
+            return jobs[header.start() : end]
+        self.fail(f"workflow should declare the {name} job")
 
     def test_each_measured_job_resolves_its_result_root_first(self) -> None:
         """The defect this guards: a job that died with nothing to report.
@@ -396,9 +534,41 @@ class WorkflowGateOrderTest(unittest.TestCase):
             'run-gate.sh "$GATES" "History bound tests" -- \\', self.job("verify")
         )
 
-    def test_the_recorded_row_counts_include_the_history_gates(self) -> None:
-        self.assertIn("expected=14", self.job("verify"))
-        self.assertIn("expected=4", self.job("build-web"))
+    def test_each_recorded_row_count_matches_its_jobs_named_gates(self) -> None:
+        for name in ("verify", "build-web"):
+            job = self.job(name)
+            expected = re.findall(r"(?m)^\s+expected=(\d+)$", job)
+            calls = re.findall(
+                r"(?m)^\s+\./scripts/run-gate\.sh(?:\s|$)", job
+            )
+            self.assertEqual(len(expected), 1, f"{name} should declare one count")
+            self.assertEqual(
+                int(expected[0]),
+                len(calls),
+                f"{name} should count only its own named gates",
+            )
+
+    def test_verify_cannot_borrow_build_web_gates_or_counts(self) -> None:
+        verify = self.job("verify")
+
+        self.assertNotIn("Resolve the web result root", verify)
+        self.assertNotIn("WebAssembly toolchain", verify)
+        self.assertNotIn("expected=4", verify)
+
+    def test_the_browser_gate_unit_suite_is_a_named_verify_gate(self) -> None:
+        verify = self.job("verify")
+        web = self.job("build-web")
+
+        self.assertIn(
+            'run-gate.sh "$GATES" "Browser gate unit tests" -- \\', verify
+        )
+        self.assertIn("python3 scripts/browser_gate_test.py", verify)
+        self.assertNotIn("python3 scripts/browser_gate_test.py", web)
+        self.assertLess(
+            verify.index("python3 scripts/browser_gate_test.py"),
+            verify.index("apt-get"),
+            "the non-browser suite should run before renderer setup can fail",
+        )
 
     def test_publish_never_ends_on_a_history_repair(self) -> None:
         """Publish has to publish, whatever the history turned out to be."""
@@ -407,6 +577,21 @@ class WorkflowGateOrderTest(unittest.TestCase):
         body = publish[step : step + 400]
 
         self.assertIn("continue-on-error: true", body)
+
+    def test_publish_uses_an_honest_fallback_when_history_repair_fails(self) -> None:
+        publish = self.job("publish")
+        history = publish.index(
+            "- name: Reach every referenced commit if the history allows it"
+        )
+        build = publish.index("- name: Build and assemble current status")
+        body = publish[build:]
+
+        self.assertIn("id: history", publish[history:build])
+        self.assertIn("PUBLISH_HISTORY: ${{ steps.history.outcome }}", body)
+        self.assertIn('if [[ "$PUBLISH_HISTORY" == "success" ]]; then', body)
+        self.assertIn("cargo run --quiet --bin sitegen -- build", body)
+        self.assertIn("python3 scripts/history_failure_site.py", body)
+        self.assertLess(body.index("history_failure_site.py"), body.index("sitegen -- assemble"))
 
 
 if __name__ == "__main__":

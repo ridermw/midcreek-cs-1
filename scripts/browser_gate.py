@@ -632,14 +632,20 @@ def read_bounded(response: object, limit: int, deadline: Deadline, doing: str) -
     """
     data = bytearray()
     connection = response_socket(response)
+    if connection is None:
+        raise GateFailure(
+            f"the response body cannot be re-clamped while {doing}: "
+            "urllib exposed no socket"
+        )
     reader = getattr(response, "read1", None) or response.read
     while len(data) < limit:
         remaining = deadline.require(doing)
-        if connection is not None:
-            try:
-                connection.settimeout(min(BROWSER_TIMEOUT_SECONDS, remaining))
-            except OSError:
-                pass
+        try:
+            connection.settimeout(min(BROWSER_TIMEOUT_SECONDS, remaining))
+        except OSError as failure:
+            raise GateFailure(
+                f"the response body could not be re-clamped while {doing}: {failure}"
+            ) from failure
         chunk = read_chunk(reader, min(4096, limit - len(data)), deadline, doing)
         if not chunk:
             break
@@ -1499,13 +1505,19 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             deadline.require(f"writing {path.name}")
-    except GateFailure as failure:
+        deadline.require("serializing the combined result")
+        combined = json.dumps(
+            {"standalone": summary, "embedded": embed}, indent=2, sort_keys=True
+        )
+        deadline.require("serializing the combined result")
+        print(combined, flush=True)
+        deadline.require("writing the combined result")
+    except (GateFailure, OSError) as failure:
         for path, _ in reports:
             path.unlink(missing_ok=True)
         print(f"browser gate failed: {failure}", file=sys.stderr)
         return 1
 
-    print(json.dumps({"standalone": summary, "embedded": embed}, indent=2, sort_keys=True))
     return 0
 
 

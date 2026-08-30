@@ -8,6 +8,8 @@ reassembly is proved end to end rather than asserted about in the abstract.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import socket
 import shutil
@@ -807,6 +809,58 @@ class BoundedBodyTest(unittest.TestCase):
             )
             self.assertTrue(hasattr(connection, "settimeout"))
 
+    def test_a_body_without_a_reclampable_socket_is_never_read(self) -> None:
+        """Losing the socket must not fall back to the request's stale timeout."""
+
+        class Response:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read1(self, size: int) -> bytes:
+                self.reads += 1
+                return b"body"
+
+        response = Response()
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_bounded(
+                response, 1_000_000, browser_gate.Deadline(30.0), "reading"
+            )
+
+        self.assertIn("re-clamped", str(failure.exception))
+        self.assertEqual(response.reads, 0, "an unbounded body read must never start")
+
+    def test_a_body_is_never_read_when_reclamping_the_socket_fails(self) -> None:
+        """A dead socket cannot silently retain the timeout from urlopen."""
+
+        class BrokenSocket:
+            def settimeout(self, timeout: float) -> None:
+                raise OSError("socket is closed")
+
+        class Raw:
+            _sock = BrokenSocket()
+
+        class Response:
+            fp = Raw()
+
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read1(self, size: int) -> bytes:
+                self.reads += 1
+                return b"body"
+
+        response = Response()
+
+        with self.assertRaises(GateFailure) as failure:
+            browser_gate.read_bounded(
+                response, 1_000_000, browser_gate.Deadline(30.0), "reading"
+            )
+
+        self.assertIn("could not be re-clamped", str(failure.exception))
+        self.assertIn("socket is closed", str(failure.exception))
+        self.assertEqual(response.reads, 0, "a stale-timeout body read must never start")
+
     def test_every_body_read_is_re_clamped_to_what_is_left(self) -> None:
         """The defect this guards: a body that trickles and then stops dead.
 
@@ -1501,6 +1555,59 @@ class EntryPointTest(unittest.TestCase):
         )
 
         code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 1)
+        self.assertFalse((self.diagnostics / "browser-gate.json").exists())
+        self.assertFalse((self.diagnostics / "embed-gate.json").exists())
+
+    def test_expiring_while_serializing_the_combined_result_is_not_a_pass(self) -> None:
+        """The final JSON serialization spends the same absolute budget."""
+        summary = {"canvas": {}, "pixels": {}, "ready_seconds": 1.0, "scroll": {}}
+        active: list[browser_gate.Deadline] = []
+        calls = 0
+        original_dumps = browser_gate.json.dumps
+
+        def succeed(arguments: object, sessions: list, deadline: object) -> tuple:
+            active.append(deadline)
+            return summary, {"class": "play-embed"}
+
+        def expire_on_combined_result(*args: object, **kwargs: object) -> str:
+            nonlocal calls
+            calls += 1
+            rendered = original_dumps(*args, **kwargs)
+            if calls == 3:
+                active[0]._expires = time.monotonic() - 1.0
+            return rendered
+
+        self.replace_run_gate(succeed)
+        browser_gate.json.dumps = expire_on_combined_result
+        self.addCleanup(setattr, browser_gate.json, "dumps", original_dumps)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = browser_gate.main(self.arguments())
+
+        self.assertEqual(code, 1)
+        self.assertFalse((self.diagnostics / "browser-gate.json").exists())
+        self.assertFalse((self.diagnostics / "embed-gate.json").exists())
+
+    def test_expiring_while_flushing_stdout_is_not_a_pass(self) -> None:
+        """Returning success means the final observable write finished in budget."""
+        summary = {"canvas": {}, "pixels": {}, "ready_seconds": 1.0, "scroll": {}}
+        active: list[browser_gate.Deadline] = []
+
+        def succeed(arguments: object, sessions: list, deadline: object) -> tuple:
+            active.append(deadline)
+            return summary, {"class": "play-embed"}
+
+        class ExpiringStdout(io.StringIO):
+            def flush(self) -> None:
+                active[0]._expires = time.monotonic() - 1.0
+                super().flush()
+
+        self.replace_run_gate(succeed)
+
+        with contextlib.redirect_stdout(ExpiringStdout()):
+            code = browser_gate.main(self.arguments())
 
         self.assertEqual(code, 1)
         self.assertFalse((self.diagnostics / "browser-gate.json").exists())

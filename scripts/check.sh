@@ -6,16 +6,17 @@
 # It runs, in order:
 #
 #   1. actionlint over every workflow, pinned to one version;
-#   2. rustfmt in check mode;
-#   3. Clippy over every target and feature with warnings denied;
-#   4. the autonomous asset generator in --check mode;
-#   5. sitegen validation of the published progress data;
-#   6. every pure, integration, and site test;
-#   7. the rendered verification contract, which launches the real game and
+#   2. the browser-gate unit suite against loopback and fake sockets;
+#   3. rustfmt in check mode;
+#   4. Clippy over every target and feature with warnings denied;
+#   5. the autonomous asset generator in --check mode;
+#   6. sitegen validation of the published progress data;
+#   7. every pure, integration, and site test;
+#   8. the rendered verification contract, which launches the real game and
 #      analyses its fourteen real frames;
-#   8. the packaged WebAssembly build and its headless browser gate, when a
+#   9. the packaged WebAssembly build and its headless browser gate, when a
 #      browser and the pinned wasm-bindgen toolchain are available;
-#   9. the release build.
+#  10. the release build.
 #
 # The rendered contract needs a real renderer. On a headless Linux machine that
 # means Xvfb: a missing display or a missing renderer is a hard failure here,
@@ -35,30 +36,6 @@ step() {
 export BEVY_ASSET_ROOT="$repository"
 
 # ---------------------------------------------------------------------------
-# Renderer availability
-# ---------------------------------------------------------------------------
-
-# The rendered contract launches real game windows. Its tests are serialized so
-# a heavy analysis thread can never starve a running child into its watchdog.
-render_command=(cargo test --test render_contract -- --test-threads=1 --nocapture)
-case "$(uname -s)" in
-  Linux)
-    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-      if ! command -v xvfb-run >/dev/null 2>&1; then
-        echo "the rendered contract needs a display; install Xvfb (xvfb-run) or export DISPLAY" >&2
-        exit 1
-      fi
-      render_command=(xvfb-run -a "${render_command[@]}")
-    fi
-    ;;
-  Darwin) ;;
-  *)
-    echo "unsupported platform $(uname -s) for the rendered contract" >&2
-    exit 1
-    ;;
-esac
-
-# ---------------------------------------------------------------------------
 # Pure gates
 # ---------------------------------------------------------------------------
 
@@ -67,6 +44,9 @@ esac
 # nothing about the gates it was supposed to carry.
 step "workflow lint"
 ./scripts/actionlint.sh
+
+step "browser gate unit tests"
+python3 scripts/browser_gate_test.py
 
 step "rustfmt"
 cargo fmt --all --check
@@ -101,6 +81,26 @@ cargo test --test pages_assembly_contract
 # ---------------------------------------------------------------------------
 # Rendered gate
 # ---------------------------------------------------------------------------
+
+# The rendered contract launches real game windows. Its tests are serialized so
+# a heavy analysis thread can never starve a running child into its watchdog.
+render_command=(cargo test --test render_contract -- --test-threads=1 --nocapture)
+case "$(uname -s)" in
+  Linux)
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+      if ! command -v xvfb-run >/dev/null 2>&1; then
+        echo "the rendered contract needs a display; install Xvfb (xvfb-run) or export DISPLAY" >&2
+        exit 1
+      fi
+      render_command=(xvfb-run -a "${render_command[@]}")
+    fi
+    ;;
+  Darwin) ;;
+  *)
+    echo "unsupported platform $(uname -s) for the rendered contract" >&2
+    exit 1
+    ;;
+esac
 
 step "rendered verification contract"
 "${render_command[@]}"
