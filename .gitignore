@@ -1,4 +1,5 @@
 /target
+/.worktrees
 /.tmp
 /verification-output
 .DS_Store
