@@ -42,7 +42,7 @@ impl Plugin for CellShiftPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(FLOOR_LIGHT.into()))
             .add_plugins((
-                assets::AssetPlugin,
+                assets::GeneratedAssetPlugin,
                 world::HallPlugin,
                 player::TechnicianPlugin,
                 camera::CameraPlugin,

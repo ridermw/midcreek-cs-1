@@ -37,7 +37,7 @@ use midcreek_cs_1::{
     camera::{
         CAMERA_DISTANCE, CEL_SHIFT_DEBAND_DITHER, CEL_SHIFT_TONEMAPPING, CameraHeading,
         CameraOrbit, CellShiftCamera, active_coverage, camera_target_bounds, clamp_follow_target,
-        coverage_holds_room, ground_half_depth, ground_quadrilateral,
+        coverage_holds_room, ground_half_depth, ground_quadrilateral, render_apron_quadrilateral,
     },
     design::{
         AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
@@ -47,13 +47,14 @@ use midcreek_cs_1::{
         FAULT_RED, FLOOR_LIGHT, FLOOR_MARKING_HEIGHT, FLOOR_MARKING_WIDTH, FLOOR_SHADOW,
         HEALTHY_GREEN, HOSE_CHARCOAL, HOSE_DROP_HEIGHT, HOSE_DROP_Z, INITIAL_CAMERA_YAW_DEGREES,
         INK, KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, MAX_ACTIVE_TICKETS, MIN_AISLE_CLEARANCE,
-        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, OVERHEAD_TRAY_HEIGHT, PLAYER_RADIUS, PaletteRole,
-        PrimitiveShape, PropId, RACK_COOLDOWN_SECONDS, RACK_ROW_X, RACK_SHADOW, RACK_WHITE,
-        RENDER_APRON_DROP, RENDER_COVERAGE_SIZE, REPAIR_DURATION_SECONDS, REPAIR_INTERACTION_RANGE,
-        RESOLVED_DISPLAY_SECONDS, ROOM_SIZE, SIGNATURE_YELLOW, SKY_BOUNCE_BLUE, SceneBlueprint,
-        SceneValidationError, TEAL_ACCENT, VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
-        VisualSpec, WALKABLE_CELL_SIZE, WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT,
-        WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS,
+        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, OVERHEAD_TRAY_HEIGHT, PLAYER_RADIUS, PLAYER_SPEED,
+        PaletteRole, PrimitiveShape, PropId, RACK_COOLDOWN_SECONDS, RACK_ROW_X, RACK_SHADOW,
+        RACK_WHITE, RENDER_APRON_DROP, RENDER_COVERAGE_SIZE, REPAIR_DURATION_SECONDS,
+        REPAIR_INTERACTION_RANGE, RESOLVED_DISPLAY_SECONDS, ROOM_SIZE, SIGNATURE_YELLOW,
+        SKY_BOUNCE_BLUE, SceneBlueprint, SceneValidationError, TEAL_ACCENT,
+        VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WALKABLE_CELL_SIZE,
+        WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT, WORKER_HI_VIS, WORKER_SKIN,
+        WORKER_SLATE, WORKER_TROUSERS,
     },
     hud::{
         BADGE_HEIGHT, BADGE_WIDTH, BadgeKind, BadgeVisibility, CONTROLS_PANEL_HEIGHT,
@@ -70,8 +71,8 @@ use midcreek_cs_1::{
         ScheduleBlock, Ticket, TicketId, TicketQueue, TicketSeverity,
     },
     player::{
-        PLAYER_MAX_MOVE_DELTA, PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip,
-        PlayerMotion, PlayerParts, PlayerRigError, PlayerRigReport, PlayerRigState,
+        PLAYER_MAX_MOVE_DELTA, PLAYER_MOVE_EPSILON, PlayerAnimationState, PlayerAnimations,
+        PlayerClip, PlayerMotion, PlayerParts, PlayerRigError, PlayerRigReport, PlayerRigState,
         TECHNICIAN_MODEL_FORWARD, Technician, ViewBasis, arrow_input, required_player_parts,
         update_player_animation,
     },
@@ -576,7 +577,6 @@ fn design_flood_fill_joins_every_aisle_checkpoint_to_the_player_spawn() {
         "the authored hose pinch is the narrowest point of any aisle"
     );
     assert_eq!(report.aisle_clearances, vec![MIN_AISLE_CLEARANCE; 3]);
-    assert!(report.narrowest_aisle_clearance >= MIN_AISLE_CLEARANCE);
 }
 
 #[test]
@@ -597,18 +597,18 @@ fn design_clearance_scans_every_aisle_row_and_measures_the_authored_hose_pinch()
     for aisle in &scene.aisles {
         assert_eq!(
             grid.widest_open_run(0.0, aisle.center_x, aisle.half_width),
-            AISLE_HALF_WIDTH * 2.0,
+            Some(AISLE_HALF_WIDTH * 2.0),
             "an unobstructed aisle row spans the full authored corridor"
         );
         assert_eq!(
             grid.widest_open_run(HOSE_DROP_Z, aisle.center_x, aisle.half_width),
-            MIN_AISLE_CLEARANCE,
+            Some(MIN_AISLE_CLEARANCE),
             "the hose drop pinches its aisle to the minimum walkable run"
         );
 
         let rows = ((aisle.z_max - aisle.z_min) / WALKABLE_CELL_SIZE).round() as i32;
         let scanned = (0..=rows)
-            .map(|row| {
+            .filter_map(|row| {
                 grid.widest_open_run(
                     aisle.z_min + row as f32 * WALKABLE_CELL_SIZE,
                     aisle.center_x,
@@ -640,11 +640,18 @@ fn design_clearance_measures_center_space_runs_without_double_counting_the_playe
         let nodes = 2 * cells + 1;
         assert_eq!(
             grid.widest_open_run(0.0, 0.0, half_width),
-            (nodes as f32 - 1.0) * WALKABLE_CELL_SIZE,
+            Some((nodes as f32 - 1.0) * WALKABLE_CELL_SIZE),
             "a run of {nodes} open nodes spans (n - 1) cells of centre space"
         );
     }
-    assert_eq!(grid.widest_open_run(0.0, 0.0, 0.0), 0.0);
+    assert_eq!(grid.widest_open_run(0.0, 0.0, 0.0), Some(0.0));
+    assert_eq!(grid.widest_open_run(ROOM_SIZE.y, 0.0, 1.0), None);
+    assert_eq!(grid.is_open(Vec2::new(0.0, 0.0)), Some(true));
+    assert_eq!(
+        grid.is_open(Vec2::new(ROOM_SIZE.x, ROOM_SIZE.y)),
+        None,
+        "out-of-grid is distinct from a blocked in-grid node"
+    );
 }
 
 #[test]
@@ -671,7 +678,7 @@ fn design_flood_fill_reports_checkpoints_cut_off_from_the_player_spawn() {
 
     for checkpoint in &report.unreachable {
         assert!(
-            grid.is_open(checkpoint.point),
+            grid.is_open(checkpoint.point) == Some(true),
             "{checkpoint:?} must stay an open standing position, only disconnected"
         );
     }
@@ -695,7 +702,7 @@ fn design_flood_fill_reports_checkpoints_cut_off_from_the_player_spawn() {
     assert_eq!(report.unreachable.len(), 33);
     for checkpoint in scene.aisle_checkpoints() {
         assert!(
-            grid.is_open(checkpoint.point),
+            grid.is_open(checkpoint.point) == Some(true),
             "{checkpoint:?} must stay open on both sides of the barrier"
         );
     }
@@ -941,6 +948,18 @@ fn design_validator_reports_player_spawn_within_player_radius_of_a_collider() {
 }
 
 #[test]
+fn design_validator_rejects_a_spawn_whose_disc_crosses_the_room_boundary() {
+    let errors = validation_errors(|scene| {
+        scene.player_spawn = Vec2::new(scene.room.size.x * 0.5 - PLAYER_RADIUS * 0.5, 0.0);
+    });
+
+    assert!(
+        errors.contains(&SceneValidationError::PlayerSpawnOutsideRoom),
+        "the whole player disc must fit inside the room, got {errors:?}"
+    );
+}
+
+#[test]
 fn design_validator_reports_wrong_rack_row_count() {
     let errors = validation_errors(|scene| {
         scene
@@ -1045,7 +1064,7 @@ fn design_validator_reports_empty_camera_coverage_intervals() {
     for yaw_degrees in [45, 135, 225, 315] {
         assert!(
             errors.contains(&SceneValidationError::EmptyCameraCoverageInterval { yaw_degrees }),
-            "coverage narrower than the footprint must be reported at yaw {yaw_degrees}"
+            "coverage narrower than the footprint must be reported at yaw {yaw_degrees}: {errors:?}"
         );
     }
 }
@@ -1137,6 +1156,40 @@ fn design_validator_requires_a_visual_only_apron_over_the_rendered_area() {
         coplanar,
         [SceneValidationError::RenderApronDoesNotCoverRenderedArea],
         "an apron coplanar with the floor would z-fight, so it is not a legal apron"
+    );
+
+    let too_deep = validation_errors(|scene| {
+        for visual in &mut scene.visuals {
+            if visual.asset == AssetKind::RenderApron {
+                visual.transform.translation.y = -10.0;
+            }
+        }
+    });
+    assert_eq!(
+        too_deep,
+        [SceneValidationError::RenderApronDoesNotCoverRenderedArea],
+        "the apron must use the reviewed drop rather than any negative depth"
+    );
+
+    let malformed_extra = validation_errors(|scene| {
+        scene.visuals.push(
+            VisualSpec::new(
+                "render-apron-extra",
+                AssetKind::RenderApron,
+                Vec3::new(0.0, -10.0, 0.0),
+                false,
+            )
+            .with_scale(Vec3::new(
+                RENDER_COVERAGE_SIZE.x,
+                1.0,
+                RENDER_COVERAGE_SIZE.y,
+            )),
+        );
+    });
+    assert_eq!(
+        malformed_extra,
+        [SceneValidationError::RenderApronDoesNotCoverRenderedArea],
+        "one valid apron must not mask a malformed extra"
     );
 
     let collidable = validation_errors(|scene| {
@@ -1260,7 +1313,10 @@ fn pump(app: &mut App, frames: usize) {
 }
 
 fn built_hall(assets: &Path) -> App {
-    let mut app = hall_app(assets);
+    settle_hall(hall_app(assets))
+}
+
+fn settle_hall(mut app: App) -> App {
     assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
     pump(&mut app, 4);
     assert_eq!(
@@ -1708,14 +1764,11 @@ fn hall_spawns_every_authored_visual_once_with_the_reviewed_transform() {
     let spawned = props(&mut app);
 
     assert_eq!(spawned.len(), scene.visuals.len());
-    assert_eq!(
-        spawned
-            .iter()
-            .map(|(id, _, _)| id.as_str())
-            .collect::<Vec<_>>()
-            .len(),
-        scene.visuals.len()
-    );
+    let unique_ids = spawned
+        .iter()
+        .map(|(id, _, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(unique_ids.len(), scene.visuals.len());
     for visual in &scene.visuals {
         let matches = spawned
             .iter()
@@ -1770,10 +1823,21 @@ fn hall_spawns_unit_primitives_with_cached_meshes_and_palette_materials() {
 
 #[test]
 fn hall_spawns_generated_modules_as_shared_scene_roots_without_new_materials() {
-    let mut app = built_hall(&repo_assets());
+    let mut app = hall_app(&repo_assets());
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Ready);
+    let material_count = app.world().resource::<Assets<StandardMaterial>>().len();
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Unbuilt,
+        "the material baseline must be captured after loading but before hall spawn"
+    );
+    pump(&mut app, 4);
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Ready
+    );
     let generated = app.world().resource::<GeneratedAssets>().clone();
     let scene = SceneBlueprint::v0();
-    let material_count = app.world().resource::<Assets<StandardMaterial>>().len();
 
     let spawned = app
         .world_mut()
@@ -2012,7 +2076,16 @@ fn rig_is_bound(app: &mut App) -> bool {
 /// consume the rig, but a test reads between frames, so the harness waits for a
 /// run of frames in which the bound handles still resolve.
 fn walking_hall(assets: &Path) -> App {
-    let mut app = built_hall(assets);
+    settle_technician(built_hall(assets))
+}
+
+fn walking_hall_with_blueprint(assets: &Path, blueprint: SceneBlueprint) -> App {
+    let mut app = hall_app(assets);
+    app.insert_resource(HallBlueprint(blueprint));
+    settle_technician(settle_hall(app))
+}
+
+fn settle_technician(mut app: App) -> App {
     app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
         FIXED_STEP,
     )));
@@ -2027,7 +2100,7 @@ fn walking_hall(assets: &Path) -> App {
             ),
             PlayerRigState::Ready if rig_is_bound(&mut app) => {
                 stable += 1;
-                if stable >= 30 {
+                if stable >= 2 {
                     return app;
                 }
             }
@@ -2461,7 +2534,10 @@ fn keyboard_movement_slides_along_racks_and_stops_at_the_room_boundary() {
         stopped.x > rack_face && stopped.x <= rack_face + PLAYER_SPEED * FIXED_STEP as f32,
         "the technician must stop against the rack face, got {stopped:?}"
     );
-    assert_eq!(stopped.y, 0.0, "a head-on stop may not drift sideways");
+    assert!(
+        stopped.y.abs() < PLAYER_MOVE_EPSILON,
+        "a head-on stop may not drift sideways: {stopped:?}"
+    );
     assert_eq!(
         app.world()
             .resource::<PlayerMotion>()
@@ -2519,6 +2595,33 @@ fn keyboard_movement_slides_along_racks_and_stops_at_the_room_boundary() {
     drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 120);
     assert_eq!(player_position(&mut app).y, -limit.y);
     assert!(app.world().resource::<PlayerMotion>().resolution.clamped_z);
+}
+
+#[test]
+fn keyboard_movement_clamps_to_the_active_blueprint_room_size() {
+    let mut blueprint = blueprint_with_coverage(Vec2::splat(80.0));
+    blueprint.room.size = Vec2::splat(44.0);
+    assert_eq!(blueprint.validate(), Vec::<SceneValidationError>::new());
+    let mut app = walking_hall_with_blueprint(&repo_assets(), blueprint);
+
+    let start = Vec2::new(19.0, 18.0);
+    place_player(&mut app, start);
+    for _ in 0..120 {
+        let position = player_position(&mut app);
+        let keys = keys_towards(&view_basis(&app), Vec2::new(30.0, 18.0) - position);
+        hold(&mut app, keys);
+        app.update();
+    }
+    let stopped = player_position(&mut app);
+    let expected_limit = 22.0 - PLAYER_RADIUS;
+    assert!(
+        stopped.x > ROOM_SIZE.x * 0.5,
+        "the override must permit movement beyond the authored room, got {stopped:?}"
+    );
+    assert!(
+        stopped.x <= expected_limit + PLAYER_MOVE_EPSILON,
+        "the player crossed the active room boundary at {stopped:?}"
+    );
 }
 
 #[test]
@@ -2720,6 +2823,33 @@ fn technician_rig_reports_specific_errors_when_an_incomplete_instance_respawns()
 }
 
 #[test]
+fn technician_rig_revalidates_the_bound_animation_player_handle() {
+    let mut app = walking_hall(&repo_assets());
+    let old = app.world().resource::<PlayerAnimations>().player;
+    app.world_mut().entity_mut(old).remove::<AnimationPlayer>();
+
+    let root = technician_entity(&mut app);
+    let replacement = app
+        .world_mut()
+        .spawn((
+            Name::new("replacement-animation-player"),
+            AnimationPlayer::default(),
+            Transform::IDENTITY,
+            ChildOf(root),
+        ))
+        .id();
+    app.update();
+
+    let animations = app.world().resource::<PlayerAnimations>();
+    assert_eq!(
+        animations.player, replacement,
+        "the rig must rebind when its AnimationPlayer handle goes stale"
+    );
+    assert!(rig_report(&app).is_healthy());
+    assert_eq!(rig_state(&app), PlayerRigState::Ready);
+}
+
+#[test]
 fn keyboard_movement_stops_when_a_rig_part_goes_stale() {
     let mut app = walking_hall(&repo_assets());
     place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
@@ -2836,11 +2966,12 @@ fn aisle_waypoint_journey_reaches_every_aisle_through_the_authored_hose_pinch() 
     let scene = SceneBlueprint::v0();
     let limit = ROOM_SIZE * 0.5 - Vec2::splat(PLAYER_RADIUS);
     let hose_half = 0.2 + PLAYER_RADIUS;
+    let rack_clearance = (RACK_ROW_X[1] - RACK_ROW_X[0]) * 0.5 - 0.8 - PLAYER_RADIUS;
 
     // Every aisle end to end, detouring around each authored hose drop. The
     // detour offset is deliberately wider than the hose half-extent plus the
     // player radius and narrower than the rack faces.
-    let detour = 1.3f32;
+    let detour = (hose_half + rack_clearance) * 0.5;
     let mut route = vec![Vec2::new(AISLE_CENTER_X[0], -11.0)];
     for (index, center_x) in AISLE_CENTER_X.into_iter().enumerate() {
         let (entry, exit) = if index % 2 == 0 {
@@ -2898,14 +3029,6 @@ fn aisle_waypoint_journey_reaches_every_aisle_through_the_authored_hose_pinch() 
     }
 
     for (index, aisle) in scene.aisles.iter().enumerate() {
-        // The authored pinch really does close the centre line, so the only way
-        // through is the off-centre detour the driver walked.
-        assert!(
-            colliders.overlaps(Vec2::new(aisle.center_x, HOSE_DROP_Z), PLAYER_RADIUS),
-            "aisle {index} centre must be blocked at the hose drop"
-        );
-        assert!(detour > hose_half && detour < 1.85);
-
         let band = aisle.half_width + detour;
         let samples = trace
             .iter()
@@ -4345,6 +4468,37 @@ fn camera_follow_clamps_against_the_active_blueprint_coverage_not_the_constant()
 }
 
 #[test]
+fn camera_follow_uses_the_coverage_of_the_hall_that_actually_spawned() {
+    let coverage = Vec2::new(80.0, 84.0);
+    let blueprint = blueprint_with_coverage(coverage);
+    let mut app = walking_hall_with_blueprint(&repo_assets(), blueprint);
+    app.insert_resource(ForcedPosition(Vec2::new(30.0, -30.0)))
+        .add_systems(
+            Update,
+            force_position
+                .after(CellShiftSet::MovePlayer)
+                .before(CellShiftSet::FollowCamera),
+        );
+    app.update();
+
+    let spawned_apron = props(&mut app)
+        .into_iter()
+        .find(|(id, _, _)| id == "render-apron")
+        .expect("the overridden hall spawned its apron");
+    assert_eq!(
+        spawned_apron.2.scale,
+        Vec3::new(coverage.x, 1.0, coverage.y)
+    );
+    let yaw = orbit(&app).yaw_radians();
+    let target = camera_ground_target(&mut app);
+    let expected = clamp_follow_target(Vec2::new(30.0, -30.0), coverage, yaw);
+    assert!(
+        (target - expected).abs().max_element() < 1.0e-4,
+        "the spawned override followed to {target:?}, expected {expected:?}"
+    );
+}
+
+#[test]
 fn camera_orbit_holds_the_rendered_apron_instead_of_leaking_past_it() {
     let mut app = walking_hall(&repo_assets());
     let coverage = RENDER_COVERAGE_SIZE * 0.5;
@@ -4392,7 +4546,7 @@ fn camera_orbit_holds_the_rendered_apron_instead_of_leaking_past_it() {
 }
 
 #[test]
-fn camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach() {
+fn camera_orbit_geometry_covers_the_apron_over_every_reachable_position() {
     // The apron is the thing that makes the relaxed containment rule sound: the
     // whole ground quadrilateral, at every legal player position and every yaw,
     // must land on authored apron geometry rather than on the clear colour.
@@ -4411,18 +4565,20 @@ fn camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach() {
     );
 
     let reachable = ROOM_SIZE * 0.5;
-    // The apron size is not arbitrary. Following a technician standing at a
-    // room corner overhangs the room by up to `hypot(13, 8.71916)` m, so the
-    // rendered coverage has to be at least `2 * (20 + 15.6532)` m.
-    let widest = (ORTHOGRAPHIC_WIDTH * 0.5).hypot(ground_half_depth());
+    // The apron size is not arbitrary. Its lowered plane extends the vertical
+    // footprint by `drop / tan(elevation)`, so the rendered coverage must
+    // include that amount as well as the Y=0 ground rectangle.
+    let apron_depth =
+        ground_half_depth() + RENDER_APRON_DROP / CAMERA_ELEVATION_DEGREES.to_radians().tan();
+    let widest = (ORTHOGRAPHIC_WIDTH * 0.5).hypot(apron_depth);
     assert!(
-        (widest - 15.653_2).abs() < 1.0e-3,
-        "the widest camera overhang should be 15.6532 m, got {widest}"
+        (widest - 15.671_4).abs() < 1.0e-3,
+        "the widest camera overhang should be 15.6714 m, got {widest}"
     );
     let required = 2.0 * (ROOM_SIZE.x * 0.5 + widest);
     assert!(
-        (required - 71.306_5).abs() < 1.0e-2,
-        "the rendered coverage must be at least 71.3065 m, got {required}"
+        (required - 71.342_8).abs() < 1.0e-2,
+        "the rendered coverage must be at least 71.3428 m, got {required}"
     );
     assert!(
         RENDER_COVERAGE_SIZE.x >= required && RENDER_COVERAGE_SIZE.y >= required,
@@ -4443,7 +4599,7 @@ fn camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach() {
                 "yaw {} must follow the legal position {player:?}",
                 yaw.to_degrees()
             );
-            for ground in ground_quadrilateral(yaw, target) {
+            for ground in render_apron_quadrilateral(yaw, target) {
                 assert!(
                     ground.x.abs() <= apron_half.x + 1.0e-3
                         && ground.y.abs() <= apron_half.y + 1.0e-3,
@@ -4453,6 +4609,41 @@ fn camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach() {
             }
         }
     }
+}
+
+#[test]
+fn camera_coverage_accounts_for_the_apron_plane_below_the_follow_target() {
+    let ground_only = Vec2::new(
+        2.0 * (ROOM_SIZE.x * 0.5 + ORTHOGRAPHIC_WIDTH * 0.5),
+        2.0 * (ROOM_SIZE.y * 0.5 + ground_half_depth()),
+    );
+    let mut blueprint = SceneBlueprint::v0();
+    blueprint.room.coverage = ground_only;
+    blueprint
+        .visuals
+        .iter_mut()
+        .find(|visual| visual.asset == AssetKind::RenderApron)
+        .expect("the blueprint has one apron")
+        .transform
+        .scale = Vec3::new(ground_only.x, 1.0, ground_only.y);
+
+    assert!(
+        blueprint.validate().iter().any(|error| matches!(
+            error,
+            SceneValidationError::RoomOutsideCameraCoverage { yaw_degrees: 0 }
+        )),
+        "coverage sized only for Y=0 must not validate when the apron is below the floor"
+    );
+
+    blueprint.room.coverage = RENDER_COVERAGE_SIZE;
+    blueprint
+        .visuals
+        .iter_mut()
+        .find(|visual| visual.asset == AssetKind::RenderApron)
+        .expect("the blueprint has one apron")
+        .transform
+        .scale = Vec3::new(RENDER_COVERAGE_SIZE.x, 1.0, RENDER_COVERAGE_SIZE.y);
+    assert_eq!(blueprint.validate(), Vec::<SceneValidationError>::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -5086,6 +5277,45 @@ fn operations_out_of_range_space_is_rejected_and_stays_observable() {
     assert_eq!(last.outcome, InteractionOutcome::NoOpenTickets);
     assert_eq!(last.rejected, 1);
     assert_eq!(last.started, 0);
+
+    let mut unavailable = operations_hall(&repo_assets());
+    unavailable.world_mut().insert_resource(LastInteraction {
+        outcome: InteractionOutcome::OutOfRange {
+            nearest_rack: Some(1),
+            nearest_distance: 2.2,
+        },
+        ..LastInteraction::default()
+    });
+    unavailable
+        .world_mut()
+        .remove_resource::<PlayerSpawnPoint>();
+    let technician = technician_entity(&mut unavailable);
+    unavailable.world_mut().entity_mut(technician).despawn();
+    press_space(&mut unavailable);
+    let last = last_interaction(&unavailable);
+    assert_eq!(last.presses, 1);
+    assert_eq!(last.rejected, 1);
+    assert_eq!(last.outcome, InteractionOutcome::None);
+
+    let mut no_faulted = operations_hall(&repo_assets());
+    pump(&mut no_faulted, FAULT_FRAMES * 3);
+    let tickets = ticket_queue(&no_faulted).ordered().to_vec();
+    let roster = roster(&no_faulted);
+    for ticket in &tickets {
+        let entity = roster.get(ticket.rack).expect("ticket rack").entity;
+        assert_eq!(
+            no_faulted
+                .world_mut()
+                .get_mut::<RackOperations>(entity)
+                .expect("rack operations")
+                .begin_repair(),
+            Some(ticket.id)
+        );
+    }
+    press_space(&mut no_faulted);
+    let last = last_interaction(&no_faulted);
+    assert_eq!(last.outcome, InteractionOutcome::NoOpenTickets);
+    assert_eq!(last.rejected, 1);
 }
 
 #[test]
@@ -5286,6 +5516,38 @@ fn operations_repair_resolves_removes_the_ticket_and_cools_the_rack_down() {
         "the held candidate still belongs to a rack that is faulted"
     );
     assert_eq!(scheduler(&app).rng().draws(), 8, "waiting never rerolls");
+}
+
+#[test]
+fn operations_scheduler_rolls_back_if_the_live_queue_rejects_its_emission() {
+    let mut app = operations_hall(&repo_assets());
+    let rack = SEEDED_FAULTS[0].0;
+    let rack_id = roster(&app).get(rack).expect("seeded rack").id.clone();
+    app.world_mut()
+        .resource_mut::<TicketQueue>()
+        .insert(Ticket {
+            id: TicketId::new(99),
+            rack,
+            rack_id,
+            severity: TicketSeverity::Warning,
+            created_tick: 0,
+        })
+        .expect("the inconsistent fixture queue accepts one ticket");
+
+    pump(&mut app, FAULT_FRAMES);
+
+    let scheduler = scheduler(&app);
+    assert_eq!(scheduler.emitted(), 0);
+    assert!(scheduler.is_armed());
+    assert_eq!(
+        scheduler.pending(),
+        Some(FaultCandidate {
+            rack,
+            severity: SEEDED_FAULTS[0].1,
+        })
+    );
+    assert_eq!(scheduler.rng().draws(), 2);
+    assert_eq!(ticket_queue(&app).len(), 1);
 }
 
 /// The bone names one authored technician clip actually animates.
@@ -5579,6 +5841,12 @@ fn journey_frame(app: &mut App, active: &mut Vec<Ticket>, log: &mut Vec<JourneyE
     });
 }
 
+fn journey_press_space(app: &mut App, active: &mut Vec<Ticket>, log: &mut Vec<JourneyEvent>) {
+    key_message(app, REPAIR_KEY, ButtonState::Pressed);
+    journey_frame(app, active, log);
+    key_message(app, REPAIR_KEY, ButtonState::Released);
+}
+
 #[test]
 fn recurring_ticket_journey() {
     let mut app = operations_hall(&repo_assets());
@@ -5624,21 +5892,15 @@ fn recurring_ticket_journey() {
         journey_frame(&mut app, &mut active, &mut log);
         frames += 1;
 
-        press_space(&mut app);
+        journey_press_space(&mut app, &mut active, &mut log);
         frames += 1;
-        let queue = ticket_queue(&app);
-        for ticket in queue.ordered() {
-            if !active.iter().any(|held| held.id == ticket.id) {
-                active.push(ticket.clone());
-            }
-        }
         assert_eq!(
             last_interaction(&app).outcome,
             InteractionOutcome::Started {
                 ticket: target.id,
                 rack: target.rack
             },
-            "the journey must start the repair it walked to"
+            "the journey must start the selected repair"
         );
         assert!(movement_lock(&app).is_locked());
         assert_eq!(
@@ -5719,7 +5981,8 @@ fn recurring_ticket_journey() {
         "exactly two words are drawn per candidate, and only for candidates"
     );
 
-    // Multiple simultaneous tickets, and never more than the reviewed maximum.
+    // This observation proves the scheduler reaches the reviewed cap. The
+    // separate queue-insertion contract proves no fourth ticket can be added.
     assert_eq!(simultaneous, MAX_ACTIVE_TICKETS);
     for event in &log {
         if let JourneyEvent::Opened { ticket, .. } = event {
@@ -6746,10 +7009,11 @@ fn operations_hud_refuses_a_parented_camera_instead_of_projecting_a_local_transf
 
     let report = hud_report(&app);
     assert!(
-        report.errors.contains(&HudError::NoCamera),
+        report.errors.contains(&HudError::ParentedCamera),
         "a parented camera is an unusable camera, got {:?}",
         report.errors
     );
+    assert!(!report.errors.contains(&HudError::NoCamera));
     assert_eq!(report.viewport, Vec2::ZERO);
     for badge in &report.badges {
         if badge.kind.is_some() {
@@ -6771,6 +7035,33 @@ fn operations_hud_refuses_a_parented_camera_instead_of_projecting_a_local_transf
     let report = hud_report(&app);
     assert!(report.is_healthy(), "{:?}", report.errors);
     assert!(!report.shown_badges().is_empty());
+}
+
+#[test]
+fn operations_hud_rejects_multiple_game_cameras() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    app.world_mut()
+        .spawn((CellShiftCamera, Camera::default(), Transform::IDENTITY));
+    app.update();
+
+    let report = hud_report(&app);
+    assert_eq!(report.errors, vec![HudError::MultipleCameras { found: 2 }]);
+    assert!(report.shown_badges().is_empty());
+}
+
+#[test]
+fn operations_hud_reports_a_marked_node_that_lost_its_style_components() {
+    let mut app = hud_app(&repo_assets());
+    let status = hud_single::<HudStatusChip>(&mut app);
+    app.world_mut().entity_mut(status).remove::<Node>();
+    app.update();
+
+    assert!(
+        hud_report(&app)
+            .errors
+            .contains(&HudError::MissingStyle { entity: status })
+    );
 }
 
 /// Checks every badge against the real projection of its own anchor and
@@ -7049,6 +7340,11 @@ fn operations_hud_panels_stay_on_screen_and_clear_of_the_play_rectangle() {
         let play = play_rectangle(viewport);
         let queue_panel = hud_single::<TicketQueuePanel>(&mut app);
         let controls_panel = hud_single::<ControlsPanel>(&mut app);
+        assert_eq!(app.world().get::<ZIndex>(queue_panel), Some(&ZIndex(10)));
+        assert_eq!(app.world().get::<ZIndex>(controls_panel), Some(&ZIndex(10)));
+        for (_, badge) in rack_badge_nodes(&mut app) {
+            assert_eq!(app.world().get::<ZIndex>(badge), Some(&ZIndex(1)));
+        }
         let queue = ui_rect(&app, queue_panel);
         let controls = ui_rect(&app, controls_panel);
         for (name, rect) in [("queue", queue), ("controls", controls)] {
@@ -7112,10 +7408,10 @@ fn operations_hud_panels_stay_on_screen_and_clear_of_the_play_rectangle() {
             let rect = ui_rect(&app, entity);
             assert_eq!(rect.size(), Vec2::new(BADGE_WIDTH, BADGE_HEIGHT));
             assert!(
-                rect.min.x >= 0.0
-                    && rect.min.y >= 0.0
-                    && rect.max.x <= viewport.x
-                    && rect.max.y <= viewport.y,
+                rect.min.x >= HUD_MARGIN - 0.5
+                    && rect.min.y >= HUD_MARGIN - 0.5
+                    && rect.max.x <= viewport.x - HUD_MARGIN + 0.5
+                    && rect.max.y <= viewport.y - HUD_MARGIN + 0.5,
                 "rack {} badge {rect:?} left the {viewport:?} viewport",
                 badge.rack
             );

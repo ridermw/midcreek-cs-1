@@ -22,7 +22,8 @@
 //!            | Camera::world_to_viewport, using this frame's camera
 //!            | transform rather than last frame's propagated one
 //!            v
-//!    +-- Err ------------> BadgeVisibility::ProjectionFailed (+ HudError)
+//!    +-- behind clip planes -> BadgeVisibility::OffScreen
+//!    +-- invalid projection -> BadgeVisibility::ProjectionFailed (+ HudError)
 //!    +-- outside viewport -> BadgeVisibility::OffScreen
 //!            v
 //!    anchor viewport point
@@ -109,7 +110,7 @@ pub const BADGE_HEIGHT: f32 = 22.0;
 pub const BADGE_LIFT: f32 = 54.0;
 
 /// How far a badge stays clear of the viewport edge when it is clamped.
-pub const BADGE_EDGE_MARGIN: f32 = 6.0;
+pub const BADGE_EDGE_MARGIN: f32 = HUD_MARGIN;
 
 /// Thickness of a leader line, in logical px.
 pub const LEADER_WIDTH: f32 = 2.0;
@@ -222,7 +223,7 @@ pub enum HudStatus {
     Repairing,
     /// The last `Space` press was rejected for range.
     MoveCloser,
-    /// The last `Space` press found no open ticket at all.
+    /// The last `Space` press found no faulted ticket ready to repair.
     NoOpenTickets,
 }
 
@@ -243,7 +244,7 @@ impl HudStatus {
             Self::TicketsOpen => "Tickets waiting",
             Self::Repairing => "Repair running",
             Self::MoveCloser => "Move closer",
-            Self::NoOpenTickets => "No open tickets",
+            Self::NoOpenTickets => "No repairable tickets",
         }
     }
 
@@ -470,6 +471,14 @@ pub struct HudBadge {
 pub enum HudError {
     /// No game camera exists, so nothing can be projected.
     NoCamera,
+    /// More than one game camera exists, so no projection is authoritative.
+    MultipleCameras {
+        /// Number of game cameras found.
+        found: usize,
+    },
+    /// The game camera is parented, so its local transform is not a valid
+    /// current-frame global transform.
+    ParentedCamera,
     /// The camera has no viewport size yet.
     NoViewport,
     /// A rack on the roster lost its [`RackOperations`].
@@ -486,6 +495,11 @@ pub enum HudError {
     MissingRow {
         /// The offending slot.
         slot: usize,
+    },
+    /// A marked HUD entity lost one or more presentation components.
+    MissingStyle {
+        /// The entity that could not be updated.
+        entity: Entity,
     },
     /// The real projection refused a rack anchor.
     ProjectionFailed {
@@ -525,6 +539,14 @@ impl From<ViewportConversionError> for ProjectionFailure {
             ViewportConversionError::PastFarPlane => Self::PastFarPlane,
             ViewportConversionError::InvalidData => Self::InvalidData,
         }
+    }
+}
+
+impl ProjectionFailure {
+    /// Whether this is a normal visibility result rather than broken camera
+    /// data. Clip-plane rejection simply means the badge is off screen.
+    pub const fn is_off_screen(self) -> bool {
+        matches!(self, Self::PastNearPlane | Self::PastFarPlane)
     }
 }
 
@@ -733,6 +755,48 @@ pub fn badge_anchor_world(center: Vec2) -> Vec3 {
     Vec3::new(center.x, RACK_BADGE_ANCHOR_HEIGHT, center.y)
 }
 
+fn badge_anchor_candidates(entry: &RackEntry) -> [Vec3; 3] {
+    [
+        badge_anchor_world(entry.center),
+        badge_anchor_world(entry.center - Vec2::Y * entry.half_extents.y),
+        badge_anchor_world(entry.center + Vec2::Y * entry.half_extents.y),
+    ]
+}
+
+fn visible_badge_placement(
+    candidates: [Vec3; 3],
+    viewport: Vec2,
+    mut project: impl FnMut(Vec3) -> Result<Vec2, ViewportConversionError>,
+) -> Result<Option<(Vec3, BadgePlacement)>, ProjectionFailure> {
+    let mut failure = None;
+    let mut fallback = None;
+    for world in candidates {
+        match project(world) {
+            Ok(anchor) => {
+                if let Some(placement) = place_badge(anchor, viewport) {
+                    if placement.leader_center.is_some() {
+                        return Ok(Some((world, placement)));
+                    }
+                    fallback.get_or_insert((world, placement));
+                }
+            }
+            Err(error) => {
+                let reason = ProjectionFailure::from(error);
+                if !reason.is_off_screen() {
+                    failure.get_or_insert(reason);
+                }
+            }
+        }
+    }
+    if fallback.is_some() {
+        return Ok(fallback);
+    }
+    match failure {
+        Some(reason) => Err(reason),
+        None => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Presentation components
 // ---------------------------------------------------------------------------
@@ -857,7 +921,6 @@ fn panel_node(padding: f32) -> Node {
         position_type: PositionType::Absolute,
         flex_direction: FlexDirection::Column,
         padding: UiRect::all(Val::Px(padding)),
-        row_gap: Val::Px(QUEUE_ROW_GAP),
         ..default()
     }
 }
@@ -892,10 +955,12 @@ fn spawn_queue_panel(root: &mut RelatedSpawnerCommands<'_, ChildOf>) {
             left: Val::Px(HUD_MARGIN),
             top: Val::Px(HUD_MARGIN),
             width: Val::Px(QUEUE_PANEL_WIDTH),
+            row_gap: Val::Px(QUEUE_ROW_GAP),
             border_radius: BorderRadius::all(Val::Px(4.0)),
             ..panel_node(HUD_PANEL_PADDING)
         },
         BackgroundColor(hud_panel_color()),
+        ZIndex(10),
     ))
     .with_children(|panel| {
         panel.spawn((
@@ -1018,6 +1083,7 @@ fn spawn_controls_panel(root: &mut RelatedSpawnerCommands<'_, ChildOf>) {
             ..panel_node(HUD_PANEL_PADDING)
         },
         BackgroundColor(hud_panel_color()),
+        ZIndex(10),
     ))
     .with_children(|panel| {
         for control in HudControl::ALL {
@@ -1126,34 +1192,34 @@ fn spawn_rack_badges(
 }
 
 /// Everything the badge pass needs from the one game camera.
-struct BadgeCamera {
-    camera: Camera,
+struct BadgeCamera<'a> {
+    camera: &'a Camera,
     transform: GlobalTransform,
     viewport: Vec2,
 }
 
 /// What the badge pass could get from the one game camera this frame.
-enum BadgeView {
+enum BadgeView<'a> {
     /// A usable, unparented camera with a real viewport size.
-    ///
-    /// [`Camera`] is a large component and this enum is built every frame, so
-    /// the usable case is boxed and the two failure cases stay pointer sized.
-    Ready(Box<BadgeCamera>),
-    /// No usable game camera exists: either none is spawned, or the one that
-    /// is has been given a parent and so no longer satisfies the current-frame
-    /// projection invariant.
+    /// The [`Camera`] is borrowed rather than cloned each frame.
+    Ready(BadgeCamera<'a>),
+    /// No game camera exists.
     NoCamera,
+    /// More than one game camera exists.
+    MultipleCameras,
+    /// The sole game camera is parented and cannot use its local transform as
+    /// the current-frame global transform.
+    ParentedCamera,
     /// A usable camera exists but has no viewport size yet.
     NoViewport,
 }
 
 /// What the badge pass reads off the one game camera.
-type GameCamera = (&'static Camera, &'static Transform);
-
-/// The one game camera the badge pass will accept.
-///
-/// `Without<ChildOf>` is load bearing, not decoration: see [`update_hud`].
-type GameCameraFilter = (With<CellShiftCamera>, Without<ChildOf>);
+type GameCamera = (
+    &'static Camera,
+    &'static Transform,
+    Option<&'static ChildOf>,
+);
 
 /// Reads the live operations model, writes only presentation components, and
 /// records everything it could not draw in [`HudReport`].
@@ -1165,11 +1231,12 @@ fn update_hud(
     last: Res<LastInteraction>,
     racks: Query<&RackOperations>,
     players: Query<&Transform, With<Technician>>,
-    cameras: Query<GameCamera, GameCameraFilter>,
+    cameras: Query<GameCamera, With<CellShiftCamera>>,
     mut report: ResMut<HudReport>,
     mut nodes: HudNodes,
 ) {
     let mut errors = Vec::new();
+    nodes.extend_missing_style_errors(&mut errors);
 
     // Reading the camera's own `Transform` rather than its propagated
     // `GlobalTransform` is deliberate: propagation runs in `PostUpdate`, so the
@@ -1179,22 +1246,33 @@ fn update_hud(
     // invariant rather than a comment: a parented camera is refused as
     // unusable and every badge is hidden, instead of being projected through a
     // local transform pretending to be a global one.
-    let view = match cameras.iter().next() {
-        Some((camera, transform)) => match camera.logical_viewport_size() {
-            Some(viewport) => BadgeView::Ready(Box::new(BadgeCamera {
-                camera: camera.clone(),
+    let mut cameras = cameras.iter();
+    let view = match (cameras.next(), cameras.next()) {
+        (Some(_), Some(_)) => {
+            let found = 2 + cameras.count();
+            errors.push(HudError::MultipleCameras { found });
+            BadgeView::MultipleCameras
+        }
+        (Some((_, _, Some(_))), None) => {
+            errors.push(HudError::ParentedCamera);
+            BadgeView::ParentedCamera
+        }
+        (Some((camera, transform, None)), None) => match camera.logical_viewport_size() {
+            Some(viewport) => BadgeView::Ready(BadgeCamera {
+                camera,
                 transform: GlobalTransform::from(*transform),
                 viewport,
-            })),
+            }),
             None => {
                 errors.push(HudError::NoViewport);
                 BadgeView::NoViewport
             }
         },
-        None => {
+        (None, None) => {
             errors.push(HudError::NoCamera);
             BadgeView::NoCamera
         }
+        (None, Some(_)) => unreachable!("an iterator cannot yield a second item without a first"),
     };
 
     let presentations = roster
@@ -1254,31 +1332,38 @@ fn update_hud(
             badge.visibility = BadgeVisibility::MissingRack;
         } else if let Some(kind) = kind {
             match &view {
-                BadgeView::NoCamera => badge.visibility = BadgeVisibility::NoCamera,
+                BadgeView::NoCamera | BadgeView::MultipleCameras | BadgeView::ParentedCamera => {
+                    badge.visibility = BadgeVisibility::NoCamera
+                }
                 BadgeView::NoViewport => badge.visibility = BadgeVisibility::NoViewport,
                 BadgeView::Ready(view) => {
-                    match view.camera.world_to_viewport(&view.transform, anchor_world) {
-                        Err(error) => {
-                            badge.visibility = BadgeVisibility::ProjectionFailed;
-                            errors.push(HudError::ProjectionFailed {
-                                rack,
-                                reason: error.into(),
-                            });
-                        }
-                        Ok(anchor) => {
-                            badge.anchor = Some(anchor);
-                            match place_badge(anchor, view.viewport) {
-                                None => badge.visibility = BadgeVisibility::OffScreen,
-                                Some(placement) => {
-                                    badge.visibility = BadgeVisibility::Shown;
-                                    badge.center = Some(placement.center);
-                                    if let Some(error) = nodes.write_badge(rack, kind, &placement) {
-                                        errors.push(error);
-                                        badge.visibility = BadgeVisibility::MissingBadgeNode;
-                                        badge.center = None;
-                                    }
-                                }
+                    match visible_badge_placement(
+                        badge_anchor_candidates(entry),
+                        view.viewport,
+                        |world| view.camera.world_to_viewport(&view.transform, world),
+                    ) {
+                        Ok(Some((world, placement))) => {
+                            badge.anchor_world = world;
+                            badge.anchor = Some(placement.anchor);
+                            badge.visibility = BadgeVisibility::Shown;
+                            badge.center = Some(placement.center);
+                            if let Some(error) = nodes.write_badge(rack, kind, &placement) {
+                                errors.push(error);
+                                badge.visibility = BadgeVisibility::MissingBadgeNode;
+                                badge.center = None;
                             }
+                        }
+                        Ok(None) => {
+                            badge.visibility = BadgeVisibility::OffScreen;
+                            if let Ok(anchor) =
+                                view.camera.world_to_viewport(&view.transform, anchor_world)
+                            {
+                                badge.anchor = Some(anchor);
+                            }
+                        }
+                        Err(reason) => {
+                            badge.visibility = BadgeVisibility::ProjectionFailed;
+                            errors.push(HudError::ProjectionFailed { rack, reason });
                         }
                     }
                 }
@@ -1300,7 +1385,10 @@ fn update_hud(
     let updated = HudReport {
         viewport: match &view {
             BadgeView::Ready(view) => view.viewport,
-            BadgeView::NoCamera | BadgeView::NoViewport => Vec2::ZERO,
+            BadgeView::NoCamera
+            | BadgeView::MultipleCameras
+            | BadgeView::ParentedCamera
+            | BadgeView::NoViewport => Vec2::ZERO,
         },
         rows,
         badges,
@@ -1313,11 +1401,6 @@ fn update_hud(
     }
 }
 
-/// Every presentation node the HUD writes.
-///
-/// The marker queries read only their own marker component and the style query
-/// writes only presentation components, so the two sets are disjoint and Bevy
-/// can schedule them in one system without a `ParamSet`.
 /// Every presentation component the HUD writes, as one query item.
 type HudStyle = (
     &'static mut Node,
@@ -1327,6 +1410,11 @@ type HudStyle = (
     Option<&'static mut TextColor>,
 );
 
+/// Every presentation node the HUD writes.
+///
+/// The marker queries read only their own marker component and the style query
+/// writes only presentation components, so the two sets are disjoint and Bevy
+/// can schedule them in one system without a `ParamSet`.
 #[derive(SystemParam)]
 struct HudNodes<'w, 's> {
     header: Query<'w, 's, Entity, With<QueueHeaderLabel>>,
@@ -1346,6 +1434,24 @@ struct HudNodes<'w, 's> {
 }
 
 impl HudNodes<'_, '_> {
+    fn extend_missing_style_errors(&self, errors: &mut Vec<HudError>) {
+        self.header
+            .iter()
+            .chain(self.rows.iter().map(|(entity, _)| entity))
+            .chain(self.severity_chips.iter().map(|(entity, _)| entity))
+            .chain(self.state_chips.iter().map(|(entity, _)| entity))
+            .chain(self.row_labels.iter().map(|(entity, _)| entity))
+            .chain(self.row_progress.iter().map(|(entity, _)| entity))
+            .chain(self.status_chip.iter())
+            .chain(self.status_label.iter())
+            .chain(self.caps.iter().map(|(entity, _)| entity))
+            .chain(self.cap_labels.iter().map(|(entity, _)| entity))
+            .chain(self.badges.iter().map(|(entity, _)| entity))
+            .chain(self.badge_labels.iter().map(|(entity, _)| entity))
+            .chain(self.leaders.iter().map(|(entity, _)| entity))
+            .filter(|entity| !self.style.contains(*entity))
+            .for_each(|entity| errors.push(HudError::MissingStyle { entity }));
+    }
     fn row_entity(&self, slot: usize) -> Option<Entity> {
         self.rows
             .iter()
@@ -2147,6 +2253,34 @@ mod tests {
     }
 
     #[test]
+    fn hud_clip_plane_projection_failures_are_normal_off_screen_results() {
+        assert!(ProjectionFailure::PastNearPlane.is_off_screen());
+        assert!(ProjectionFailure::PastFarPlane.is_off_screen());
+        assert!(!ProjectionFailure::NoViewportSize.is_off_screen());
+        assert!(!ProjectionFailure::InvalidData.is_off_screen());
+    }
+
+    #[test]
+    fn hud_uses_a_visible_row_end_when_the_row_center_is_off_screen() {
+        let entry = entry(1);
+        let candidates = badge_anchor_candidates(&entry);
+        let selected = visible_badge_placement(candidates, Vec2::new(960.0, 540.0), |world| {
+            if world.z == entry.center.y {
+                Ok(Vec2::new(-1.0, 270.0))
+            } else if world.z < entry.center.y {
+                Ok(Vec2::new(120.0, 270.0))
+            } else {
+                Ok(Vec2::new(961.0, 270.0))
+            }
+        })
+        .expect("the synthetic projection is valid")
+        .expect("one row end is visible");
+
+        assert_eq!(selected.0, candidates[1]);
+        assert_eq!(selected.1.anchor, Vec2::new(120.0, 270.0));
+    }
+
+    #[test]
     fn hud_badge_placement_lifts_the_badge_and_points_the_leader_at_the_anchor() {
         let viewport = Vec2::new(1280.0, 720.0);
         let anchor = Vec2::new(640.0, 400.0);
@@ -2187,8 +2321,11 @@ mod tests {
             let min = placement.center - half;
             let max = placement.center + half;
             assert!(
-                min.x >= 0.0 && min.y >= 0.0 && max.x <= viewport.x && max.y <= viewport.y,
-                "badge for {anchor:?} left the viewport: {min:?}..{max:?}"
+                min.x >= HUD_MARGIN
+                    && min.y >= HUD_MARGIN
+                    && max.x <= viewport.x - HUD_MARGIN
+                    && max.y <= viewport.y - HUD_MARGIN,
+                "badge for {anchor:?} broke the {HUD_MARGIN}px edge margin: {min:?}..{max:?}"
             );
             if let Some(leader) = placement.leader_center {
                 let tip =

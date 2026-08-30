@@ -641,19 +641,20 @@ impl FaultScheduler {
         self.emitted
     }
 
-    /// How many times a matured opportunity paused because the queue was full.
+    /// Number of distinct pause episodes entered because the queue was full.
+    /// Repeated ticks in the same blocked state do not increment it.
     pub const fn capacity_pauses(&self) -> u64 {
         self.capacity_pauses
     }
 
-    /// How many times a drawn candidate paused because its rack already held
-    /// an active ticket.
+    /// Number of distinct pause episodes entered because the drawn rack
+    /// already held an active ticket. Repeated ticks do not increment it.
     pub const fn duplicate_pauses(&self) -> u64 {
         self.duplicate_pauses
     }
 
-    /// How many times a drawn candidate paused because its rack was not
-    /// eligible yet.
+    /// Number of distinct pause episodes entered because the drawn rack was
+    /// otherwise unavailable. Repeated ticks do not increment it.
     pub const fn busy_pauses(&self) -> u64 {
         self.busy_pauses
     }
@@ -762,6 +763,16 @@ impl FaultScheduler {
         FaultCandidate { rack, severity }
     }
 
+    /// Restores an emitted ticket to the armed pending state when the ECS-side
+    /// queue/rack commit cannot complete. RNG draws and elapsed time stay
+    /// consumed; only the externally uncommitted emission is reversed.
+    fn rollback_emission(&mut self, rack: usize, severity: TicketSeverity, next_ticket: u64) {
+        self.pending = Some(FaultCandidate { rack, severity });
+        self.armed = true;
+        self.next_ticket = next_ticket;
+        self.emitted = self.emitted.saturating_sub(1);
+    }
+
     /// Records why a matured opportunity paused, counting each new pause once.
     fn note_block(&mut self, block: ScheduleBlock) {
         if self.blocked == Some(block) {
@@ -849,7 +860,8 @@ pub enum InteractionOutcome {
         /// The ticket currently being repaired.
         ticket: TicketId,
     },
-    /// Space was pressed with no open ticket anywhere.
+    /// Space was pressed with no faulted ticket currently able to start a
+    /// repair. The queue may still contain Repairing or Resolved tickets.
     NoOpenTickets,
     /// Space was pressed with open tickets, but none within range.
     OutOfRange {
@@ -933,7 +945,8 @@ impl RackRoster {
     /// The hall builds the real roster in stable [`PropId`] order; this exists
     /// so the roster can also be built directly, without a world, when
     /// something needs to reason about racks in isolation.
-    pub fn from_entries(racks: Vec<RackEntry>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_entries(racks: Vec<RackEntry>) -> Self {
         Self { racks }
     }
 
@@ -1132,12 +1145,15 @@ fn handle_repair_input(
     if !keys.just_pressed(REPAIR_KEY) {
         return;
     }
-    let Ok(transform) = players.single() else {
-        return;
-    };
-
     last.presses += 1;
     last.tick = clock.tick();
+    let Ok(transform) = players.single() else {
+        let found = players.iter().count();
+        error!("repair input found {found} technicians instead of exactly one");
+        last.outcome = InteractionOutcome::None;
+        last.rejected += 1;
+        return;
+    };
     if let Some(ticket) = lock.ticket {
         last.outcome = InteractionOutcome::AlreadyRepairing { ticket };
         last.rejected += 1;
@@ -1244,23 +1260,28 @@ fn advance_scheduler(
 
     let id = ticket.id;
     let rack_index = ticket.rack;
+    let severity = ticket.severity;
     if let Err(rejection) = queue.insert(ticket) {
         error!("the queue refused a scheduled ticket: {rejection:?}");
+        scheduler.rollback_emission(rack_index, severity, id.value());
         return;
     }
     let Some(entry) = roster.get(rack_index) else {
         error!("the scheduler emitted a ticket for unknown rack {rack_index}");
         queue.remove(id);
+        scheduler.rollback_emission(rack_index, severity, id.value());
         return;
     };
     let Ok(mut rack) = racks.get_mut(entry.entity) else {
         error!("rack {} lost its operational state", entry.id);
         queue.remove(id);
+        scheduler.rollback_emission(rack_index, severity, id.value());
         return;
     };
     if !rack.open_fault(id) {
         error!("rack {} refused the fault it was scheduled for", entry.id);
         queue.remove(id);
+        scheduler.rollback_emission(rack_index, severity, id.value());
     }
 }
 

@@ -161,15 +161,6 @@ impl GeneratedAssets {
         let module = module_for(kind)?;
         self.scene(module.asset, module.module)
     }
-
-    /// Every tracked handle, for load-state polling.
-    pub fn handle_ids(&self) -> Vec<UntypedAssetId> {
-        self.documents
-            .iter()
-            .map(|(_, handle)| handle.id().untyped())
-            .chain(self.scenes.iter().map(|(_, handle)| handle.id().untyped()))
-            .collect()
-    }
 }
 
 /// Every generated-asset failure observed while resolving the load state.
@@ -389,9 +380,9 @@ impl RenderAssets {
 }
 
 /// Loads every generated asset and publishes the shared render handles.
-pub struct AssetPlugin;
+pub struct GeneratedAssetPlugin;
 
-impl Plugin for AssetPlugin {
+impl Plugin for GeneratedAssetPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<AssetLoadState>()
             .init_resource::<AssetLoadReport>()
@@ -566,11 +557,28 @@ enum LoadOutcome {
 }
 
 fn load_outcome(server: &AssetServer, id: UntypedAssetId) -> LoadOutcome {
-    match server.get_recursive_dependency_load_state(id) {
+    classify_load_state(server.get_recursive_dependency_load_state(id))
+}
+
+fn classify_load_state(state: Option<RecursiveDependencyLoadState>) -> LoadOutcome {
+    match state {
         Some(RecursiveDependencyLoadState::Loaded) => LoadOutcome::Loaded,
         Some(RecursiveDependencyLoadState::Failed(error)) => LoadOutcome::Failed(error.to_string()),
         Some(RecursiveDependencyLoadState::Loading)
-        | Some(RecursiveDependencyLoadState::NotLoaded)
-        | None => LoadOutcome::Pending,
+        | Some(RecursiveDependencyLoadState::NotLoaded) => LoadOutcome::Pending,
+        None => LoadOutcome::Failed("recursive dependency load state is missing".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_recursive_dependency_state_is_a_terminal_failure() {
+        assert!(matches!(
+            classify_load_state(None),
+            LoadOutcome::Failed(message) if message.contains("missing")
+        ));
     }
 }

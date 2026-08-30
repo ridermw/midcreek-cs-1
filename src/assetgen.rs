@@ -1493,12 +1493,19 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
                 let Some(parent) = &bone.parent else {
                     continue;
                 };
-                let parent_index = layout
-                    .order
-                    .get(parent)
-                    .copied()
-                    .expect("validation guarantees the parent bone exists")
-                    as usize;
+                let parent_index =
+                    layout
+                        .order
+                        .get(parent)
+                        .copied()
+                        .ok_or_else(|| AssetGenError::Invalid {
+                            path: path.to_owned(),
+                            field: format!("{module_field}.rig.bones"),
+                            message: format!(
+                                "bone {} references unresolved parent {parent}",
+                                bone.name
+                            ),
+                        })? as usize;
                 let child = json::Index::new((bone_base + bone_index) as u32);
                 builder.root.nodes[bone_base + parent_index]
                     .children
@@ -1509,7 +1516,11 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
                 .bones
                 .iter()
                 .position(|bone| bone.parent.is_none())
-                .expect("validation guarantees exactly one root bone");
+                .ok_or_else(|| AssetGenError::Invalid {
+                    path: path.to_owned(),
+                    field: format!("{module_field}.rig.bones"),
+                    message: "rig has no root bone".to_owned(),
+                })?;
             children.push(json::Index::new((bone_base + root_bone) as u32));
 
             let matrices = rig
@@ -1552,7 +1563,7 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
             );
             builder.root.nodes[skin_index.value()].skin = Some(skin);
 
-            push_animations(&mut builder, rig, bone_base);
+            push_animations(&mut builder, rig, bone_base, path, &module_field)?;
         }
 
         builder.root.nodes[root_index] = json::Node {
@@ -1797,17 +1808,29 @@ fn push_mesh(
     ))
 }
 
-fn push_animations(builder: &mut Builder, rig: &RigSource, bone_base: usize) {
-    for clip in &rig.clips {
+fn push_animations(
+    builder: &mut Builder,
+    rig: &RigSource,
+    bone_base: usize,
+    path: &str,
+    module_field: &str,
+) -> Result<(), AssetGenError> {
+    for (clip_index, clip) in rig.clips.iter().enumerate() {
         let mut channels = Vec::with_capacity(clip.tracks.len());
         let mut samplers = Vec::with_capacity(clip.tracks.len());
 
-        for track in &clip.tracks {
+        for (track_index, track) in clip.tracks.iter().enumerate() {
             let bone_index = rig
                 .bones
                 .iter()
                 .position(|bone| bone.name == track.bone)
-                .expect("validation guarantees the target bone exists");
+                .ok_or_else(|| AssetGenError::Invalid {
+                    path: path.to_owned(),
+                    field: format!(
+                        "{module_field}.rig.clips[{clip_index}].tracks[{track_index}].bone"
+                    ),
+                    message: format!("unknown animation target bone {}", track.bone),
+                })?;
             let rest = rig.bones[bone_index].translation;
 
             let times = track
@@ -1901,6 +1924,7 @@ fn push_animations(builder: &mut Builder, rig: &RigSource, bone_base: usize) {
             },
         );
     }
+    Ok(())
 }
 
 fn glb_container(json_chunk: &[u8], bin_chunk: &[u8]) -> Vec<u8> {

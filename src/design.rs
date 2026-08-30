@@ -20,10 +20,10 @@ pub const ROOM_SIZE: Vec2 = Vec2::new(40.0, 40.0);
 /// the walkable room and covered by the non-playable visual apron.
 ///
 /// The camera follows the technician anywhere in the walkable room, so its
-/// widest ground footprint may overhang the room by
-/// `hypot(13, 8.71916) = 15.6532` m on either side. Covering that needs
-/// `2 * (20 + 15.6532) = 71.3065` m; 72 m is the next whole metre and leaves
-/// 0.3468 m of slack on every edge.
+/// widest footprint on the apron plane may overhang the room by
+/// `hypot(13, 8.71916 + 0.03247) = 15.6714` m on either side. Covering that
+/// needs `2 * (20 + 15.6714) = 71.3428` m; 72 m is the next whole metre and
+/// leaves about 0.3286 m of slack on every edge.
 pub const RENDER_COVERAGE_SIZE: Vec2 = Vec2::new(72.0, 72.0);
 
 /// How far below the walkable floor the visual apron sits, in metres. The
@@ -97,6 +97,9 @@ pub const ORTHOGRAPHIC_WIDTH: f32 = 26.0;
 pub const ORTHOGRAPHIC_HEIGHT: f32 = 14.625;
 pub const INITIAL_CAMERA_YAW_DEGREES: f32 = 45.0;
 pub const CAMERA_ELEVATION_DEGREES: f32 = 57.0;
+/// Normalized camera offset proportions. The vertical component is
+/// `sqrt(2) * tan(57 degrees)`, so normalization produces the reviewed
+/// 57-degree elevation with equal X/Z components.
 #[allow(clippy::excessive_precision)]
 pub const CAMERA_OFFSET_DIRECTION: Vec3 = Vec3::new(1.0, 2.177_697_9, 1.0);
 pub const CAMERA_ORBIT_DURATION_SECONDS: f32 = 0.30;
@@ -104,6 +107,8 @@ pub const CAMERA_ORBIT_DURATION_SECONDS: f32 = 0.30;
 pub const FAULT_INTERVAL_SECONDS: f32 = 4.0;
 pub const MAX_ACTIVE_TICKETS: usize = 3;
 pub const PLAYER_RADIUS: f32 = 0.35;
+/// Ground speed of the technician, in metres per second.
+pub const PLAYER_SPEED: f32 = 3.0;
 pub const REPAIR_INTERACTION_RANGE: f32 = 1.5;
 pub const REPAIR_DURATION_SECONDS: f32 = 3.0;
 pub const RESOLVED_DISPLAY_SECONDS: f32 = 2.0;
@@ -393,9 +398,11 @@ pub struct RoomSpec {
 }
 
 impl RoomSpec {
-    fn contains_point(self, point: Vec2) -> bool {
-        let half_size = self.size * 0.5;
-        point.x.abs() <= half_size.x && point.y.abs() <= half_size.y
+    fn contains_disc(self, center: Vec2, radius: f32) -> bool {
+        let half_size = self.size * 0.5 - Vec2::splat(radius);
+        half_size.min_element() >= 0.0
+            && center.x.abs() <= half_size.x
+            && center.y.abs() <= half_size.y
     }
 
     fn contains_collider(self, collider: &ColliderSpec) -> bool {
@@ -887,7 +894,7 @@ impl SceneBlueprint {
             }
         }
 
-        let mut spawn_is_walkable = self.room.contains_point(self.player_spawn);
+        let mut spawn_is_walkable = self.room.contains_disc(self.player_spawn, PLAYER_RADIUS);
         if !spawn_is_walkable {
             errors.push(SceneValidationError::PlayerSpawnOutsideRoom);
         } else {
@@ -943,12 +950,14 @@ impl SceneBlueprint {
                 None => {
                     errors.push(SceneValidationError::EmptyCameraCoverageInterval { yaw_degrees })
                 }
-                Some((_, max)) => {
+                Some((min, max)) => {
                     // The camera must follow every legal player position, so
                     // the legal follow rectangle has to contain the whole
                     // walkable room rather than merely be non-empty.
                     let half_room = self.room.size * 0.5;
-                    if max.x + COVERAGE_TOLERANCE < half_room.x
+                    if min.x - COVERAGE_TOLERANCE > -half_room.x
+                        || min.y - COVERAGE_TOLERANCE > -half_room.y
+                        || max.x + COVERAGE_TOLERANCE < half_room.x
                         || max.y + COVERAGE_TOLERANCE < half_room.y
                     {
                         errors
@@ -978,14 +987,15 @@ impl SceneBlueprint {
             return errors;
         }
 
-        let covered = aprons.iter().any(|apron| {
-            let transform = &apron.transform;
-            transform.translation.x == 0.0
-                && transform.translation.z == 0.0
-                && transform.translation.y < 0.0
-                && transform.scale.x + COVERAGE_TOLERANCE >= self.room.coverage.x
-                && transform.scale.z + COVERAGE_TOLERANCE >= self.room.coverage.y
-        });
+        let covered = aprons.len() == 1
+            && aprons.iter().all(|apron| {
+                let transform = &apron.transform;
+                transform.translation.x == 0.0
+                    && transform.translation.z == 0.0
+                    && (transform.translation.y + RENDER_APRON_DROP).abs() <= COVERAGE_TOLERANCE
+                    && transform.scale.x + COVERAGE_TOLERANCE >= self.room.coverage.x
+                    && transform.scale.z + COVERAGE_TOLERANCE >= self.room.coverage.y
+            });
         if !covered {
             errors.push(SceneValidationError::RenderApronDoesNotCoverRenderedArea);
         }
@@ -1083,12 +1093,21 @@ impl WalkableGrid {
     }
 
     /// Whether the grid node nearest `point` is a legal standing position.
-    pub fn is_open(&self, point: Vec2) -> bool {
-        self.node(point).is_some()
+    ///
+    /// `None` means the point lies outside the represented room; `Some(false)`
+    /// means it lies on an in-room node that is blocked.
+    pub fn is_open(&self, point: Vec2) -> Option<bool> {
+        self.index(point).map(|index| self.open[index])
     }
 
     /// Index of the grid node nearest `point`, when that node is open.
     fn node(&self, point: Vec2) -> Option<usize> {
+        let index = self.index(point)?;
+        self.open[index].then_some(index)
+    }
+
+    /// Index of the grid node nearest `point`, whether open or blocked.
+    fn index(&self, point: Vec2) -> Option<usize> {
         let offset = (point - self.origin) / WALKABLE_CELL_SIZE;
         let column = offset.x.round();
         let row = offset.y.round();
@@ -1099,8 +1118,7 @@ impl WalkableGrid {
         if column >= self.columns || row >= self.rows {
             return None;
         }
-        let index = row * self.columns + column;
-        self.open[index].then_some(index)
+        Some(row * self.columns + column)
     }
 
     /// Index of the grid row nearest `z`, when it lies inside the room.
@@ -1118,10 +1136,8 @@ impl WalkableGrid {
     /// grid is already inflated by [`PLAYER_RADIUS`], so every open node is a
     /// standing position and a run of `n` adjacent nodes spans `(n - 1)` cells;
     /// a lone open node has zero width. The player diameter is not added again.
-    pub fn widest_open_run(&self, z: f32, center_x: f32, half_width: f32) -> f32 {
-        let Some(row) = self.row(z) else {
-            return 0.0;
-        };
+    pub fn widest_open_run(&self, z: f32, center_x: f32, half_width: f32) -> Option<f32> {
+        let row = self.row(z)?;
         let tolerance = WALKABLE_CELL_SIZE * 1.0e-3;
 
         let mut longest = 0usize;
@@ -1139,7 +1155,7 @@ impl WalkableGrid {
             }
         }
 
-        longest.saturating_sub(1) as f32 * WALKABLE_CELL_SIZE
+        Some(longest.saturating_sub(1) as f32 * WALKABLE_CELL_SIZE)
     }
 
     /// Narrowest [`WalkableGrid::widest_open_run`] over every grid
@@ -1152,7 +1168,9 @@ impl WalkableGrid {
             if z < aisle.z_min - tolerance || z > aisle.z_max + tolerance {
                 continue;
             }
-            narrowest = narrowest.min(self.widest_open_run(z, aisle.center_x, aisle.half_width));
+            if let Some(clearance) = self.widest_open_run(z, aisle.center_x, aisle.half_width) {
+                narrowest = narrowest.min(clearance);
+            }
         }
 
         if narrowest.is_finite() {

@@ -29,9 +29,9 @@
 //! [`RENDER_COVERAGE_SIZE`] exactly as `spawn_hall` falls back to
 //! [`SceneBlueprint::v0`](crate::design::SceneBlueprint::v0). It is never
 //! against [`ROOM_SIZE`](crate::design::ROOM_SIZE), and because
-//! `72 / 2 - hypot(13, 8.71916) = 20.3468` m exceeds the room's 20 m half
-//! extent, every legal player position is followed exactly, at every yaw. The
-//! clamp only ever engages for a position the technician cannot reach.
+//! `72 / 2 - hypot(13, 8.71916 + 0.03247) = 20.3286` m exceeds the room's
+//! 20 m half extent, every legal player position is followed exactly, at every
+//! yaw. The clamp only ever engages for a position the technician cannot reach.
 //!
 //! ```text
 //! ButtonInput<KeyCode>
@@ -75,7 +75,7 @@ use crate::{
     CellShiftSet,
     design::{
         CAMERA_ELEVATION_DEGREES, CAMERA_ORBIT_DURATION_SECONDS, INITIAL_CAMERA_YAW_DEGREES,
-        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, RENDER_COVERAGE_SIZE,
+        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, RENDER_APRON_DROP, RENDER_COVERAGE_SIZE,
     },
     player::{Technician, ViewBasis},
     world::HallBlueprint,
@@ -366,6 +366,32 @@ pub fn ground_footprint_extents(yaw_radians: f32) -> Vec2 {
         .fold(Vec2::ZERO, |extents, corner| extents.max(corner.abs()))
 }
 
+/// Ground-plane shift between the followed point at `Y = 0` and the centre of
+/// the camera rectangle where it intersects the lowered render apron.
+fn render_apron_center_offset(yaw_radians: f32) -> Vec2 {
+    ViewBasis::from_yaw_radians(yaw_radians).forward()
+        * (RENDER_APRON_DROP / CAMERA_ELEVATION_DEGREES.to_radians().tan())
+}
+
+/// The four viewport corners cast onto the actual lowered render-apron plane.
+pub fn render_apron_quadrilateral(yaw_radians: f32, target: Vec2) -> [Vec2; 4] {
+    ground_quadrilateral(
+        yaw_radians,
+        target + render_apron_center_offset(yaw_radians),
+    )
+}
+
+/// Minimum and maximum offsets of the camera rectangle on the actual apron
+/// plane, relative to the followed point.
+fn render_apron_footprint_bounds(yaw_radians: f32) -> (Vec2, Vec2) {
+    render_apron_quadrilateral(yaw_radians, Vec2::ZERO)
+        .into_iter()
+        .fold(
+            (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+            |bounds, corner| (bounds.0.min(corner), bounds.1.max(corner)),
+        )
+}
+
 /// The legal follow-target rectangle: rendered coverage minus the ground
 /// footprint. `None` when the footprint is wider than the coverage on either
 /// axis.
@@ -374,16 +400,24 @@ pub fn ground_footprint_extents(yaw_radians: f32) -> Vec2 {
 /// not the walkable room. Clamping against the room instead would push the
 /// camera off any technician standing near a wall.
 pub fn camera_target_bounds(coverage: Vec2, yaw_radians: f32) -> Option<(Vec2, Vec2)> {
-    let remaining = coverage * 0.5 - ground_footprint_extents(yaw_radians);
-    (remaining.min_element() >= 0.0).then_some((-remaining, remaining))
+    let (footprint_min, footprint_max) = render_apron_footprint_bounds(yaw_radians);
+    let half_coverage = coverage * 0.5;
+    let min = -half_coverage - footprint_min;
+    let max = half_coverage - footprint_max;
+    (min.x <= max.x && min.y <= max.y).then_some((min, max))
 }
 
 /// Whether every legal position in a walkable `room` is also a legal follow
 /// target under `coverage` at `yaw_radians`, so the camera never has to stop
 /// tracking the technician.
 pub fn coverage_holds_room(room: Vec2, coverage: Vec2, yaw_radians: f32) -> bool {
-    camera_target_bounds(coverage, yaw_radians)
-        .is_some_and(|(_, max)| max.x >= room.x * 0.5 && max.y >= room.y * 0.5)
+    camera_target_bounds(coverage, yaw_radians).is_some_and(|(min, max)| {
+        let half_room = room * 0.5;
+        min.x <= -half_room.x
+            && min.y <= -half_room.y
+            && max.x >= half_room.x
+            && max.y >= half_room.y
+    })
 }
 
 /// The two yaws at which the ground footprint is widest, one per world axis.
@@ -889,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_orbit_retarget_mid_tween_keeps_a_constant_angular_speed() {
+    fn camera_orbit_retarget_mid_tween_keeps_the_same_average_rate_budget() {
         let mut queued = CameraOrbit::default();
         press(&mut queued, &[KeyCode::KeyE]);
         queued.advance(CAMERA_ORBIT_DURATION_SECONDS * 0.5);
@@ -913,7 +947,8 @@ mod tests {
             assert_yaw(sample.yaw_radians(), expected, "queued turn sample");
         }
 
-        // Every retarget, at any point of any tween, keeps the same rate.
+        // Every retarget uses the same distance-to-duration ratio. Smoothstep
+        // still eases the instantaneous rate at both ends.
         for fraction in [0.0_f32, 0.1, 0.37, 0.5, 0.9, 1.0] {
             let mut orbit = CameraOrbit::default();
             press(&mut orbit, &[KeyCode::KeyE]);
@@ -1035,9 +1070,9 @@ mod tests {
     #[test]
     fn camera_ground_footprint_extents_match_the_rotated_rectangle() {
         for (degrees, expected) in [
-            (0.0_f32, Vec2::new(13.0, 8.719_43)),
-            (90.0, Vec2::new(8.719_43, 13.0)),
-            (180.0, Vec2::new(13.0, 8.719_43)),
+            (0.0_f32, Vec2::new(13.0, 8.719_16)),
+            (90.0, Vec2::new(8.719_16, 13.0)),
+            (180.0, Vec2::new(13.0, 8.719_16)),
             (
                 45.0,
                 Vec2::splat((13.0 + 8.719_16) * 0.5 * std::f32::consts::SQRT_2),
@@ -1096,10 +1131,12 @@ mod tests {
             let bounds = camera_target_bounds(RENDER_COVERAGE_SIZE, yaw);
             let (min, max) = bounds
                 .unwrap_or_else(|| panic!("yaw {degrees} must have a legal target rectangle"));
-            assert_eq!(min, -max);
             assert!(
-                max.x >= half_room.x && max.y >= half_room.y,
-                "yaw {degrees} legal rectangle {max:?} does not hold the walkable room {half_room:?}"
+                min.x <= -half_room.x
+                    && min.y <= -half_room.y
+                    && max.x >= half_room.x
+                    && max.y >= half_room.y,
+                "yaw {degrees} legal rectangle {min:?}..{max:?} does not hold the walkable room {half_room:?}"
             );
             assert!(
                 coverage_holds_room(ROOM_SIZE, RENDER_COVERAGE_SIZE, yaw),
@@ -1110,27 +1147,33 @@ mod tests {
         let diagonal =
             camera_target_bounds(RENDER_COVERAGE_SIZE, CameraHeading::NorthEast.yaw_radians())
                 .expect("the reviewed initial view must have a legal rectangle");
+        let diagonal_shift = render_apron_center_offset(CameraHeading::NorthEast.yaw_radians());
         assert!(
-            (diagonal.1 - Vec2::splat(20.641_6)).abs().max_element() < 1.0e-3,
-            "the diagonal legal rectangle should reach 20.6416 m, got {:?}",
-            diagonal.1
+            ((diagonal.0 + diagonal.1) * 0.5 + diagonal_shift)
+                .abs()
+                .max_element()
+                < 1.0e-4,
+            "the legal rectangle must compensate for the lowered apron plane, got {diagonal:?}"
         );
 
         // The tightest legal rectangle of a whole orbit still contains the
-        // 20 m room half extent, with 0.3468 m of authored slack to spare.
-        let tightest = RENDER_COVERAGE_SIZE * 0.5
-            - Vec2::splat(ground_half_width().hypot(ground_half_depth()));
+        // 20 m room half extent after accounting for the lowered apron plane.
+        let tightest_slack = widest_footprint_yaws()
+            .into_iter()
+            .flat_map(|yaw| {
+                let (min, max) =
+                    camera_target_bounds(RENDER_COVERAGE_SIZE, yaw).expect("legal coverage");
+                [
+                    -half_room.x - min.x,
+                    -half_room.y - min.y,
+                    max.x - half_room.x,
+                    max.y - half_room.y,
+                ]
+            })
+            .fold(f32::INFINITY, f32::min);
         assert!(
-            (tightest - Vec2::splat(20.346_8)).abs().max_element() < 1.0e-3,
-            "the tightest legal rectangle of a whole orbit should reach 20.3468 m, got {tightest:?}"
-        );
-        assert!(
-            ((tightest - half_room) - Vec2::splat(0.346_8))
-                .abs()
-                .max_element()
-                < 1.0e-3,
-            "the worst-case coverage slack should be 0.3468 m, got {:?}",
-            tightest - half_room
+            tightest_slack > 0.3,
+            "the lowered apron must retain meaningful authored slack, got {tightest_slack}"
         );
 
         // Coverage narrower than the footprint still has no legal target.

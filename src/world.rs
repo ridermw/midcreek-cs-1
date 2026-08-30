@@ -27,7 +27,6 @@
 use bevy::prelude::*;
 
 use crate::{
-    CellShiftSet,
     assets::{AssetLoadState, GeneratedAssets, RenderAssets},
     design::{
         AssetKind, ColliderSpec, PropId, SceneBlueprint, SceneValidationError, TransformSpec,
@@ -52,12 +51,6 @@ pub enum HallState {
 #[derive(Resource, Clone, Debug)]
 pub struct HallBlueprint(pub SceneBlueprint);
 
-impl Default for HallBlueprint {
-    fn default() -> Self {
-        Self(SceneBlueprint::v0())
-    }
-}
-
 /// Validation errors that stopped the hall from spawning.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct HallErrors(Vec<SceneValidationError>);
@@ -74,13 +67,13 @@ impl HallErrors {
 #[derive(Resource, Clone, Debug)]
 pub struct HallColliders(Vec<ColliderSpec>);
 
-impl From<Vec<ColliderSpec>> for HallColliders {
-    fn from(colliders: Vec<ColliderSpec>) -> Self {
-        Self(colliders)
-    }
-}
-
 impl HallColliders {
+    /// Caches the collider list of a blueprint that has already passed
+    /// [`SceneBlueprint::validate`].
+    pub(crate) fn from_validated_blueprint(blueprint: &SceneBlueprint) -> Self {
+        Self(blueprint.colliders.clone())
+    }
+
     /// Every cached collider, in blueprint order.
     pub fn all(&self) -> &[ColliderSpec] {
         &self.0
@@ -140,10 +133,7 @@ impl Plugin for HallPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<HallState>()
             .init_resource::<HallErrors>()
-            .add_systems(
-                OnEnter(AssetLoadState::Ready),
-                spawn_hall.in_set(CellShiftSet::SpawnWorld),
-            );
+            .add_systems(OnEnter(AssetLoadState::Ready), spawn_hall);
     }
 }
 
@@ -169,7 +159,7 @@ fn spawn_hall(
         return;
     }
 
-    commands.insert_resource(HallColliders(blueprint.colliders.clone()));
+    commands.insert_resource(HallColliders::from_validated_blueprint(&blueprint));
     commands.insert_resource(PlayerSpawnPoint(blueprint.player_spawn));
 
     let root = commands
