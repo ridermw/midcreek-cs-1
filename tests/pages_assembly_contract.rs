@@ -826,6 +826,78 @@ fn a_relocated_assemble_refuses_to_publish_into_the_checkout_it_runs_in() {
     assert!(checkout.path().join("target/pages/index.html").is_file());
 }
 
+/// The checkout is *discovered*, so an exported `GITHUB_WORKSPACE` is a hint,
+/// and an empty, relative, missing, or non-directory one is no hint at all: it
+/// must fall through to discovery rather than replace it.
+///
+/// The empty string is the dangerous shape. It names no directory, but its
+/// `.git` probe resolves relative to the working directory, so a run standing
+/// inside a checkout "found" a workspace of `""`, stopped looking, and lost
+/// the very source tree it was standing in — leaving the compiled-in path as
+/// the only protected root, which on a runner is not on the machine at all.
+#[test]
+fn an_unusable_workspace_hint_cannot_suppress_checkout_discovery() {
+    let checkout = fixture_site(
+        "workspace-hint-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+            ("notes.txt", "a file, not a workspace"),
+        ],
+    );
+    let current = fixture_site(
+        "workspace-hint-current",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    for (case, workspace) in [
+        ("empty", String::new()),
+        ("relative", ".".to_owned()),
+        ("relative below the checkout", "docs".to_owned()),
+        ("missing", "/midcreek-no-such-exported-workspace".to_owned()),
+        (
+            "not a directory",
+            checkout.path().join("notes.txt").display().to_string(),
+        ),
+    ] {
+        let output = checkout
+            .path()
+            .join(format!("docs/site-{}", case.replace(' ', "-")));
+        let finished = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(checkout.path())
+            .env("GITHUB_WORKSPACE", &workspace)
+            .args([
+                "assemble",
+                "--current",
+                current.path().to_str().unwrap(),
+                "--result",
+                result_path.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+
+        assert_eq!(
+            finished.status.code(),
+            Some(1),
+            "an {case} workspace must not lose the checkout the run stands in: {} {}",
+            String::from_utf8_lossy(&finished.stdout),
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&finished.stderr).contains("refusing unsafe output path"),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert!(
+            !output.exists(),
+            "nothing may be published into the discovered checkout"
+        );
+    }
+}
+
 #[test]
 fn assemble_cli_reports_status_only_retention_without_failure_label() {
     let previous = fixture_site(

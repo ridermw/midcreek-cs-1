@@ -442,18 +442,42 @@ mod native {
     /// workflow declares nothing extra for this: a job that checked the
     /// repository out either exported `GITHUB_WORKSPACE` or is running inside
     /// the checkout.
+    ///
+    /// `GITHUB_WORKSPACE` is a hint, not an assertion, so an unusable one
+    /// falls through to discovery instead of replacing it. The empty string is
+    /// why that matters: it names no directory at all, yet `"".join(".git")`
+    /// is `.git`, which resolves against the working directory — so an empty
+    /// export used to "find" a workspace of `""`, stop the search, and leave a
+    /// run standing inside a checkout with no protected root but the
+    /// compiled-in one. A hint is therefore only taken when it is absolute,
+    /// is a directory, and really holds a `.git` entry, and a discovered
+    /// checkout is reported canonically, so the protected root is the same
+    /// path whichever route found it and however the run was launched.
     fn runtime_repository() -> PathBuf {
         env::var_os("GITHUB_WORKSPACE")
             .map(PathBuf::from)
-            .filter(|workspace| workspace.join(".git").exists())
+            .filter(|workspace| workspace.is_absolute() && workspace.is_dir())
+            .and_then(|workspace| checkout_root(&workspace))
             .or_else(|| {
-                let working = env::current_dir().ok()?;
-                working
-                    .ancestors()
-                    .find(|ancestor| ancestor.join(".git").exists())
-                    .map(Path::to_path_buf)
+                let working = fs::canonicalize(env::current_dir().ok()?).ok()?;
+                working.ancestors().find_map(checkout_root)
             })
             .unwrap_or_else(default_repository)
+    }
+
+    /// The canonical path of one candidate directory that really is a
+    /// checkout.
+    ///
+    /// A `.git` entry is enough and is not required to be a directory: a
+    /// worktree and a submodule both carry a `.git` file naming their real
+    /// git directory, and both are checkouts an output may not be written
+    /// into.
+    fn checkout_root(candidate: &Path) -> Option<PathBuf> {
+        candidate
+            .join(".git")
+            .exists()
+            .then(|| fs::canonicalize(candidate).ok())
+            .flatten()
     }
 
     // -----------------------------------------------------------------------

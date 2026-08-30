@@ -343,23 +343,19 @@ mod output_validation_contract {
         );
     }
 
-    /// A published page is served from a URL, so no location on the machine
-    /// that built it belongs in one — in rendered text, in an attribute, or
-    /// anywhere else in the document. The rule names the paths this run really
-    /// used rather than guessing which absolute-looking prose is a leak.
+    /// A published page is served from a URL, so the checkout it was published
+    /// from never belongs in one — in rendered text, in an attribute, or
+    /// anywhere else in the document. The rule names the repository and the
+    /// output this publication was handed rather than guessing which
+    /// absolute-looking prose is a leak.
     #[test]
     fn rejects_a_path_of_the_machine_that_published_the_page() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let mut leaks = vec![
+        let leaks = [
             repository.join("docs/reference").display().to_string(),
             fs::canonicalize(repository).unwrap().display().to_string(),
             "file:///anywhere/at/all".to_owned(),
         ];
-        leaks.extend(
-            home.filter(|home| home.is_absolute())
-                .map(|home| home.join("checkout/site").display().to_string()),
-        );
 
         for leak in leaks {
             for (label, mutation) in [
@@ -372,13 +368,10 @@ mod output_validation_contract {
                     html.replace("Render the progress hub", &injected)
                 });
 
-                // The site root is itself one of this run's own locations, so
-                // the guard is asked about the repository it published from.
-                let result = midcreek_cs_1::sitegen::validate_site_output_in(
-                    repository,
-                    site.root(),
-                    &fixture("green/progress.json"),
-                );
+                // The public entry point declares the compiled-in checkout as
+                // the repository, which is the one this build really published
+                // from.
+                let result = validate_site_output(site.root(), &fixture("green/progress.json"));
                 assert!(
                     matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
                         if message.contains("path of the publishing machine")),
@@ -388,11 +381,33 @@ mod output_validation_contract {
         }
     }
 
-    /// The directory a page was published into is a location on the same
-    /// machine, and a build that names its own output is leaking the runner's
-    /// layout just as surely as one that names the checkout.
+    /// The directory a page was published into is one of the two locations
+    /// this publication was handed, and a build that names its own output is
+    /// leaking the runner's layout just as surely as one that names the
+    /// checkout. The directory that *encloses* the output is not: it is
+    /// nothing this run chose, and refusing it would be refusing whatever
+    /// shared root the host happens to hand out. This proves the output root
+    /// itself is what decides, not the temporary root it sits under.
     #[test]
     fn rejects_the_output_directory_the_page_was_published_into() {
+        let enclosing = std::env::temp_dir().display().to_string();
+        let staged = build_fixture_site("green").unwrap();
+        assert!(
+            staged.root().starts_with(&enclosing),
+            "this fixture publishes below {enclosing}"
+        );
+        mutate_index(&staged, |html| {
+            html.replace(
+                "Render the progress hub",
+                &format!("Staged below {enclosing}"),
+            )
+        });
+        assert_eq!(
+            validate_site_output(staged.root(), &fixture("green/progress.json")),
+            Ok(()),
+            "the root the output happens to sit under is not this publication's own"
+        );
+
         let site = build_fixture_site("green").unwrap();
         let output = site.root().display().to_string();
         mutate_index(&site, |html| {
@@ -405,6 +420,99 @@ mod output_validation_contract {
             matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
                 if message.contains("path of the publishing machine")),
             "{result:?}"
+        );
+    }
+
+    /// The repository a run publishes from is whatever root the caller named,
+    /// and a shallow one is still a checkout. Skipping roots with too few
+    /// components to look "identifying" was a guess about path shapes: `/srv`
+    /// is an ordinary place to check a repository out, and a page that names
+    /// it names the machine that built it.
+    #[test]
+    fn a_shallow_declared_repository_is_still_the_checkout_it_names() {
+        for root in ["/srv", "/srv/hub"] {
+            let site = build_fixture_site("green").unwrap();
+            mutate_index(&site, |html| {
+                html.replace(
+                    "Render the progress hub",
+                    &format!("Published from {root}/docs/reference"),
+                )
+            });
+
+            let result = midcreek_cs_1::sitegen::validate_site_output_in(
+                Path::new(root),
+                site.root(),
+                &fixture("green/progress.json"),
+            );
+            assert!(
+                matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                    if message.contains("path of the publishing machine")),
+                "{root} is the declared checkout: {result:?}"
+            );
+        }
+    }
+
+    /// The same bytes, checked against the same declared repository and
+    /// output, must reach the same verdict on every machine and from every
+    /// working directory. A gate that consulted the environment publishes a
+    /// page on a laptop and refuses the identical page on the runner, which
+    /// makes the check unreproducible and its failures unexplainable.
+    ///
+    /// The page below names this host's home directory, its temporary root,
+    /// the working directory the suite runs in — which is also the checkout
+    /// this binary was compiled in — and the two paths a GitHub runner
+    /// exports. None of them is the repository or the output this publication
+    /// was handed, so none of them decides anything.
+    #[test]
+    fn the_hosts_environment_never_decides_whether_a_page_is_publishable() {
+        let foreign_checkout = "/home/runner/work/other-project/other-project";
+        let mut ambient = vec![
+            std::env::temp_dir().display().to_string(),
+            std::env::current_dir().unwrap().display().to_string(),
+            foreign_checkout.to_owned(),
+            "/home/runner/_temp/other-project".to_owned(),
+        ];
+        ambient.extend(
+            ["HOME", "USERPROFILE"]
+                .into_iter()
+                .filter_map(std::env::var_os)
+                .map(|value| std::path::PathBuf::from(value).display().to_string()),
+        );
+
+        let site = build_fixture_site("green").unwrap();
+        for (index, value) in ambient.iter().enumerate() {
+            mutate_index(&site, |html| {
+                html.replace(
+                    "Render the progress hub",
+                    &format!("Ambient {index}: {value}. Render the progress hub"),
+                )
+            });
+        }
+
+        // A repository that is not on this machine at all: only what the
+        // caller declared can matter, so nothing has to resolve.
+        let declared = std::env::temp_dir().join("midcreek-declared-checkout-elsewhere");
+        assert_eq!(
+            midcreek_cs_1::sitegen::validate_site_output_in(
+                &declared,
+                site.root(),
+                &fixture("green/progress.json"),
+            ),
+            Ok(()),
+            "no value the host happens to carry may decide a publication"
+        );
+
+        // The very same bytes are refused the moment the caller declares the
+        // checkout they name: the verdict follows the declaration.
+        let result = midcreek_cs_1::sitegen::validate_site_output_in(
+            Path::new(foreign_checkout),
+            site.root(),
+            &fixture("green/progress.json"),
+        );
+        assert!(
+            matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                if message.contains("path of the publishing machine")),
+            "the declared repository decides, whichever machine it is on: {result:?}"
         );
     }
 
@@ -482,6 +590,19 @@ mod output_validation_contract {
             .index_html();
         assert!(
             published.contains("/var/lib/midcreek/seed.json"),
+            "{published}"
+        );
+
+        // Another machine's checkout is prose too. It is not this run's
+        // repository or output, and the page renders it exactly as written
+        // wherever the page is validated.
+        inputs.repo.commits[0].subject =
+            "fix: mirror /home/runner/work/other-project/other-project/docs".to_owned();
+        let published = build_site_from_inputs("commit-subject-foreign", &inputs)
+            .expect("a foreign checkout path in a subject is not this publication's")
+            .index_html();
+        assert!(
+            published.contains("/home/runner/work/other-project/other-project/docs"),
             "{published}"
         );
     }

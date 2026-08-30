@@ -2783,6 +2783,11 @@ fn retained_playable_is_consistent(output: &Path) -> bool {
     manifest.game_files == actual_files
 }
 
+/// Validates one generated page against the compiled-in checkout.
+///
+/// A caller that names no repository is a caller running from the checkout
+/// this binary was built in, so that is the repository this declares. A
+/// relocated run declares its own with [`validate_site_output_in`].
 pub fn validate_site_output(
     output: &Path,
     progress: &ProgressDocument,
@@ -2791,6 +2796,13 @@ pub fn validate_site_output(
 }
 
 /// Validates one generated page against the repository it was published from.
+///
+/// The verdict is a function of three things and nothing else: the bytes of
+/// `index.html`, the declared `repository`, and the declared `output`. Every
+/// rule below — one `<main>`, unique ids, alt text on every image, every local
+/// link and resource resolving, no path of this publication in the document,
+/// no inline script, a rendered plan heading per progress task — is decided
+/// from those, so the same page reaches the same verdict on any host.
 pub fn validate_site_output_in(
     repository: &Path,
     output: &Path,
@@ -4385,21 +4397,39 @@ fn validate_local_target(
     }
 }
 
-/// The first path of the publishing machine the generated page names, if any.
+/// The path of this publication the generated page names, if any.
 ///
-/// A published page is served from a URL, so no location on the machine that
-/// built it ever belongs in one. The rule is stated over the places this run
-/// really used — the repository it published from, the compiled-in checkout,
-/// the directory it published into, the working directory it resolved
-/// relative paths against, and the host roots the environment handed it —
-/// rather than over what an absolute path looks like. The page renders
-/// reserved prose (the plan, the progress document, commit subjects), and
-/// prose legitimately contains absolute paths like `/var/lib/foo` or the
-/// `/midcreek-cs-1/` URL prefix this project is served below. Guessing which
-/// of those is a leak tunes the guard to today's wording; naming this run's
-/// own paths states the invariant the page has to meet whatever it renders.
+/// A published page is served from a URL, so a location on the machine that
+/// built it never belongs in one. The rule is stated over exactly the two
+/// locations this publication was handed — the repository it published from
+/// and the directory it published into — each as it was given and as it
+/// canonicalizes, matched raw and HTML-escaped, anywhere in the document.
+///
+/// Nothing ambient decides the verdict: not `HOME`, not the system temporary
+/// directory, not the working directory, not `RUNNER_TEMP` or
+/// `GITHUB_WORKSPACE`, not the path this binary was compiled in. The same
+/// bytes checked against the same repository and output therefore reach the
+/// same verdict on any host and from any working directory, which is what
+/// makes a publication gate reproducible: a page that publishes on a
+/// developer's machine publishes on the runner, and a refusal can be
+/// explained by the document and the declaration alone. Callers that mean the
+/// compiled-in checkout say so by declaring it, which is what
+/// [`validate_site_output`] does.
+///
+/// Nothing about what an absolute path *looks like* decides it either. The
+/// page renders reserved prose — the plan, the progress document, commit
+/// subjects — and prose legitimately carries paths like `/var/lib/foo`, the
+/// `/midcreek-cs-1/` prefix this project is served below, or another
+/// machine's checkout. Link and resource targets are a separate and stricter
+/// rule: [`validate_local_target`] refuses an absolute or `file:` target in
+/// any `href` or `src` whatever it names.
+///
+/// This reads the generated HTML. The JSON this build publishes beside it is
+/// not scanned here and does not need to be: it is serialized from strict
+/// typed projections whose only path-shaped fields are artifact paths already
+/// proven relative and contained by [`resolve_artifact`].
 fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<String> {
-    for root in host_roots(repository, output) {
+    for root in publication_paths(repository, output) {
         if html.contains(&root) || html.contains(&escape_html(&root)) {
             return Some(root);
         }
@@ -4410,42 +4440,32 @@ fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<S
     html.contains("file://").then(|| "file://".to_owned())
 }
 
-/// Every filesystem location this run knows to be on the publishing machine.
+/// The two locations of this publication, in every form a leak could carry.
 ///
-/// Each candidate is taken both as it was handed over and as it canonicalizes,
-/// because a leak carries whichever form the code that leaked it held. A root
-/// shallower than two components — `/`, `/tmp`, `/home` — is a shared system
-/// location rather than an identifying one, and matching it would be a guess
-/// about prose again, so it is not used.
-fn host_roots(repository: &Path, output: &Path) -> Vec<String> {
-    let mut candidates = vec![
-        repository.to_path_buf(),
-        default_repository(),
-        output.to_path_buf(),
-        std::env::temp_dir(),
-    ];
-    candidates.extend(std::env::current_dir());
-    candidates.extend(
-        ["HOME", "USERPROFILE", "RUNNER_TEMP", "GITHUB_WORKSPACE"]
-            .into_iter()
-            .filter_map(std::env::var_os)
-            .map(PathBuf::from),
-    );
-
+/// Each is taken both as it was handed over and as it canonicalizes, because
+/// whatever leaked it held whichever form it happened to hold. A relative
+/// candidate names no location on its own, so only the location it resolves to
+/// is used. The filesystem root is skipped: `/` prefixes every absolute path
+/// there is, so matching it would be matching path shapes again rather than
+/// this publication's own locations. Every real checkout and every real output
+/// directory has at least one component below the root, including a
+/// single-component one like `/srv`.
+fn publication_paths(repository: &Path, output: &Path) -> Vec<String> {
     let mut roots = Vec::new();
-    for candidate in candidates {
-        for path in [Some(candidate.clone()), fs::canonicalize(&candidate).ok()]
-            .into_iter()
-            .flatten()
+    for candidate in [repository, output] {
+        for path in [
+            Some(candidate.to_path_buf()),
+            fs::canonicalize(candidate).ok(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            let identifying = path.is_absolute()
+            let names_a_location = path.is_absolute()
                 && path
                     .components()
-                    .filter(|component| matches!(component, std::path::Component::Normal(_)))
-                    .count()
-                    >= 2;
+                    .any(|component| matches!(component, Component::Normal(_)));
             let text = path.to_string_lossy().into_owned();
-            if identifying && !roots.contains(&text) {
+            if names_a_location && !roots.contains(&text) {
                 roots.push(text);
             }
         }
