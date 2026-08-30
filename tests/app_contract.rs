@@ -20,6 +20,8 @@ use bevy::{
         settings::{RenderCreation, WgpuSettings},
     },
     time::TimeUpdateStrategy,
+    ui::{ComputedNode, UiGlobalTransform},
+    window::WindowResized,
 };
 use midcreek_cs_1::{
     CellShiftPlugin, CellShiftSet,
@@ -51,6 +53,13 @@ use midcreek_cs_1::{
         SceneValidationError, TEAL_ACCENT, VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
         VisualSpec, WALKABLE_CELL_SIZE, WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT,
         WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS,
+    },
+    hud::{
+        BADGE_HEIGHT, BADGE_WIDTH, BadgeKind, BadgeVisibility, CONTROLS_PANEL_HEIGHT,
+        ControlHintCap, ControlHintCapLabel, ControlsPanel, HUD_MARGIN, HudControl, HudError,
+        HudReport, HudRoot, HudStatus, HudStatusChip, HudStatusLabel, LEADER_WIDTH,
+        QueueHeaderLabel, QueueRowLabel, QueueRowNode, QueueRowSeverityChip, QueueRowStateChip,
+        RackBadgeNode, RackLeaderLine, TicketQueuePanel, severity_role, state_role,
     },
     operations::{
         FAULT_INTERVAL, FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction,
@@ -5202,4 +5211,990 @@ fn recurring_ticket_journey() {
     assert!(app.world().resource::<PlayerRigReport>().is_healthy());
     assert_eq!(FAULT_INTERVAL, Duration::from_secs(4));
     assert_eq!(RESOLVED_DISPLAY, Duration::from_secs(2));
+}
+
+// ---------------------------------------------------------------------------
+// Operations HUD contracts
+// ---------------------------------------------------------------------------
+
+fn hud_report(app: &App) -> HudReport {
+    app.world().resource::<HudReport>().clone()
+}
+
+/// The one entity carrying a marker component.
+fn hud_single<T: Component>(app: &mut App) -> Entity {
+    let entities = app
+        .world_mut()
+        .query_filtered::<Entity, With<T>>()
+        .iter(app.world())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entities.len(),
+        1,
+        "exactly one {} must exist",
+        std::any::type_name::<T>()
+    );
+    entities[0]
+}
+
+/// The real laid-out rectangle of one UI node, in logical px.
+fn ui_rect(app: &App, entity: Entity) -> Rect {
+    let node = *app
+        .world()
+        .get::<ComputedNode>(entity)
+        .expect("a HUD node carries a ComputedNode");
+    let transform = *app
+        .world()
+        .get::<UiGlobalTransform>(entity)
+        .expect("a HUD node carries a UiGlobalTransform");
+    let scale = node.inverse_scale_factor;
+    let center = transform.translation * scale;
+    let half = node.size * 0.5 * scale;
+    Rect::from_corners(center - half, center + half)
+}
+
+fn ui_displayed(app: &App, entity: Entity) -> bool {
+    app.world()
+        .get::<Node>(entity)
+        .expect("a HUD node carries a Node")
+        .display
+        != Display::None
+}
+
+fn ui_text(app: &App, entity: Entity) -> String {
+    app.world()
+        .get::<Text>(entity)
+        .expect("a HUD label carries Text")
+        .0
+        .clone()
+}
+
+fn ui_background(app: &App, entity: Entity) -> Srgba {
+    app.world()
+        .get::<BackgroundColor>(entity)
+        .expect("a HUD node carries a BackgroundColor")
+        .0
+        .to_srgba()
+}
+
+/// Every queue row entity, by slot.
+fn queue_rows_by_slot(app: &mut App) -> Vec<(usize, Entity)> {
+    let mut rows = app
+        .world_mut()
+        .query::<(Entity, &QueueRowNode)>()
+        .iter(app.world())
+        .map(|(entity, row)| (row.slot, entity))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(slot, _)| *slot);
+    rows
+}
+
+fn queue_row_labels(app: &mut App) -> Vec<(usize, Entity)> {
+    let mut labels = app
+        .world_mut()
+        .query::<(Entity, &QueueRowLabel)>()
+        .iter(app.world())
+        .map(|(entity, label)| (label.slot, entity))
+        .collect::<Vec<_>>();
+    labels.sort_by_key(|(slot, _)| *slot);
+    labels
+}
+
+fn queue_row_severity_chips(app: &mut App) -> Vec<(usize, Entity)> {
+    let mut chips = app
+        .world_mut()
+        .query::<(Entity, &QueueRowSeverityChip)>()
+        .iter(app.world())
+        .map(|(entity, chip)| (chip.slot, entity))
+        .collect::<Vec<_>>();
+    chips.sort_by_key(|(slot, _)| *slot);
+    chips
+}
+
+fn queue_row_state_chips(app: &mut App) -> Vec<(usize, Entity)> {
+    let mut chips = app
+        .world_mut()
+        .query::<(Entity, &QueueRowStateChip)>()
+        .iter(app.world())
+        .map(|(entity, chip)| (chip.slot, entity))
+        .collect::<Vec<_>>();
+    chips.sort_by_key(|(slot, _)| *slot);
+    chips
+}
+
+fn rack_badge_nodes(app: &mut App) -> Vec<(usize, Entity)> {
+    let mut badges = app
+        .world_mut()
+        .query::<(Entity, &RackBadgeNode)>()
+        .iter(app.world())
+        .map(|(entity, badge)| (badge.rack, entity))
+        .collect::<Vec<_>>();
+    badges.sort_by_key(|(rack, _)| *rack);
+    badges
+}
+
+fn rack_leader_lines(app: &mut App) -> Vec<(usize, Entity)> {
+    let mut leaders = app
+        .world_mut()
+        .query::<(Entity, &RackLeaderLine)>()
+        .iter(app.world())
+        .map(|(entity, leader)| (leader.rack, entity))
+        .collect::<Vec<_>>();
+    leaders.sort_by_key(|(rack, _)| *rack);
+    leaders
+}
+
+fn control_caps(app: &mut App) -> Vec<(HudControl, Entity)> {
+    app.world_mut()
+        .query::<(Entity, &ControlHintCap)>()
+        .iter(app.world())
+        .map(|(entity, cap)| (cap.control, entity))
+        .collect()
+}
+
+/// Resizes the primary window exactly the way the windowing backend does, so
+/// the camera and the UI layout both see the change.
+fn resize_window(app: &mut App, width: f32, height: f32) {
+    let window = app
+        .world_mut()
+        .query_filtered::<Entity, With<Window>>()
+        .iter(app.world())
+        .next()
+        .expect("the app has a primary window");
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .expect("the primary window carries a Window")
+        .resolution
+        .set(width, height);
+    app.world_mut().write_message(WindowResized {
+        window,
+        width,
+        height,
+    });
+    pump(app, 3);
+}
+
+/// The central half-width, half-height rectangle the fixed panels must never
+/// cover.
+fn play_rectangle(viewport: Vec2) -> Rect {
+    Rect::from_corners(viewport * 0.25, viewport * 0.75)
+}
+
+fn hud_app(assets: &Path) -> App {
+    let mut app = operations_hall(assets);
+    app.update();
+    assert!(
+        hud_report(&app).is_healthy(),
+        "the HUD started with errors: {:?}",
+        hud_report(&app).errors
+    );
+    app
+}
+
+/// Fills the queue with the first three seeded tickets.
+fn fill_queue(app: &mut App) {
+    pump(app, FAULT_FRAMES * 3);
+    assert_eq!(ticket_queue(app).len(), MAX_ACTIVE_TICKETS);
+}
+
+/// Stands the technician in the middle of the hall, where the camera frames
+/// every rack row's badge anchor at the initial heading.
+fn center_player(app: &mut App) {
+    place_player(app, Vec2::ZERO);
+    hold(app, &[]);
+    pump(app, 4);
+}
+
+/// Whether one viewport point is inside the viewport rectangle.
+fn on_screen(point: Vec2, viewport: Vec2) -> bool {
+    (0.0..=viewport.x).contains(&point.x) && (0.0..=viewport.y).contains(&point.y)
+}
+
+#[test]
+fn operations_hud_shows_the_healthy_state_with_no_ticket_and_no_badge() {
+    let mut app = hud_app(&repo_assets());
+    let report = hud_report(&app);
+
+    assert!(ticket_queue(&app).is_empty());
+    assert!(report.rows.is_empty(), "{:?}", report.rows);
+    assert_eq!(report.status, HudStatus::AllHealthy);
+    assert!(!report.movement_locked);
+    assert_eq!(report.badges.len(), roster(&app).len());
+    for badge in &report.badges {
+        assert_eq!(badge.kind, None, "rack {} shows a badge", badge.rack);
+        assert_eq!(badge.visibility, BadgeVisibility::NoTicket);
+    }
+    assert!(report.shown_badges().is_empty());
+
+    for (slot, entity) in queue_rows_by_slot(&mut app) {
+        assert!(!ui_displayed(&app, entity), "row {slot} is visible");
+    }
+    for (rack, entity) in rack_badge_nodes(&mut app) {
+        assert!(!ui_displayed(&app, entity), "badge {rack} is visible");
+    }
+    for (rack, entity) in rack_leader_lines(&mut app) {
+        assert!(!ui_displayed(&app, entity), "leader {rack} is visible");
+    }
+
+    let header = hud_single::<QueueHeaderLabel>(&mut app);
+    assert_eq!(ui_text(&app, header), "OPS QUEUE 0/3");
+    let status = hud_single::<HudStatusLabel>(&mut app);
+    assert_eq!(ui_text(&app, status), "All racks healthy");
+    let chip = hud_single::<HudStatusChip>(&mut app);
+    assert_eq!(ui_background(&app, chip), HEALTHY_GREEN);
+}
+
+#[test]
+fn operations_hud_lists_one_then_three_tickets_in_queue_priority_order() {
+    let mut app = hud_app(&repo_assets());
+
+    // One ticket.
+    pump(&mut app, FAULT_FRAMES);
+    let first = ticket_queue(&app).ordered()[0].clone();
+    let report = hud_report(&app);
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.rows[0].ticket, first.id);
+    assert_eq!(report.rows[0].rack, first.rack);
+    assert_eq!(report.status, HudStatus::TicketsOpen);
+    let rows = queue_rows_by_slot(&mut app);
+    assert!(ui_displayed(&app, rows[0].1));
+    assert!(!ui_displayed(&app, rows[1].1));
+    assert!(!ui_displayed(&app, rows[2].1));
+
+    // Three tickets, in the queue's own global priority order.
+    pump(&mut app, FAULT_FRAMES * 2);
+    let queue = ticket_queue(&app);
+    assert_eq!(queue.len(), MAX_ACTIVE_TICKETS);
+    let report = hud_report(&app);
+    assert_eq!(
+        report
+            .rows
+            .iter()
+            .map(|row| (row.slot, row.ticket, row.rack, row.severity))
+            .collect::<Vec<_>>(),
+        queue
+            .ordered()
+            .iter()
+            .enumerate()
+            .map(|(slot, ticket)| (slot, ticket.id, ticket.rack, ticket.severity))
+            .collect::<Vec<_>>(),
+        "the HUD renders the live queue order, never its own"
+    );
+
+    let header = hud_single::<QueueHeaderLabel>(&mut app);
+    assert_eq!(ui_text(&app, header), "OPS QUEUE 3/3");
+
+    // The rendered rows carry the real labels, colours, and vertical order.
+    let labels = queue_row_labels(&mut app);
+    let severity_chips = queue_row_severity_chips(&mut app);
+    let state_chips = queue_row_state_chips(&mut app);
+    let row_nodes = queue_rows_by_slot(&mut app);
+    let mut previous_bottom = f32::NEG_INFINITY;
+    for row in &report.rows {
+        let ticket = queue
+            .get(row.ticket)
+            .expect("every rendered row names a live ticket");
+        assert_eq!(
+            ui_text(&app, labels[row.slot].1),
+            format!(
+                "{} R{:02} {}",
+                ticket.id,
+                ticket.rack + 1,
+                ticket.severity.label()
+            )
+        );
+        assert_eq!(
+            ui_background(&app, severity_chips[row.slot].1),
+            severity_role(ticket.severity).color(),
+            "row {} shows the wrong severity colour",
+            row.slot
+        );
+        assert_eq!(
+            ui_background(&app, state_chips[row.slot].1),
+            state_role(row.state).color()
+        );
+        let rect = ui_rect(&app, row_nodes[row.slot].1);
+        assert!(
+            rect.min.y > previous_bottom,
+            "row {} is not below row {}",
+            row.slot,
+            row.slot.saturating_sub(1)
+        );
+        previous_bottom = rect.min.y;
+    }
+
+    // Every faulted rack the camera can see carries the red badge, and no
+    // other rack does.
+    center_player(&mut app);
+    let report = hud_report(&app);
+    let viewport = viewport_size(&mut app);
+    let mut expected = queue
+        .ordered()
+        .iter()
+        .map(|ticket| (ticket.rack, BadgeKind::Fault))
+        .collect::<Vec<_>>();
+    expected.sort();
+    for (rack, _) in &expected {
+        let anchor = report
+            .badge(*rack)
+            .expect("a faulted rack has a badge")
+            .anchor;
+        assert!(
+            anchor.is_some_and(|anchor| on_screen(anchor, viewport)),
+            "rack {rack} must be framed from the middle of the hall, got {anchor:?}"
+        );
+    }
+    let mut shown_sorted = report.shown_badges();
+    shown_sorted.sort();
+    assert_eq!(shown_sorted, expected, "got {shown_sorted:?}");
+    for (rack, entity) in rack_badge_nodes(&mut app) {
+        let visible = expected.iter().any(|(faulted, _)| *faulted == rack);
+        assert_eq!(ui_displayed(&app, entity), visible, "badge {rack}");
+        if visible {
+            assert_eq!(ui_background(&app, entity), FAULT_RED);
+        }
+    }
+}
+
+#[test]
+fn operations_hud_follows_the_repair_resolve_and_removal_states() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    let target = ticket_queue(&app).ordered()[0].clone();
+
+    let spot = repair_spot(&app, target.rack);
+    place_player(&mut app, spot);
+    hold(&mut app, &[]);
+    app.update();
+    press_space(&mut app);
+
+    // Repairing: blue badge, blue row state, locked controls.
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Repairing);
+    let report = hud_report(&app);
+    assert_eq!(report.status, HudStatus::Repairing);
+    assert!(report.movement_locked);
+    assert_eq!(
+        report
+            .badge(target.rack)
+            .expect("the rack has a badge")
+            .kind,
+        Some(BadgeKind::Repairing)
+    );
+    let repairing_row = report
+        .rows
+        .iter()
+        .find(|row| row.ticket == target.id)
+        .expect("the repairing ticket is still queued");
+    assert_eq!(repairing_row.state, RackState::Repairing);
+    let badge = rack_badge_nodes(&mut app)
+        .into_iter()
+        .find(|(rack, _)| *rack == target.rack)
+        .expect("the repairing rack has a badge node")
+        .1;
+    assert_eq!(ui_background(&app, badge), WORKER_HARD_HAT);
+    for (control, entity) in control_caps(&mut app) {
+        assert_eq!(
+            ui_background(&app, entity),
+            control.cap_role(true).color(),
+            "{control:?} does not show the locked repair"
+        );
+    }
+
+    // Halfway through the repair the progress bar is halfway across.
+    pump(&mut app, REPAIR_FRAMES / 2);
+    let report = hud_report(&app);
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.ticket == target.id)
+        .expect("still queued");
+    assert!(
+        (row.progress - 0.5).abs() < 0.05,
+        "the repair bar reads {}",
+        row.progress
+    );
+
+    // Resolved: healthy green badge while the ticket is still queued.
+    pump(&mut app, REPAIR_FRAMES / 2 + 1);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Resolved);
+    let report = hud_report(&app);
+    assert!(!report.movement_locked);
+    assert_eq!(
+        report.badge(target.rack).expect("badge").kind,
+        Some(BadgeKind::Resolved)
+    );
+    assert_eq!(ui_background(&app, badge), HEALTHY_GREEN);
+    assert!(
+        report.rows.iter().any(|row| row.ticket == target.id),
+        "the resolved ticket is still in the queue and still on the HUD"
+    );
+    for (control, entity) in control_caps(&mut app) {
+        assert_eq!(ui_background(&app, entity), control.cap_role(false).color());
+    }
+
+    // Removed: the row disappears and the badge goes out with it.
+    pump(&mut app, RESOLVED_FRAMES + 1);
+    assert_eq!(ticket_queue(&app).get(target.id), None);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Cooldown);
+    let report = hud_report(&app);
+    assert!(
+        !report.rows.iter().any(|row| row.ticket == target.id),
+        "a removed ticket must leave the HUD"
+    );
+    assert_eq!(report.badge(target.rack).expect("badge").kind, None);
+    assert_eq!(
+        report.badge(target.rack).expect("badge").visibility,
+        BadgeVisibility::NoTicket
+    );
+    assert!(!ui_displayed(&app, badge));
+    assert_eq!(report.rows.len(), ticket_queue(&app).len());
+    assert!(hud_report(&app).is_healthy());
+}
+
+#[test]
+fn operations_hud_status_reports_a_real_out_of_range_rejection() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    hold(&mut app, &[]);
+    app.update();
+    press_space(&mut app);
+
+    assert!(matches!(
+        last_interaction(&app).outcome,
+        InteractionOutcome::OutOfRange { .. }
+    ));
+    let report = hud_report(&app);
+    assert_eq!(report.status, HudStatus::MoveCloser);
+    let status = hud_single::<HudStatusLabel>(&mut app);
+    assert_eq!(ui_text(&app, status), "Move closer");
+    let chip = hud_single::<HudStatusChip>(&mut app);
+    assert_eq!(ui_background(&app, chip), SIGNATURE_YELLOW);
+    assert!(!report.movement_locked, "a rejection never locks movement");
+}
+
+/// Checks every badge against the real projection of its own anchor and
+/// returns how many drawn badges it verified.
+fn assert_badges_match_the_real_projection(app: &mut App) -> usize {
+    let viewport = viewport_size(app);
+    let report = hud_report(app);
+    assert_eq!(report.viewport, viewport);
+    assert!(report.is_healthy(), "{:?}", report.errors);
+
+    let mut checked = 0usize;
+    for badge in &report.badges {
+        let projected = viewport_of_world(app, badge.anchor_world);
+        let visible = on_screen(projected, viewport);
+        let Some(kind) = badge.kind else {
+            assert_eq!(badge.visibility, BadgeVisibility::NoTicket);
+            continue;
+        };
+        assert_eq!(kind, BadgeKind::Fault);
+        assert_eq!(
+            badge.anchor.expect("a projected badge records its anchor"),
+            projected,
+            "rack {} anchored somewhere other than the real projection",
+            badge.rack
+        );
+        assert_eq!(
+            badge.visibility == BadgeVisibility::Shown,
+            visible,
+            "rack {} visibility disagrees with its projected anchor {projected:?}",
+            badge.rack
+        );
+        if !visible {
+            continue;
+        }
+        checked += 1;
+
+        let entity = rack_badge_nodes(app)
+            .into_iter()
+            .find(|(rack, _)| *rack == badge.rack)
+            .expect("a shown badge has a node")
+            .1;
+        assert!(ui_displayed(app, entity));
+        let rect = ui_rect(app, entity);
+        assert_eq!(
+            rect.size(),
+            Vec2::new(BADGE_WIDTH, BADGE_HEIGHT),
+            "badges are fixed size in screen space"
+        );
+        assert!(
+            rect.min.x >= 0.0
+                && rect.min.y >= 0.0
+                && rect.max.x <= viewport.x
+                && rect.max.y <= viewport.y,
+            "rack {} badge left the viewport: {rect:?}",
+            badge.rack
+        );
+        let center = badge.center.expect("a shown badge records its centre");
+        assert!(
+            rect.center().distance(center) < 0.75,
+            "rack {} badge laid out at {:?}, report says {center:?}",
+            badge.rack,
+            rect.center()
+        );
+
+        // The leader line really ends on the projected rack anchor.
+        let leader = rack_leader_lines(app)
+            .into_iter()
+            .find(|(rack, _)| *rack == badge.rack)
+            .expect("a shown badge has a leader")
+            .1;
+        assert!(ui_displayed(app, leader), "rack {} leader", badge.rack);
+        let node = *app
+            .world()
+            .get::<ComputedNode>(leader)
+            .expect("the leader carries a ComputedNode");
+        let transform = *app
+            .world()
+            .get::<UiGlobalTransform>(leader)
+            .expect("the leader carries a UiGlobalTransform");
+        let scale = node.inverse_scale_factor;
+        let tip = transform.transform_point2(Vec2::new(0.0, node.size.y * 0.5)) * scale;
+        assert!(
+            tip.distance(projected) < 1.5,
+            "rack {} leader ends at {tip:?} instead of the anchor {projected:?}",
+            badge.rack
+        );
+        assert!(
+            (node.size.x * scale - LEADER_WIDTH).abs() < 0.75,
+            "leader lines stay thin, got {}",
+            node.size.x * scale
+        );
+    }
+    checked
+}
+
+#[test]
+fn operations_hud_badges_track_the_projected_rack_at_every_heading_and_mid_tween() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    center_player(&mut app);
+
+    let mut samples = 0usize;
+    let mut headings = Vec::new();
+    for _ in 0..4 {
+        assert!(orbit(&app).is_settled(), "each sweep step starts settled");
+        headings.push(orbit(&app).heading());
+        samples += assert_badges_match_the_real_projection(&mut app);
+
+        // A genuine mid-tween frame, where the camera is between headings.
+        tap(&mut app, &[KeyCode::KeyE]);
+        pump(&mut app, QUARTER_TURN_FRAMES / 2);
+        assert!(!orbit(&app).is_settled(), "this sample must be mid-tween");
+        samples += assert_badges_match_the_real_projection(&mut app);
+
+        pump(&mut app, QUARTER_TURN_FRAMES);
+        assert!(orbit(&app).is_settled(), "the quarter turn must complete");
+    }
+    assert_eq!(
+        headings,
+        vec![
+            CameraHeading::NorthEast,
+            CameraHeading::SouthEast,
+            CameraHeading::SouthWest,
+            CameraHeading::NorthWest,
+        ],
+        "the sweep must visit every heading"
+    );
+    assert!(
+        samples >= 16,
+        "the sweep must have checked real badges, got {samples}"
+    );
+}
+
+#[test]
+fn operations_hud_clamps_an_edge_badge_and_still_points_its_leader_at_the_rack() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    let viewport = viewport_size(&mut app);
+    let edge = BADGE_WIDTH * 0.5 + 6.0;
+
+    // Walk the technician until a faulted rack's anchor sits close enough to a
+    // viewport edge that the fixed badge box has to be clamped sideways.
+    let mut found = None;
+    'search: for step in 0..80 {
+        let along = -18.0 + step as f32 * 0.45;
+        for lateral in [-18.0f32, -9.0, 0.0, 9.0, 18.0] {
+            place_player(&mut app, Vec2::new(lateral, along));
+            hold(&mut app, &[]);
+            pump(&mut app, 2);
+            let report = hud_report(&app);
+            for badge in &report.badges {
+                if badge.visibility != BadgeVisibility::Shown {
+                    continue;
+                }
+                let anchor = badge.anchor.expect("a shown badge records its anchor");
+                if anchor.x < edge || anchor.x > viewport.x - edge {
+                    found = Some(badge.rack);
+                    break 'search;
+                }
+            }
+        }
+    }
+    let rack = found.expect("no player position pushed a badge against a side edge");
+
+    let report = hud_report(&app);
+    let badge = *report.badge(rack).expect("badge");
+    let anchor = badge.anchor.expect("anchor");
+    let center = badge.center.expect("centre");
+    assert_ne!(
+        center.x, anchor.x,
+        "an edge badge must be clamped sideways, so its leader is not vertical"
+    );
+
+    let entity = rack_badge_nodes(&mut app)
+        .into_iter()
+        .find(|(index, _)| *index == rack)
+        .expect("badge node")
+        .1;
+    let rect = ui_rect(&app, entity);
+    assert_eq!(rect.size(), Vec2::new(BADGE_WIDTH, BADGE_HEIGHT));
+    assert!(
+        rect.min.x >= 0.0
+            && rect.min.y >= 0.0
+            && rect.max.x <= viewport.x
+            && rect.max.y <= viewport.y,
+        "the clamped badge {rect:?} still left the viewport {viewport:?}"
+    );
+
+    let leader = rack_leader_lines(&mut app)
+        .into_iter()
+        .find(|(index, _)| *index == rack)
+        .expect("leader")
+        .1;
+    assert!(ui_displayed(&app, leader));
+    let node = *app
+        .world()
+        .get::<ComputedNode>(leader)
+        .expect("ComputedNode");
+    let transform = *app
+        .world()
+        .get::<UiGlobalTransform>(leader)
+        .expect("UiGlobalTransform");
+    let scale = node.inverse_scale_factor;
+    let tip = transform.transform_point2(Vec2::new(0.0, node.size.y * 0.5)) * scale;
+    assert!(
+        tip.distance(anchor) < 1.5,
+        "the tilted leader ends at {tip:?} instead of the anchor {anchor:?}"
+    );
+    assert!(hud_report(&app).is_healthy());
+}
+
+#[test]
+fn operations_hud_hides_a_badge_whose_rack_leaves_the_viewport() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+
+    // Walk the camera to the far corner so the west rack rows leave the view.
+    place_player(&mut app, Vec2::new(18.0, 18.0));
+    hold(&mut app, &[]);
+    pump(&mut app, 4);
+
+    let viewport = viewport_size(&mut app);
+    let report = hud_report(&app);
+    let mut hidden = 0usize;
+    for badge in &report.badges {
+        let Some(_) = badge.kind else { continue };
+        let projected = viewport_of_world(&mut app, badge.anchor_world);
+        let on_screen =
+            (0.0..=viewport.x).contains(&projected.x) && (0.0..=viewport.y).contains(&projected.y);
+        let entity = rack_badge_nodes(&mut app)
+            .into_iter()
+            .find(|(rack, _)| *rack == badge.rack)
+            .expect("badge node")
+            .1;
+        if on_screen {
+            assert_eq!(badge.visibility, BadgeVisibility::Shown);
+            assert!(ui_displayed(&app, entity));
+        } else {
+            hidden += 1;
+            assert_eq!(
+                badge.visibility,
+                BadgeVisibility::OffScreen,
+                "rack {} projected to {projected:?}",
+                badge.rack
+            );
+            assert!(!ui_displayed(&app, entity), "rack {} badge", badge.rack);
+            let leader = rack_leader_lines(&mut app)
+                .into_iter()
+                .find(|(rack, _)| *rack == badge.rack)
+                .expect("leader")
+                .1;
+            assert!(!ui_displayed(&app, leader));
+        }
+    }
+    assert!(
+        hidden > 0,
+        "the corner sample must push at least one faulted rack off screen"
+    );
+    assert!(report.is_healthy(), "an off-screen rack is not a failure");
+}
+
+#[test]
+fn operations_hud_panels_stay_on_screen_and_clear_of_the_play_rectangle() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+
+    for (width, height) in [
+        (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
+        (VERIFICATION_WINDOW_WIDTH, VERIFICATION_WINDOW_HEIGHT),
+    ] {
+        resize_window(&mut app, width as f32, height as f32);
+        let viewport = viewport_size(&mut app);
+        assert_eq!(viewport, Vec2::new(width as f32, height as f32));
+        assert_eq!(hud_report(&app).viewport, viewport);
+
+        let play = play_rectangle(viewport);
+        let queue_panel = hud_single::<TicketQueuePanel>(&mut app);
+        let controls_panel = hud_single::<ControlsPanel>(&mut app);
+        let queue = ui_rect(&app, queue_panel);
+        let controls = ui_rect(&app, controls_panel);
+        for (name, rect) in [("queue", queue), ("controls", controls)] {
+            assert!(
+                rect.min.x >= HUD_MARGIN - 0.5
+                    && rect.min.y >= HUD_MARGIN - 0.5
+                    && rect.max.x <= viewport.x - HUD_MARGIN + 0.5
+                    && rect.max.y <= viewport.y - HUD_MARGIN + 0.5,
+                "the {name} panel {rect:?} broke the {HUD_MARGIN} px margin at {viewport:?}"
+            );
+            assert!(rect.width() > 0.0 && rect.height() > 0.0, "{name} is empty");
+            assert!(
+                rect.intersect(play).is_empty(),
+                "the {name} panel {rect:?} covers the play rectangle {play:?}"
+            );
+        }
+        assert!(
+            queue.max.x <= play.min.x,
+            "the queue stack {queue:?} must stay left of the play rectangle {play:?}"
+        );
+        assert!(
+            controls.min.y >= play.max.y,
+            "the control strip {controls:?} must stay below the play rectangle {play:?}"
+        );
+        assert_eq!(queue.min, Vec2::splat(HUD_MARGIN), "at {viewport:?}");
+        assert!(
+            (controls.max - (viewport - Vec2::splat(HUD_MARGIN)))
+                .abs()
+                .max_element()
+                < 0.5,
+            "the control strip must stay pinned to the bottom-right, got {controls:?}"
+        );
+
+        // The rows are still ordered, still on screen, and still inside their
+        // panel.
+        let report = hud_report(&app);
+        assert_eq!(report.rows.len(), MAX_ACTIVE_TICKETS);
+        let mut previous = f32::NEG_INFINITY;
+        for (slot, entity) in queue_rows_by_slot(&mut app) {
+            assert!(ui_displayed(&app, entity), "row {slot} vanished");
+            let rect = ui_rect(&app, entity);
+            assert!(rect.min.y > previous, "row {slot} is out of order");
+            previous = rect.min.y;
+            assert!(
+                queue.contains(rect.min) && queue.contains(rect.max),
+                "row {slot} {rect:?} escaped its panel {queue:?}"
+            );
+            assert!(rect.intersect(play).is_empty());
+        }
+
+        // Every visible badge is still fully on screen at this size.
+        for badge in &report.badges {
+            if badge.visibility != BadgeVisibility::Shown {
+                continue;
+            }
+            let entity = rack_badge_nodes(&mut app)
+                .into_iter()
+                .find(|(rack, _)| *rack == badge.rack)
+                .expect("badge node")
+                .1;
+            let rect = ui_rect(&app, entity);
+            assert_eq!(rect.size(), Vec2::new(BADGE_WIDTH, BADGE_HEIGHT));
+            assert!(
+                rect.min.x >= 0.0
+                    && rect.min.y >= 0.0
+                    && rect.max.x <= viewport.x
+                    && rect.max.y <= viewport.y,
+                "rack {} badge {rect:?} left the {viewport:?} viewport",
+                badge.rack
+            );
+        }
+    }
+}
+
+#[test]
+fn operations_hud_reports_a_rack_that_lost_its_operational_state() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    let faulted = ticket_queue(&app).ordered()[0].rack;
+    assert_eq!(
+        hud_report(&app).badge(faulted).expect("badge").kind,
+        Some(BadgeKind::Fault)
+    );
+
+    let entity = roster(&app).get(faulted).expect("rack entry").entity;
+    app.world_mut()
+        .entity_mut(entity)
+        .remove::<RackOperations>();
+    app.update();
+
+    let report = hud_report(&app);
+    assert!(
+        report
+            .errors
+            .contains(&HudError::MissingRackState { rack: faulted }),
+        "a rack the HUD cannot read must be reported, got {:?}",
+        report.errors
+    );
+    let badge = report.badge(faulted).expect("badge");
+    assert_eq!(badge.visibility, BadgeVisibility::MissingRack);
+    assert_eq!(badge.kind, None);
+    let node = rack_badge_nodes(&mut app)
+        .into_iter()
+        .find(|(rack, _)| *rack == faulted)
+        .expect("badge node")
+        .1;
+    assert!(!ui_displayed(&app, node));
+    assert!(!report.is_healthy());
+}
+
+#[test]
+fn operations_hud_reports_a_missing_camera_instead_of_drawing_stale_badges() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    assert!(!hud_report(&app).shown_badges().is_empty());
+
+    // Removing the marker is the fault the HUD must survive: the game camera
+    // it projects through is gone. Despawning the whole entity would tear the
+    // render world down instead, which is a different failure.
+    let camera = camera_entity(&mut app);
+    app.world_mut()
+        .entity_mut(camera)
+        .remove::<CellShiftCamera>();
+    app.update();
+
+    let report = hud_report(&app);
+    assert!(
+        report.errors.contains(&HudError::NoCamera),
+        "got {:?}",
+        report.errors
+    );
+    assert_eq!(report.viewport, Vec2::ZERO);
+    for badge in &report.badges {
+        if badge.kind.is_some() {
+            assert_eq!(badge.visibility, BadgeVisibility::NoCamera);
+            assert_eq!(badge.anchor, None);
+            assert_eq!(badge.center, None);
+        }
+    }
+    for (rack, entity) in rack_badge_nodes(&mut app) {
+        assert!(!ui_displayed(&app, entity), "badge {rack} survived");
+    }
+    // The queue stack still reads the live queue: losing the camera hides
+    // badges, not tickets.
+    assert_eq!(report.rows.len(), MAX_ACTIVE_TICKETS);
+}
+
+#[test]
+fn operations_hud_draws_only_typed_palette_colors() {
+    let mut app = hud_app(&repo_assets());
+    fill_queue(&mut app);
+    let spot = repair_spot(&app, ticket_queue(&app).ordered()[0].rack);
+    place_player(&mut app, spot);
+    hold(&mut app, &[]);
+    app.update();
+    press_space(&mut app);
+    pump(&mut app, 2);
+
+    let root = hud_single::<HudRoot>(&mut app);
+    let mut stack = vec![(root, true)];
+    let mut seen = 0usize;
+    let mut text_nodes = 0usize;
+    while let Some((entity, inherited)) = stack.pop() {
+        let visible = inherited && ui_displayed(&app, entity);
+        if let Some(children) = app.world().get::<Children>(entity) {
+            stack.extend(children.iter().map(|child| (child, visible)));
+        }
+        let mut colors: Vec<Srgba> = Vec::new();
+        if let Some(background) = app.world().get::<BackgroundColor>(entity) {
+            colors.push(background.0.to_srgba());
+        }
+        if let Some(border) = app.world().get::<BorderColor>(entity) {
+            colors.extend(
+                [border.top, border.right, border.bottom, border.left]
+                    .map(|color| color.to_srgba()),
+            );
+        }
+        if let Some(text) = app.world().get::<TextColor>(entity) {
+            colors.push(text.0.to_srgba());
+        }
+        for color in colors {
+            if color.alpha == 0.0 {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                PaletteRole::ALL
+                    .iter()
+                    .any(|role| role.color().to_vec3() == color.to_vec3()),
+                "the HUD drew {color:?}, which is not a typed PaletteRole colour"
+            );
+        }
+        // Every label the HUD renders must actually produce glyphs.
+        if app.world().get::<Text>(entity).is_some() {
+            let text = ui_text(&app, entity);
+            let node = app
+                .world()
+                .get::<ComputedNode>(entity)
+                .expect("a text node carries a ComputedNode");
+            if !text.is_empty() && visible {
+                text_nodes += 1;
+                assert!(
+                    node.content_size.x > 0.0 && node.content_size.y > 0.0,
+                    "{text:?} rendered no glyphs at all"
+                );
+            }
+        }
+    }
+    assert!(seen > 20, "the walk only found {seen} colours");
+    assert!(text_nodes >= 12, "the walk only found {text_nodes} labels");
+}
+
+#[test]
+fn operations_hud_control_strip_names_every_reviewed_key() {
+    let mut app = hud_app(&repo_assets());
+    let caps = control_caps(&mut app);
+    assert_eq!(caps.len(), HudControl::ALL.len());
+
+    let mut labelled = app
+        .world_mut()
+        .query::<(&ControlHintCapLabel, &Text)>()
+        .iter(app.world())
+        .map(|(label, text)| (label.control, text.0.clone()))
+        .collect::<Vec<_>>();
+    labelled.sort_by_key(|(control, _)| format!("{control:?}"));
+    let mut expected = HudControl::ALL
+        .map(|control| (control, control.keys().to_owned()))
+        .to_vec();
+    expected.sort_by_key(|(control, _)| format!("{control:?}"));
+    assert_eq!(labelled, expected);
+
+    // The strip is one compact row pinned to the bottom-right corner.
+    let panel_entity = hud_single::<ControlsPanel>(&mut app);
+    let panel = ui_rect(&app, panel_entity);
+    assert!(
+        panel.height() <= CONTROLS_PANEL_HEIGHT + 0.5,
+        "the control strip grew to {}",
+        panel.height()
+    );
+    for (control, entity) in caps {
+        let cap = ui_rect(&app, entity);
+        assert!(
+            panel.contains(cap.min) && panel.contains(cap.max),
+            "{control:?} escaped the strip"
+        );
+        assert_eq!(ui_background(&app, entity), control.cap_role(false).color());
+    }
 }

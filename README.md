@@ -338,10 +338,14 @@ and none of them stands in for another:
   clip, and is never counted as a start. A second app proves an empty queue is
   its own explicit `NoOpenTickets` rejection.
 - `operations_in_range_space_starts_the_repair_and_locks_movement_in_one_frame`
-  is the dedicated approach-and-lock test, and the only operations test that
-  really walks: over two hundred frames of real arrow input with no transform
-  writes, then a real `Space` press with the arrows still held, and the lock,
-  the `Repair` clip, and the zero accepted motion all landing on that one frame.
+  is the dedicated approach-and-lock test: over two hundred frames of real
+  arrow input with no transform writes, then a real `Space` press with the
+  arrows still held, and the lock, the `Repair` clip, and the zero accepted
+  motion all landing on that one frame. It is the only operations test that
+  walks the technician *to* a rack;
+  `operations_leaving_the_repair_clip_restores_every_rest_transform_first`
+  also walks, but afterwards, to prove the released repair really hands over to
+  a moving `Walk`.
 - `operations_space_counts_one_edge_per_press_not_a_held_key` holds `Space`
   down for hundreds of frames and proves one press is counted exactly once,
   that a held key neither spams a rejection at 60 Hz nor re-enters a running
@@ -357,10 +361,88 @@ fills the queue to three simultaneous tickets on ticks 240, 480, and 720, then
 repeatedly *teleports* the technician to the repair spot of the highest-priority
 ticket -- deliberately, because the real approach and the out-of-range rejection
 are each proved by their own contract above -- presses the real `Space` key, and
-rides the whole documented tail out. It completes at least three repairs and
-watches two separate racks fault again after their cooldowns, one of them on the
-exact tick its eight-second cooldown ended, while the opened sequence still
-matches the pinned seed prefix.
+rides the whole documented tail out. It requires at least three completed
+repairs and watches two separate racks fault again after their cooldowns, one of
+them on the exact tick its eight-second cooldown ended, while the opened
+sequence still matches the pinned seed prefix.
+
+## Operations HUD and diegetic badges
+
+`src/hud.rs` draws the whole HUD and owns no gameplay state. Every frame it
+reads `TicketQueue`, `RackOperations`, `RackRoster`, `MovementLock`,
+`LastInteraction`, and the real camera, and writes only presentation components
+plus one observable `HudReport`. There is no second ticket model to drift.
+
+- The top-left stack renders up to three rows straight out of the queue's own
+  global priority order. It never re-sorts, so Critical before Warning, then
+  creation tick, then rack index is the queue's ordering and the HUD's ordering
+  by construction. Each row is a severity chip, a rack-state chip, a short real
+  label such as `T0002 R01 Critical`, and a thin bar that fills across the
+  repairing, resolved, and cooldown dwell times.
+- Shape carries meaning alongside colour: a critical severity chip is a hard
+  square and a warning chip is a circle; the fault badge is sharp cornered, the
+  repair badge is rounded, and the resolved badge is a full pill.
+- The status line below the rows is derived from live state only: a running
+  repair outranks everything, then a real out-of-range rejection while the
+  ticket it was about is still open, then the queue itself.
+- Badges are fixed-size screen-space UI nodes, never world-space sprites, so
+  they never rotate, shear, or resize with the camera. Each is anchored every
+  frame from a stable rack world point 2.4 m above the rack's collider centre,
+  projected through the real `Camera::world_to_viewport`. The pass reads the
+  camera's own `Transform` rather than its propagated `GlobalTransform`, because
+  propagation runs in `PostUpdate` and a stale transform would make badges lag
+  the camera through every orbit tween.
+- A visible anchor always has a fully visible badge: the badge box is clamped
+  inside the viewport and its thin leader line is rotated to end exactly on the
+  projected anchor, whatever the heading. An anchor that projects off screen
+  hides explicitly as `BadgeVisibility::OffScreen`, and a projection the camera
+  refuses is recorded as a typed `ProjectionFailed` error rather than silently
+  skipped.
+- The bottom-right strip names `Arrows`, `Q`, `E`, and `Space`, and says which
+  are live: while a repair holds the technician still, the `Space` cap turns
+  the technician's hard-hat blue and the `Arrows` cap goes flat.
+- Every colour the HUD draws is a typed `PaletteRole`, and every fixed panel is
+  pinned to a corner: the queue stack is 216 px wide and the control strip is
+  40 px tall, so at 1280x720 and at 960x540 both keep a 16 px margin and stay
+  outside the central 50% x 50% play rectangle.
+
+`HudReport` is the presentation contract. It carries the rendered rows, every
+rack's badge with the reason it is or is not drawn, the status, the movement
+lock, the viewport, and a list of typed `HudError`s. A rack that lost its
+`RackOperations`, a queue ticket whose rack is unknown, a missing badge or row
+node, and a missing game camera are all reported rather than quietly ignored.
+
+HUD gates:
+
+```bash
+cargo test hud
+cargo test --test app_contract operations_hud
+```
+
+The real-app HUD contracts drive the same headless Bevy app the rest of the
+suite uses and query the real laid-out `ComputedNode` and `UiGlobalTransform`:
+
+- `operations_hud_badges_track_the_projected_rack_at_every_heading_and_mid_tween`
+  sweeps all four headings and a genuine mid-tween frame at each, and requires
+  every badge's recorded anchor to equal the test's own independent projection
+  of the same world point, its visibility to agree with whether that projection
+  is on screen, its laid-out box to stay exactly 34x22 px and fully inside the
+  viewport, and its leader line to end within 1.5 px of the anchor.
+- `operations_hud_clamps_an_edge_badge_and_still_points_its_leader_at_the_rack`
+  walks the technician until a faulted rack is pushed against a side edge,
+  which is the only case where the leader is not vertical, and proves the
+  clamped badge stays on screen while the tilted leader still ends on the rack.
+- `operations_hud_panels_stay_on_screen_and_clear_of_the_play_rectangle`
+  resizes the real window to 1280x720 and 960x540 through a real
+  `WindowResized` message and re-checks the margins, the row order, the panel
+  containment, and the play rectangle at both sizes.
+- `operations_hud_draws_only_typed_palette_colors` walks every HUD node and
+  rejects any background, border, or text colour that is not a `PaletteRole`,
+  and requires every visible label to have produced real glyphs.
+- `operations_hud_reports_a_rack_that_lost_its_operational_state` and
+  `operations_hud_reports_a_missing_camera_instead_of_drawing_stale_badges`
+  fault-inject both failures into a running app and require the named typed
+  error, the hidden badge, and an otherwise intact queue stack.
 
 ## Foundation gates
 

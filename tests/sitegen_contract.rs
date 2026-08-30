@@ -458,7 +458,7 @@ mod progress_contract {
             assert_eq!(output.status.code(), Some(0));
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                "operations-hud\n"
+                "pages-playable\n"
             );
             assert!(output.stderr.is_empty());
         }
@@ -525,14 +525,14 @@ mod progress_contract {
                 ),
                 (
                     "operations-hud",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["camera-orbit", "operations-loop"][..],
-                    "Add ticket HUD, controls, and rack badges.",
-                    None,
+                    "Added src/hud.rs, which draws the whole operations HUD from the live operations model and owns no gameplay state of its own: every frame it reads TicketQueue, RackOperations, RackRoster, MovementLock, LastInteraction, and the real camera, and writes only presentation components plus one observable HudReport, so there is no second ticket model to drift. The top-left stack renders up to three rows straight out of the queue's own global priority order rather than re-sorting it, each row carrying a severity chip, a rack-state chip, a short real label such as T0002 R01 Critical, and a dwell-progress bar; shape carries meaning beside colour, with a square critical chip against a round warning chip and sharp, rounded, and pill badges for fault, repair, and resolved. The status line is derived from live state alone, preferring a running repair, then a real out-of-range rejection while the ticket it was about is still open, then the queue. Badges are fixed-size screen-space UI nodes anchored every frame from a stable world point 2.4 m above each rack's collider centre through the real Camera::world_to_viewport, reading the camera's own Transform rather than its propagated GlobalTransform so they never lag a tween by a frame; a visible anchor always gets a fully visible badge because the badge box is clamped inside the viewport and its thin leader line is rotated to end exactly on the projected anchor, while an anchor that leaves the viewport hides explicitly and a refused projection is recorded as a typed error. The bottom-right strip names Arrows, Q, E, and Space and shows which are live, turning the Space cap hard-hat blue and flattening the Arrows cap while a repair holds the technician still. Every colour is a typed PaletteRole, the 216 px queue stack and 40 px control strip keep a 16 px margin and stay outside the central 50% x 50% play rectangle at both 1280x720 and 960x540, and HudReport reports a rack that lost its RackOperations, a ticket whose rack is unknown, a missing badge or row node, and a missing game camera instead of hiding them.",
+                    Some("HEAD"),
                 ),
                 (
                     "pages-playable",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["operations-hud"][..],
                     "Publish the playable WASM game.",
                     None,
@@ -593,6 +593,7 @@ mod progress_contract {
                     "rig-handles-that-survive-instance-respawn",
                     "clamped-orbit-cannot-frame-a-room-corner",
                     "seeded-faults-that-player-timing-cannot-perturb",
+                    "screen-space-badges-that-survive-orbit-and-resize",
                 ]
             );
             for challenge in &document.challenges {
