@@ -274,6 +274,63 @@ An earlier revision of the plan asked for corner framing *and* containment
 inside the 40 m room, which is impossible for any room size; the published
 challenge records how the two squares were separated.
 
+## Recurring faults, prioritized tickets, and repair
+
+`src/operations.rs` owns the whole operations slice and carries the reviewed
+rack state machine diagram beside the enum it documents.
+
+- Operational state hangs on the four authored `rack-row-NN` `HallProp`
+  entities, joined to the blueprint and to their cached collider rectangles by
+  stable `PropId`. Rack indices are assigned from sorted identifier order, which
+  is also the authored declaration order, so a rack index means the same thing
+  in every report.
+- One seeded ChaCha8 stream, `0xCE11_5A1F_DA7A_CE01`, produces the whole fault
+  sequence. It is an ordered generator, not a sampler of the current world:
+  every four simulated seconds an opportunity matures and the timer stops
+  accumulating, a full queue pauses it without consuming a single word, and a
+  drawn candidate whose rack already holds a ticket -- or is still repairing,
+  resolving, or cooling down -- is held and reported rather than rerolled.
+  Exactly two words are consumed per candidate, so repairing early or late moves
+  only *when* each fault arrives, never *which* fault it is.
+- Tickets carry stable monotonic identifiers that are never reused. The queue
+  holds at most three, refuses a second ticket for one rack, names the rack it
+  refused, and stays sorted Critical before Warning, then by creation tick, then
+  by rack index.
+- `Space` gathers only open faults, measures the distance from the technician to
+  each rack's collider *rectangle* rather than to its centre, and selects by
+  severity, then distance, then creation tick, then rack index. An out-of-range
+  press changes nothing at all and is recorded as a named rejection with the
+  nearest faulted rack and its distance; it is never counted as a start.
+- Starting a repair runs in `UpdateOperations`, before `MovePlayer`, so the
+  movement lock takes hold on the same frame. The arrow request is dropped
+  rather than merely blocked, so the published motion really is standing still,
+  the generated `Repair` clip plays, and the blue-wrench state is exposed for
+  the HUD task. The camera keeps orbiting and following throughout.
+- The tail completes on its own: three seconds of repair, then the lock is
+  released and the healthy indicator shows for two seconds, then the ticket
+  leaves the queue as the rack begins an eight-second cooldown, and only a fully
+  recovered rack is eligible again. Capacity reopens the instant the ticket is
+  removed, and a paused opportunity fires on that very frame.
+- Every timer is a `std::time::Duration` of whole nanoseconds rather than an
+  accumulated `f32`, so the fixed sixtieth-of-a-second contract lands on exact
+  tick boundaries: 240 ticks to a fault, 180 to a repair, 120 to the healthy
+  indicator, 480 to a recovered rack.
+
+Operations gates:
+
+```bash
+cargo test operations
+cargo test --test app_contract recurring_ticket_journey
+```
+
+`recurring_ticket_journey` runs 2106 fixed frames of the real app: it fills the
+queue to three simultaneous tickets on ticks 240, 480, and 720, rejects an
+out-of-range `Space` from the middle of the centre aisle, walks to a rack with
+the real arrow keys, completes four real `Space` repairs, and watches two racks
+fault again after their cooldowns -- one of them on the exact tick its eight
+second cooldown ended -- while the opened sequence still matches the pinned
+seed prefix.
+
 ## Foundation gates
 
 ```bash

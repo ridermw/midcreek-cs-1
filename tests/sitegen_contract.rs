@@ -458,7 +458,7 @@ mod progress_contract {
             assert_eq!(output.status.code(), Some(0));
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                "operations-loop\n"
+                "operations-hud\n"
             );
             assert!(output.stderr.is_empty());
         }
@@ -518,14 +518,14 @@ mod progress_contract {
                 ),
                 (
                     "operations-loop",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["data-hall", "technician-movement"][..],
-                    "Add recurring prioritized faults, tickets, and repair.",
-                    None,
+                    "Attached the documented rack state machine to the four authored rack-row HallProp entities by stable PropId, joined to their cached collider rectangles once, and drove it from one seeded ChaCha8 fault stream. The scheduler is a pure sequence generator: every four simulated seconds an opportunity matures and the timer stops accumulating, a full queue pauses it without consuming a single word of randomness, and a drawn candidate whose rack already holds a ticket or is still resolving or cooling down is held rather than rerolled, so the exact rack and severity order is the same whatever the player does and only its timing moves. Tickets carry stable monotonic identifiers and sort Critical before Warning, then by creation tick, then by rack; the queue enforces the maximum of three active tickets and one ticket per rack and reports which rack it refused. A real Space press gathers only open faults, measures distance to each rack's collider rectangle rather than its centre, and selects by severity, then distance, then creation tick, then rack, so an out-of-range press changes nothing and is recorded as a named rejection instead of a silent no-op. Starting a repair in UpdateOperations locks movement in the same frame, before MovePlayer runs, zeroes the published motion, plays the generated Repair clip, and exposes the blue wrench state for the HUD task while the camera keeps orbiting and following. Repair completes on its own after three seconds and releases the lock, the healthy indicator shows for two seconds, the ticket then leaves the queue as the rack begins an eight second cooldown, and only a fully recovered rack is eligible again.",
+                    Some("HEAD"),
                 ),
                 (
                     "operations-hud",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["camera-orbit", "operations-loop"][..],
                     "Add ticket HUD, controls, and rack badges.",
                     None,
@@ -592,6 +592,7 @@ mod progress_contract {
                     "loud-asset-loading-without-a-gpu",
                     "rig-handles-that-survive-instance-respawn",
                     "clamped-orbit-cannot-frame-a-room-corner",
+                    "seeded-faults-that-player-timing-cannot-perturb",
                 ]
             );
             for challenge in &document.challenges {

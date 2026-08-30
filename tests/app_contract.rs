@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -50,6 +51,12 @@ use midcreek_cs_1::{
         SceneValidationError, TEAL_ACCENT, VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
         VisualSpec, WALKABLE_CELL_SIZE, WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT,
         WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS,
+    },
+    operations::{
+        FAULT_INTERVAL, FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction,
+        MovementLock, OperationsClock, RACK_ASSET_KIND, RACK_COOLDOWN, REPAIR_DURATION, REPAIR_KEY,
+        RESOLVED_DISPLAY, RackOperations, RackRoster, RackState, ScheduleBlock, Ticket, TicketId,
+        TicketQueue, TicketSeverity,
     },
     player::{
         PLAYER_MAX_MOVE_DELTA, PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip,
@@ -4155,4 +4162,748 @@ fn camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Operations, ticket, and repair contracts
+// ---------------------------------------------------------------------------
+
+/// The pinned `(rack, severity)` prefix of the reviewed seed, derived
+/// independently from ChaCha8 word order: rack is `next_u32() % 4`, severity is
+/// `next_u32() % 2` with zero meaning Critical.
+const SEEDED_FAULTS: [(usize, TicketSeverity); 12] = [
+    (2, TicketSeverity::Critical),
+    (1, TicketSeverity::Critical),
+    (3, TicketSeverity::Critical),
+    (1, TicketSeverity::Warning),
+    (2, TicketSeverity::Critical),
+    (0, TicketSeverity::Critical),
+    (3, TicketSeverity::Critical),
+    (1, TicketSeverity::Warning),
+    (1, TicketSeverity::Warning),
+    (3, TicketSeverity::Critical),
+    (1, TicketSeverity::Warning),
+    (1, TicketSeverity::Critical),
+];
+
+/// Fixed-step frames in each documented interval.
+const FAULT_FRAMES: usize = 240;
+const REPAIR_FRAMES: usize = 180;
+const RESOLVED_FRAMES: usize = 120;
+const COOLDOWN_FRAMES: usize = 480;
+
+fn ticket_queue(app: &App) -> TicketQueue {
+    app.world().resource::<TicketQueue>().clone()
+}
+
+fn scheduler(app: &App) -> FaultScheduler {
+    app.world().resource::<FaultScheduler>().clone()
+}
+
+fn movement_lock(app: &App) -> MovementLock {
+    *app.world().resource::<MovementLock>()
+}
+
+fn last_interaction(app: &App) -> LastInteraction {
+    *app.world().resource::<LastInteraction>()
+}
+
+fn operations_tick(app: &App) -> u64 {
+    app.world().resource::<OperationsClock>().tick()
+}
+
+fn roster(app: &App) -> RackRoster {
+    app.world().resource::<RackRoster>().clone()
+}
+
+fn rack_ops(app: &App, rack: usize) -> RackOperations {
+    let entry = roster(app)
+        .get(rack)
+        .cloned()
+        .unwrap_or_else(|| panic!("rack {rack} must be on the roster"));
+    app.world()
+        .get::<RackOperations>(entry.entity)
+        .unwrap_or_else(|| panic!("rack {rack} must carry operational state"))
+        .clone()
+}
+
+fn rack_states(app: &App) -> Vec<RackState> {
+    (0..roster(app).len())
+        .map(|rack| rack_ops(app, rack).state())
+        .collect()
+}
+
+/// A standing position beside one rack, just inside the repair range and clear
+/// of every authored collider.
+fn repair_spot(app: &App, rack: usize) -> Vec2 {
+    let entry = roster(app)
+        .get(rack)
+        .cloned()
+        .unwrap_or_else(|| panic!("rack {rack} must be on the roster"));
+    Vec2::new(
+        entry.center.x + entry.half_extents.x + PLAYER_RADIUS + 0.2,
+        0.0,
+    )
+}
+
+/// Presses and releases the real Space key across exactly one frame.
+fn press_space(app: &mut App) {
+    tap(app, &[REPAIR_KEY]);
+}
+
+/// Boots the walking hall, then resets the operations model to a pristine
+/// origin.
+///
+/// The hall settles its assets and its rig against the wall clock, so the
+/// scheduler would otherwise start each test part way through an interval. The
+/// reset is the same fixed-seed origin the verification harness will use, and
+/// nothing else about the running app changes.
+fn operations_hall(assets: &Path) -> App {
+    let mut app = walking_hall(assets);
+    let roster = roster(&app);
+    assert_eq!(roster.len(), 4, "the authored hall has four rack rows");
+    for entry in roster.all() {
+        *app.world_mut()
+            .get_mut::<RackOperations>(entry.entity)
+            .expect("every authored rack carries operational state") =
+            RackOperations::new(entry.rack, entry.id.clone());
+    }
+    app.world_mut()
+        .insert_resource(FaultScheduler::new(roster.len()));
+    app.world_mut().insert_resource(TicketQueue::default());
+    app.world_mut().insert_resource(OperationsClock::default());
+    app.world_mut().insert_resource(MovementLock::default());
+    app.world_mut().insert_resource(LastInteraction::default());
+    hold(&mut app, &[]);
+    app
+}
+
+#[test]
+fn operations_attaches_state_to_every_authored_rack_by_prop_id() {
+    let mut app = walking_hall(&repo_assets());
+    let roster = roster(&app);
+    let blueprint = SceneBlueprint::v0();
+
+    let authored = blueprint
+        .visuals
+        .iter()
+        .filter(|visual| visual.asset == RACK_ASSET_KIND)
+        .map(|visual| visual.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roster
+            .all()
+            .iter()
+            .map(|entry| entry.id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        authored,
+        "the roster is the authored rack list, in stable identifier order"
+    );
+
+    for (rack, entry) in roster.all().iter().enumerate() {
+        assert_eq!(entry.rack, rack, "rack indices are stable and dense");
+
+        // The joined collider really is the blueprint's, by stable PropId.
+        let collider = blueprint
+            .collider(entry.id.as_str())
+            .expect("every rack row authors a collider");
+        assert_eq!(entry.center, collider.center);
+        assert_eq!(entry.half_extents, collider.half_extents);
+
+        // The state hangs on the spawned HallProp itself.
+        let prop = app
+            .world()
+            .get::<HallProp>(entry.entity)
+            .expect("the roster points at the authored prop entity");
+        assert_eq!(prop.id, entry.id);
+        assert_eq!(prop.asset, RACK_ASSET_KIND);
+
+        let state = rack_ops(&app, rack);
+        assert_eq!(state.id, entry.id);
+        assert_eq!(state.rack, rack);
+    }
+
+    // Nothing that is not a rack carries operational state.
+    let attached = app
+        .world_mut()
+        .query::<&RackOperations>()
+        .iter(app.world())
+        .count();
+    assert_eq!(attached, roster.len());
+    assert_eq!(attached, 4);
+    assert_eq!(scheduler(&app).racks(), 4);
+    assert_eq!(scheduler(&app).rng().seed(), FAULT_SCHEDULER_SEED);
+}
+
+#[test]
+fn operations_scheduler_opens_the_seeded_queue_on_the_exact_interval_ticks() {
+    let mut app = operations_hall(&repo_assets());
+    assert!(ticket_queue(&app).is_empty());
+
+    pump(&mut app, FAULT_FRAMES - 1);
+    assert_eq!(operations_tick(&app), 239);
+    assert!(
+        ticket_queue(&app).is_empty(),
+        "one tick short of four seconds must not fault"
+    );
+    assert_eq!(scheduler(&app).rng().draws(), 0);
+
+    for (index, (rack, severity)) in SEEDED_FAULTS.iter().copied().take(3).enumerate() {
+        if index > 0 {
+            pump(&mut app, FAULT_FRAMES - 1);
+            assert_eq!(ticket_queue(&app).len(), index);
+        }
+        app.update();
+
+        let queue = ticket_queue(&app);
+        assert_eq!(queue.len(), index + 1, "fault {index} must be open");
+        let ticket = queue
+            .for_rack(rack)
+            .unwrap_or_else(|| panic!("fault {index} belongs to rack {rack}"));
+        assert_eq!(ticket.id, TicketId::new(index as u64 + 1));
+        assert_eq!(ticket.severity, severity);
+        assert_eq!(ticket.created_tick, (index as u64 + 1) * 240);
+        assert_eq!(ticket.rack_id.as_str(), format!("rack-row-{:02}", rack + 1));
+        assert_eq!(rack_ops(&app, rack).state(), RackState::Faulted);
+        assert_eq!(rack_ops(&app, rack).ticket(), Some(ticket.id));
+    }
+
+    // Three simultaneous tickets, in global priority order, and every other
+    // rack still healthy.
+    let queue = ticket_queue(&app);
+    assert!(queue.is_at_capacity());
+    assert_eq!(
+        queue
+            .ordered()
+            .iter()
+            .map(|ticket| (ticket.rack, ticket.severity, ticket.created_tick))
+            .collect::<Vec<_>>(),
+        vec![
+            (2, TicketSeverity::Critical, 240),
+            (1, TicketSeverity::Critical, 480),
+            (3, TicketSeverity::Critical, 720),
+        ],
+        "equal severities sort by creation tick"
+    );
+    assert_eq!(
+        rack_states(&app),
+        vec![
+            RackState::Healthy,
+            RackState::Faulted,
+            RackState::Faulted,
+            RackState::Faulted
+        ]
+    );
+    assert_eq!(scheduler(&app).rng().draws(), 6, "two words per emission");
+
+    // The fourth opportunity matures against a full queue: it pauses, reports
+    // why, and never touches the seeded stream.
+    pump(&mut app, FAULT_FRAMES);
+    assert_eq!(operations_tick(&app), 960);
+    assert_eq!(ticket_queue(&app).len(), 3);
+    let paused = scheduler(&app);
+    assert!(paused.is_armed());
+    assert_eq!(
+        paused.blocked(),
+        Some(ScheduleBlock::AtCapacity { active: 3 })
+    );
+    assert_eq!(paused.rng().draws(), 6);
+    assert_eq!(paused.capacity_pauses(), 1);
+    assert_eq!(paused.emitted(), 3);
+
+    pump(&mut app, FAULT_FRAMES * 3);
+    let still_paused = scheduler(&app);
+    assert_eq!(still_paused.rng().draws(), 6, "a full queue never rerolls");
+    assert_eq!(still_paused.capacity_pauses(), 1);
+    assert_eq!(ticket_queue(&app).len(), 3);
+}
+
+#[test]
+fn operations_out_of_range_space_is_rejected_and_stays_observable() {
+    let mut app = operations_hall(&repo_assets());
+    pump(&mut app, FAULT_FRAMES * 3);
+    assert_eq!(ticket_queue(&app).len(), 3);
+
+    // The middle of the centre aisle is 2.2 m from both faulted inner rack
+    // faces, which is outside the 1.5 m repair range.
+    place_player(&mut app, Vec2::new(0.0, 0.0));
+    hold(&mut app, &[]);
+    app.update();
+    let before = player_position(&mut app);
+
+    press_space(&mut app);
+
+    let last = last_interaction(&app);
+    assert_eq!(last.presses, 1);
+    assert_eq!(last.rejected, 1);
+    assert_eq!(last.started, 0, "a rejection is never recorded as a start");
+    match last.outcome {
+        InteractionOutcome::OutOfRange {
+            nearest_rack,
+            nearest_distance,
+        } => {
+            assert_eq!(nearest_rack, Some(1));
+            assert!(
+                (nearest_distance - 2.2).abs() < 1.0e-5,
+                "the nearest faulted rack face is 2.2 m away, got {nearest_distance}"
+            );
+            assert!(nearest_distance > REPAIR_INTERACTION_RANGE);
+        }
+        other => panic!("an out-of-range press must be reported, got {other:?}"),
+    }
+
+    // Nothing at all changed: no repair, no lock, no ticket movement.
+    assert!(!movement_lock(&app).is_locked());
+    assert_eq!(ticket_queue(&app).len(), 3);
+    assert!(
+        rack_states(&app)
+            .iter()
+            .all(|state| *state != RackState::Repairing)
+    );
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Idle
+    );
+    assert_eq!(player_position(&mut app), before);
+
+    // A press with no open ticket at all is a different, still explicit,
+    // rejection.
+    let mut empty = operations_hall(&repo_assets());
+    press_space(&mut empty);
+    let last = last_interaction(&empty);
+    assert_eq!(last.outcome, InteractionOutcome::NoOpenTickets);
+    assert_eq!(last.rejected, 1);
+    assert_eq!(last.started, 0);
+}
+
+#[test]
+fn operations_in_range_space_starts_the_repair_and_locks_movement_in_one_frame() {
+    let mut app = operations_hall(&repo_assets());
+    pump(&mut app, FAULT_FRAMES * 3);
+    let queue = ticket_queue(&app);
+    assert_eq!(queue.len(), 3);
+    let target = queue.ordered()[0].clone();
+    assert_eq!(target.rack, 2);
+    assert_eq!(target.id, TicketId::new(1));
+
+    // Walk there with the real arrow keys, never by writing a transform.
+    let spot = repair_spot(&app, target.rack);
+    let mut walked = 0usize;
+    for waypoint in [Vec2::new(spot.x, -11.0), spot] {
+        loop {
+            let position = player_position(&mut app);
+            if position.distance(waypoint) <= 0.1 {
+                break;
+            }
+            let keys = keys_towards(&view_basis(&app), waypoint - position);
+            hold(&mut app, keys);
+            app.update();
+            walked += 1;
+            assert!(walked < 3_000, "the walk to rack {} stalled", target.rack);
+        }
+    }
+    assert!(
+        walked > 200,
+        "the approach must be a real walk, got {walked}"
+    );
+
+    // Still holding the arrows, so the lock has to be what stops the walk.
+    let approach = keys_towards(&view_basis(&app), Vec2::new(0.0, 1.0));
+    hold(&mut app, approach);
+    app.update();
+    let before = player_position(&mut app);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Faulted);
+
+    press_space(&mut app);
+
+    let last = last_interaction(&app);
+    assert_eq!(
+        last.outcome,
+        InteractionOutcome::Started {
+            ticket: target.id,
+            rack: target.rack
+        }
+    );
+    assert_eq!(last.started, 1);
+    assert_eq!(last.rejected, 0);
+
+    // The very frame the repair starts: locked, posed, and standing still.
+    let rack = rack_ops(&app, target.rack);
+    assert_eq!(rack.state(), RackState::Repairing);
+    assert_eq!(rack.elapsed(), Duration::ZERO);
+    assert_eq!(rack.remaining(), Some(REPAIR_DURATION));
+    assert!(rack.state().shows_wrench_badge(), "Task 7 reads this state");
+    assert!(!rack.state().shows_fault_badge());
+    assert_eq!(movement_lock(&app).ticket(), Some(target.id));
+    assert_eq!(player_position(&mut app), before);
+    assert_eq!(
+        app.world().resource::<PlayerMotion>().accepted(),
+        Vec2::ZERO
+    );
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Repair
+    );
+    let animations = app.world().resource::<PlayerAnimations>().clone();
+    let playing = app
+        .world()
+        .get::<AnimationPlayer>(animations.player)
+        .expect("the technician exposes an AnimationPlayer")
+        .playing_animations()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    assert_eq!(playing, vec![animations.node(PlayerClip::Repair)]);
+
+    // Movement stays locked for the whole repair, arrows held throughout.
+    hold(&mut app, approach);
+    pump(&mut app, 60);
+    assert_eq!(player_position(&mut app), before);
+    assert!(movement_lock(&app).is_locked());
+
+    // The camera is still live: a real Q press still orbits.
+    let heading_before = orbit(&app).heading();
+    tap(&mut app, &[KeyCode::KeyQ]);
+    assert!(
+        !orbit(&app).is_settled(),
+        "the camera must still take input"
+    );
+    pump(&mut app, QUARTER_TURN_FRAMES - 1);
+    assert_ne!(orbit(&app).heading(), heading_before);
+    assert_eq!(player_position(&mut app), before);
+
+    // A second press during the repair is rejected, not silently ignored.
+    press_space(&mut app);
+    assert_eq!(
+        last_interaction(&app).outcome,
+        InteractionOutcome::AlreadyRepairing { ticket: target.id }
+    );
+    assert_eq!(last_interaction(&app).started, 1);
+}
+
+#[test]
+fn operations_repair_resolves_removes_the_ticket_and_cools_the_rack_down() {
+    let mut app = operations_hall(&repo_assets());
+    pump(&mut app, FAULT_FRAMES * 3);
+    let target = ticket_queue(&app).ordered()[0].clone();
+    let spot = repair_spot(&app, target.rack);
+    place_player(&mut app, spot);
+    hold(&mut app, &[]);
+    app.update();
+
+    press_space(&mut app);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Repairing);
+    assert!(movement_lock(&app).is_locked());
+
+    // One fixed tick short of three seconds, then exactly on it.
+    pump(&mut app, REPAIR_FRAMES - 1);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Repairing);
+    assert!(movement_lock(&app).is_locked());
+    app.update();
+    let resolved = rack_ops(&app, target.rack);
+    assert_eq!(resolved.state(), RackState::Resolved);
+    assert!(resolved.state().shows_healthy_badge());
+    assert_eq!(resolved.ticket(), Some(target.id));
+    assert!(
+        !movement_lock(&app).is_locked(),
+        "the lock is released the moment the repair completes"
+    );
+    assert_eq!(
+        ticket_queue(&app).len(),
+        3,
+        "the ticket stays active while the healthy indicator shows"
+    );
+
+    // Movement really works again.
+    let before = player_position(&mut app);
+    drive(&mut app, &[KeyCode::ArrowUp], 5);
+    assert_ne!(player_position(&mut app), before);
+    hold(&mut app, &[]);
+
+    // One tick short of the resolved display, then exactly on it.
+    pump(&mut app, RESOLVED_FRAMES - 6);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Resolved);
+    assert_eq!(ticket_queue(&app).len(), 3);
+    app.update();
+
+    let cooling = rack_ops(&app, target.rack);
+    assert_eq!(cooling.state(), RackState::Cooldown);
+    assert_eq!(cooling.ticket(), None);
+    // Each dwell carries its remainder, so the cooldown starts 100 ns in: the
+    // 60 ns the repair boundary overshot plus the 40 ns the display added.
+    assert_eq!(cooling.elapsed(), Duration::from_nanos(100));
+    assert_eq!(
+        cooling.remaining(),
+        Some(RACK_COOLDOWN - Duration::from_nanos(100))
+    );
+    let queue = ticket_queue(&app);
+    assert_eq!(queue.len(), 2, "the resolved ticket leaves the queue");
+    assert_eq!(queue.get(target.id), None);
+    assert!(!queue.is_at_capacity());
+
+    // Capacity reopened, so the paused opportunity fires on this very frame.
+    // The seeded stream's next entry is rack 1, which is still faulted, so the
+    // drawn candidate is held and the duplicate is named rather than skipped.
+    let after = scheduler(&app);
+    assert_eq!(
+        after.rng().draws(),
+        8,
+        "the paused opportunity drew exactly now"
+    );
+    assert_eq!(
+        after.blocked(),
+        Some(ScheduleBlock::DuplicateRack {
+            rack: SEEDED_FAULTS[3].0,
+            existing: TicketId::new(2)
+        })
+    );
+    assert_eq!(after.duplicate_pauses(), 1);
+    assert_eq!(after.emitted(), 3);
+
+    // The repaired rack finishes its cooldown exactly on the boundary and only
+    // then becomes eligible again.
+    pump(&mut app, COOLDOWN_FRAMES - 1);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Cooldown);
+    app.update();
+    let healthy = rack_ops(&app, target.rack);
+    assert_eq!(healthy.state(), RackState::Healthy);
+    assert!(healthy.state().is_eligible_for_fault());
+    assert_eq!(healthy.elapsed(), Duration::ZERO);
+    assert_eq!(
+        ticket_queue(&app).len(),
+        2,
+        "the held candidate still belongs to a rack that is faulted"
+    );
+    assert_eq!(scheduler(&app).rng().draws(), 8, "waiting never rerolls");
+}
+
+/// One thing the seeded journey observed happening.
+#[derive(Clone, Debug, PartialEq)]
+enum JourneyEvent {
+    Opened {
+        ticket: Ticket,
+        tick: u64,
+    },
+    Removed {
+        id: TicketId,
+        rack: usize,
+        tick: u64,
+    },
+}
+
+/// Runs one frame and records every queue change it caused.
+fn journey_frame(app: &mut App, active: &mut Vec<Ticket>, log: &mut Vec<JourneyEvent>) {
+    app.update();
+    let queue = ticket_queue(app);
+    let tick = operations_tick(app);
+    for ticket in queue.ordered() {
+        if !active.iter().any(|held| held.id == ticket.id) {
+            active.push(ticket.clone());
+            log.push(JourneyEvent::Opened {
+                ticket: ticket.clone(),
+                tick,
+            });
+        }
+    }
+    active.retain(|held| {
+        let kept = queue.get(held.id).is_some();
+        if !kept {
+            log.push(JourneyEvent::Removed {
+                id: held.id,
+                rack: held.rack,
+                tick,
+            });
+        }
+        kept
+    });
+}
+
+#[test]
+fn recurring_ticket_journey() {
+    let mut app = operations_hall(&repo_assets());
+    let mut active: Vec<Ticket> = Vec::new();
+    let mut log: Vec<JourneyEvent> = Vec::new();
+    let mut frames = 0usize;
+    let budget = 20_000usize;
+
+    // Three simultaneous tickets from the seeded stream, on the exact ticks.
+    while active.len() < MAX_ACTIVE_TICKETS {
+        journey_frame(&mut app, &mut active, &mut log);
+        frames += 1;
+        assert!(frames < budget, "the queue never filled");
+    }
+    assert_eq!(frames, FAULT_FRAMES * 3);
+    assert!(ticket_queue(&app).is_at_capacity());
+
+    // Repair the highest-priority ticket over and over until two separate racks
+    // have faulted, been repaired, cooled down, and faulted again.
+    let mut repaired: BTreeSet<usize> = BTreeSet::new();
+    let mut recurrences: Vec<(usize, u64, u64)> = Vec::new();
+    let mut removed_at: Vec<(usize, u64)> = Vec::new();
+    let mut simultaneous = 0usize;
+    let mut repairs = 0usize;
+
+    while recurrences.len() < 2 {
+        simultaneous = simultaneous.max(ticket_queue(&app).len());
+
+        let Some(target) = ticket_queue(&app).ordered().first().cloned() else {
+            journey_frame(&mut app, &mut active, &mut log);
+            frames += 1;
+            assert!(frames < budget, "the journey stalled with an empty queue");
+            continue;
+        };
+
+        // Only travel when the rack is genuinely out of reach, and always press
+        // the real Space key.
+        let spot = repair_spot(&app, target.rack);
+        place_player(&mut app, spot);
+        hold(&mut app, &[]);
+        journey_frame(&mut app, &mut active, &mut log);
+        frames += 1;
+
+        press_space(&mut app);
+        frames += 1;
+        let queue = ticket_queue(&app);
+        for ticket in queue.ordered() {
+            if !active.iter().any(|held| held.id == ticket.id) {
+                active.push(ticket.clone());
+            }
+        }
+        assert_eq!(
+            last_interaction(&app).outcome,
+            InteractionOutcome::Started {
+                ticket: target.id,
+                rack: target.rack
+            },
+            "the journey must start the repair it walked to"
+        );
+        assert!(movement_lock(&app).is_locked());
+        assert_eq!(
+            app.world().resource::<PlayerAnimationState>().current(),
+            PlayerClip::Repair
+        );
+        repairs += 1;
+
+        // Ride the documented tail out: repairing, resolved, ticket removed.
+        let opened_before = log.len();
+        while ticket_queue(&app).get(target.id).is_some() {
+            journey_frame(&mut app, &mut active, &mut log);
+            frames += 1;
+            assert!(frames < budget, "ticket {} never resolved", target.id);
+        }
+        assert!(
+            !movement_lock(&app).is_locked(),
+            "the lock never survives the repair"
+        );
+        assert_eq!(rack_ops(&app, target.rack).state(), RackState::Cooldown);
+        removed_at.push((target.rack, operations_tick(&app)));
+        repaired.insert(target.rack);
+        assert!(log.len() > opened_before);
+
+        // Any fault that now opens on an already repaired rack is a recurrence.
+        for event in &log {
+            if let JourneyEvent::Opened { ticket, tick } = event
+                && repaired.contains(&ticket.rack)
+                && let Some((_, removed)) = removed_at
+                    .iter()
+                    .rfind(|(rack, removed)| *rack == ticket.rack && *removed < *tick)
+                && !recurrences
+                    .iter()
+                    .any(|(rack, _, at)| *rack == ticket.rack && at == tick)
+            {
+                recurrences.push((ticket.rack, *removed, *tick));
+            }
+        }
+
+        assert!(frames < budget, "the journey ran out of frames");
+        assert!(repairs < 40, "the journey repaired far more than planned");
+    }
+
+    // The seeded sequence is exactly the pinned one, whatever the repairs did.
+    let opened = log
+        .iter()
+        .filter_map(|event| match event {
+            JourneyEvent::Opened { ticket, .. } => Some(ticket.clone()),
+            JourneyEvent::Removed { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(opened.len() >= 5, "got {} tickets", opened.len());
+    assert!(repairs >= 3, "the journey completed only {repairs} repairs");
+    assert_eq!(
+        opened
+            .iter()
+            .map(|ticket| (ticket.rack, ticket.severity))
+            .collect::<Vec<_>>(),
+        SEEDED_FAULTS[..opened.len()].to_vec(),
+        "repair timing must never perturb the seeded rack and severity sequence"
+    );
+    assert_eq!(
+        opened
+            .iter()
+            .map(|ticket| ticket.id.value())
+            .collect::<Vec<_>>(),
+        (1..=opened.len() as u64).collect::<Vec<_>>(),
+        "ticket identifiers are stable and monotonic"
+    );
+    assert_eq!(
+        scheduler(&app).rng().draws(),
+        2 * scheduler(&app).emitted()
+            + if scheduler(&app).pending().is_some() {
+                2
+            } else {
+                0
+            },
+        "exactly two words are drawn per candidate, and only for candidates"
+    );
+
+    // Multiple simultaneous tickets, and never more than the reviewed maximum.
+    assert_eq!(simultaneous, MAX_ACTIVE_TICKETS);
+    for event in &log {
+        if let JourneyEvent::Opened { ticket, .. } = event {
+            assert!(ticket.rack < 4);
+        }
+    }
+
+    // At least two full recurrence cycles, each honouring the whole cooldown.
+    assert!(
+        recurrences.len() >= 2,
+        "the journey must show at least two recurrence cycles, got {recurrences:?}"
+    );
+    for (rack, removed, reopened) in &recurrences {
+        assert!(
+            reopened - removed >= COOLDOWN_FRAMES as u64,
+            "rack {rack} re-faulted {} ticks after its ticket was removed, \
+             which is inside the {COOLDOWN_FRAMES}-tick cooldown",
+            reopened - removed
+        );
+    }
+    assert!(
+        recurrences
+            .iter()
+            .any(|(_, removed, reopened)| reopened - removed == COOLDOWN_FRAMES as u64),
+        "a candidate held on a cooling rack must fire the instant the cooldown \
+         ends, got {recurrences:?}"
+    );
+    assert!(
+        recurrences
+            .iter()
+            .map(|(rack, _, _)| *rack)
+            .collect::<BTreeSet<_>>()
+            .len()
+            >= 2,
+        "two separate racks must complete a recurrence cycle, got {recurrences:?}"
+    );
+
+    // Every rack that ever faulted is joined to an authored rack row, and the
+    // final state is internally consistent.
+    let queue = ticket_queue(&app);
+    for (rack, state) in rack_states(&app).into_iter().enumerate() {
+        assert_eq!(
+            state.holds_ticket(),
+            queue.contains_rack(rack),
+            "rack {rack} state {state:?} disagrees with the queue"
+        );
+    }
+    assert!(app.world().resource::<PlayerRigReport>().is_healthy());
+    assert_eq!(FAULT_INTERVAL, Duration::from_secs(4));
+    assert_eq!(RESOLVED_DISPLAY, Duration::from_secs(2));
 }

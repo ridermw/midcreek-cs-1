@@ -51,6 +51,7 @@ use crate::{
     assetgen::{TECHNICIAN_BONES, TECHNICIAN_CLIPS},
     assets::GeneratedAssets,
     design::{INITIAL_CAMERA_YAW_DEGREES, PLAYER_RADIUS, PropId, ROOM_SIZE},
+    operations::MovementLock,
     world::{HallColliders, HallState, PlayerSpawnPoint},
 };
 
@@ -446,7 +447,7 @@ pub enum PlayerClip {
     Idle,
     /// Moving under accepted displacement.
     Walk,
-    /// Repairing a rack. Wired for the operations task; nothing plays it yet.
+    /// Repairing a rack, which is exactly while movement is locked.
     Repair,
 }
 
@@ -805,12 +806,21 @@ fn move_player(
     keys: Res<ButtonInput<KeyCode>>,
     basis: Res<ViewBasis>,
     colliders: Res<HallColliders>,
+    lock: Option<Res<MovementLock>>,
     mut motion: ResMut<PlayerMotion>,
     mut technicians: Query<&mut Transform, With<Technician>>,
 ) {
     let Ok(mut transform) = technicians.single_mut() else {
         return;
     };
+
+    // A repair holds the technician still. The arrow keys are dropped rather
+    // than merely blocked, so the published motion really is standing still and
+    // the animation state cannot keep a stale walking pose.
+    if lock.is_some_and(|lock| lock.is_locked()) {
+        *motion = PlayerMotion::default();
+        return;
+    }
 
     let requested_screen = arrow_input(&keys);
     let requested_world = basis.world_direction(requested_screen);
@@ -836,12 +846,16 @@ fn move_player(
     };
 }
 
-/// Drives the generated Idle and Walk clips from accepted displacement. The
-/// idle transition stops Walk and explicitly restores every discovered rest
-/// transform before Idle starts, so a stopped technician never keeps a stale
-/// mid-stride pose.
+/// Drives the generated Idle, Walk, and Repair clips.
+///
+/// A locked repair outranks displacement, because movement is already zero
+/// while it holds. Otherwise accepted displacement chooses Walk or Idle. Every
+/// transition stops the clips it is leaving and explicitly restores every
+/// discovered rest transform first, so no stale mid-stride or mid-repair pose
+/// survives a change of clip.
 pub fn update_player_animation(
     motion: Res<PlayerMotion>,
+    lock: Option<Res<MovementLock>>,
     parts: Res<PlayerParts>,
     animations: Res<PlayerAnimations>,
     mut state: ResMut<PlayerAnimationState>,
@@ -851,7 +865,9 @@ pub fn update_player_animation(
     let Ok(mut player) = players.get_mut(animations.player) else {
         return;
     };
-    let desired = if motion.is_walking() {
+    let desired = if lock.is_some_and(|lock| lock.is_locked()) {
+        PlayerClip::Repair
+    } else if motion.is_walking() {
         PlayerClip::Walk
     } else {
         PlayerClip::Idle
@@ -861,21 +877,19 @@ pub fn update_player_animation(
         return;
     }
 
-    match desired {
-        PlayerClip::Walk => {
-            player.stop(animations.node(PlayerClip::Idle));
-            player.play(animations.node(PlayerClip::Walk)).repeat();
-        }
-        PlayerClip::Idle | PlayerClip::Repair => {
-            player.stop(animations.node(PlayerClip::Walk));
-            for part in parts.all() {
-                if let Ok(mut transform) = transforms.get_mut(part.entity) {
-                    *transform = part.rest;
-                }
-            }
-            player.play(animations.node(PlayerClip::Idle)).repeat();
+    for clip in PlayerClip::ALL {
+        if clip != desired {
+            player.stop(animations.node(clip));
         }
     }
+    if desired != PlayerClip::Walk {
+        for part in parts.all() {
+            if let Ok(mut transform) = transforms.get_mut(part.entity) {
+                *transform = part.rest;
+            }
+        }
+    }
+    player.play(animations.node(desired)).repeat();
     state.current = desired;
 }
 

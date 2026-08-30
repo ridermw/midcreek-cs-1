@@ -2,6 +2,7 @@ pub mod assetgen;
 pub mod assets;
 pub mod camera;
 pub mod design;
+pub mod operations;
 pub mod player;
 pub mod sitegen;
 pub mod world;
@@ -34,6 +35,7 @@ impl Plugin for CellShiftPlugin {
                 world::HallPlugin,
                 player::TechnicianPlugin,
                 camera::CameraPlugin,
+                operations::OperationsPlugin,
             ))
             .configure_sets(
                 Update,
