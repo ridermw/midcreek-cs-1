@@ -12,14 +12,23 @@ concurrency:
 jobs:
   verify:
     name: Verify
-    runs-on: ubuntu-latest
+    # Pinned rather than tracked. `ubuntu-latest` moves to the next image on
+    # GitHub's schedule, and the browser gate below depends on the Chrome this
+    # image ships; a silent image bump is a silently different gate.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
+      # The published timeline resolves commit references against the whole
+      # repository, so the commit graph has to be complete. Only the graph
+      # does: `blob:none` leaves every historical file body — including the
+      # 34 MB WebAssembly blobs on the generated `pages-live` branch — on the
+      # server, so what this checkout transfers stays flat as history grows.
       - name: Check out source
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          filter: blob:none
 
       # The runner's temporary directory is a runner fact, and a job-level
       # `env:` is evaluated before a runner exists. It is resolved here, from
@@ -48,7 +57,43 @@ jobs:
             libegl1 \
             libvulkan1 \
             mesa-vulkan-drivers \
+            vulkan-tools \
             xvfb
+
+      # Dependency sources only. Compiled output is deliberately not cached:
+      # a restored `target/` would let a stale artifact decide a gate, and the
+      # gates here are the only thing the published site is allowed to claim.
+      - name: Cache the Cargo dependency sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-verify-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-deps-verify-${{ runner.os }}-
+
+      # The rendered contract is the site's image evidence, so the adapter it
+      # renders on is pinned to Mesa's software rasterizer instead of whatever
+      # the image happens to expose. The adapter is proved present first: a
+      # name that selects nothing would silently fall back to another device
+      # and publish frames from a renderer nobody chose.
+      - name: Pin the software renderer
+        run: |
+          set -euo pipefail
+          summary="$(xvfb-run -a vulkaninfo --summary 2>&1 || true)"
+          printf '%s\n' "$summary"
+          if ! printf '%s' "$summary" | grep -qi 'llvmpipe'; then
+            echo "no llvmpipe Vulkan device is present on this runner" >&2
+            echo "the rendered contract may only publish software-rendered frames" >&2
+            exit 1
+          fi
+          {
+            echo "LIBGL_ALWAYS_SOFTWARE=1"
+            echo "WGPU_BACKEND=vulkan"
+            echo "WGPU_ADAPTER_NAME=llvmpipe"
+          } >> "$GITHUB_ENV"
 
       # Every named gate runs and is recorded even after an earlier one fails,
       # so one run publishes the whole matrix instead of stopping at the first
@@ -99,6 +144,23 @@ jobs:
           ./scripts/run-gate.sh "$GATES" "Release build" -- \
             cargo build --release
 
+          # Every named gate above has to leave exactly one row behind. A gate
+          # name the recording runner refuses is recorded nowhere and its
+          # command never runs, so a run that is short a row would otherwise
+          # publish a green matrix with one gate silently missing from it. The
+          # shortfall becomes a public failed row instead, and the verdict step
+          # below concludes on it like any other red gate.
+          expected=12
+          recorded=0
+          if [[ -f "$GATES" ]]; then
+            recorded="$(grep -c '' "$GATES")"
+          fi
+          if (( recorded != expected )); then
+            echo "recorded $recorded of $expected named gates" >&2
+            printf '{"name":"Named gate list","status":"failed","duration_ms":0}\n' \
+              >>"$GATES"
+          fi
+
       # The rendered contract keeps its whole run under target/render-contract.
       # Only the report and the frames are lifted into the workflow-owned
       # evidence root; the captured stdout and stderr stay behind as run
@@ -117,12 +179,38 @@ jobs:
           fi
           ls -1 "$destination" || true
 
+      # A green render gate has exactly one interesting run in it: the primary
+      # journey whose frames the site publishes. The fault-injection runs beside
+      # it only prove the analyzers bite, and shipping them turns every routine
+      # green run into a large artifact nobody opens. When the gate went red the
+      # whole directory travels, because then any of those runs may be the
+      # reason it did.
+      - name: Select the rendered run diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          selected="$RUNNER_TEMP/render-diagnostics"
+          rm -rf "$selected"
+          mkdir -p "$selected"
+          gate=""
+          if [[ -f "$GATES" ]]; then
+            gate="$(grep -F '"name":"Rendered image contracts"' "$GATES" | tail -n 1)"
+          fi
+          if [[ "$gate" == *'"status":"passed"'* ]]; then
+            if [[ -d target/render-contract/primary ]]; then
+              cp -R target/render-contract/primary "$selected/primary"
+            fi
+          elif [[ -d target/render-contract ]]; then
+            cp -R target/render-contract/. "$selected/"
+          fi
+          ls -1 "$selected" || true
+
       - name: Upload the rendered run diagnostics
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: render-contract-diagnostics
-          path: target/render-contract
+          path: ${{ runner.temp }}/render-diagnostics
           retention-days: 7
           if-no-files-found: ignore
 
@@ -164,7 +252,7 @@ jobs:
   build-web:
     name: Build web
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -205,6 +293,19 @@ jobs:
           "$chrome" --version
           echo "CHROME=$chrome" >> "$GITHUB_ENV"
 
+      # Dependency sources only, for the same reason Verify caches nothing it
+      # compiles: the packaged WebAssembly the site serves is built here.
+      - name: Cache the Cargo dependency sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-web-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-deps-web-${{ runner.os }}-
+
       - name: Run the web gates
         run: |
           set -uo pipefail
@@ -217,6 +318,20 @@ jobs:
 
           ./scripts/run-gate.sh "$GATES" "Headless browser gate" -- \
             ./scripts/web-smoke.sh "$RESULT/play" "$RESULT/browser"
+
+          # As in Verify: a refused gate name records nothing, so a short row
+          # count is published as a failed row rather than as a green matrix
+          # with a gate missing from it.
+          expected=3
+          recorded=0
+          if [[ -f "$GATES" ]]; then
+            recorded="$(grep -c '' "$GATES")"
+          fi
+          if (( recorded != expected )); then
+            echo "recorded $recorded of $expected named gates" >&2
+            printf '{"name":"Named gate list","status":"failed","duration_ms":0}\n' \
+              >>"$GATES"
+          fi
 
       - name: Summarize the web gates
         id: web
@@ -257,7 +372,7 @@ jobs:
     name: Publish
     if: always()
     needs: [verify, build-web]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -267,10 +382,13 @@ jobs:
       id-token: write
       actions: read
     steps:
+      # As in Verify: the commit graph has to be complete for the published
+      # timeline, but no historical file body has to travel with it.
       - name: Check out source
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          filter: blob:none
 
       - name: Check out previous Pages site
         id: previous
@@ -292,6 +410,18 @@ jobs:
             libx11-dev \
             libxi-dev \
             libxrandr-dev
+
+      # Dependency sources only; Publish compiles the same crate the gates did.
+      - name: Cache the Cargo dependency sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-publish-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-deps-publish-${{ runner.os }}-
 
       # Either upstream job may have failed, been skipped, or never uploaded
       # anything. A missing download is a fact this run publishes, never a
@@ -344,16 +474,49 @@ jobs:
           # publishes: the merged gate matrix, the commit timeline, the
           # inherited screenshot history, whether the verified evidence really
           # projects, and whether a complete playable package was earned.
-          cargo run --quiet --bin sitegen -- inputs \
-            --repository "$GITHUB_WORKSPACE" \
-            --source-commit "$GITHUB_SHA" \
-            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --native-outcome "$VERIFY_RESULT" \
-            --web-outcome "$WEB_RESULT" \
-            "${native_args[@]}" \
-            "${web_args[@]}" \
-            "${previous_args[@]}" \
-            --output "$pages_root"
+          project_inputs() {
+            cargo run --quiet --bin sitegen -- inputs \
+              --repository "$GITHUB_WORKSPACE" \
+              --source-commit "$GITHUB_SHA" \
+              --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --native-outcome "$VERIFY_RESULT" \
+              --web-outcome "$WEB_RESULT" \
+              "${native_args[@]}" \
+              "${@}" \
+              "${previous_args[@]}" \
+              --output "$pages_root"
+          }
+
+          project_inputs "${web_args[@]}"
+
+          # The two evidence sets project together or not at all, so a browser
+          # summary this generator cannot read would take the whole native
+          # render evidence down with it and publish a page with no frames on
+          # it. When the native job declared evidence and nothing projected,
+          # the browser summary is withdrawn from a private copy of the web
+          # artifact and the native evidence is projected on its own. The
+          # packaged game is untouched by that copy, so a green playable build
+          # is still promoted from it.
+          declared_native=0
+          if [[ -f "$RUNNER_TEMP/native/result.json" ]] \
+            && jq -e '.evidence != null' "$RUNNER_TEMP/native/result.json" >/dev/null; then
+            declared_native=1
+          fi
+          if (( declared_native == 1 )) && (( ${#web_args[@]} > 0 )) \
+            && ! jq -e '.verification != null' "$pages_root/inputs.json" >/dev/null; then
+            echo "retrying the projection without this run's browser evidence" >&2
+            retry_web="$RUNNER_TEMP/web-without-browser"
+            rm -rf "$retry_web"
+            cp -R "$RUNNER_TEMP/web" "$retry_web"
+            rm -f "$retry_web/browser/browser-gate.json"
+            project_inputs --web "$retry_web"
+            # The retry is not a silent one: the refused browser evidence is
+            # published as its own failed row, so the site says the frames it
+            # shows came from the native run alone.
+            jq '.gates += [{"name":"Published browser evidence","status":"failed","passed":0,"failed":1,"duration_ms":0,"artifact_url":null}]' \
+              "$pages_root/workflow.json" >"$pages_root/workflow.retry.json"
+            mv "$pages_root/workflow.retry.json" "$pages_root/workflow.json"
+          fi
 
           cargo run --quiet --bin sitegen -- build \
             --inputs "$pages_root/inputs.json" \
@@ -368,9 +531,16 @@ jobs:
           touch "$output/.nojekyll"
           cp .github/pages-live-README.md "$output/README.md"
 
+      # The generated branch carries the packaged game, and that package is a
+      # ~34 MB WebAssembly module. Republishing an identical tree would send
+      # the whole thing again and leave another unreferenced root commit behind
+      # on every run. Git names a tree by its content, so an unchanged
+      # publication is recognised exactly and skipped: the deployment below
+      # still runs, so a run that changes nothing still publishes its status.
       - name: Push generated Pages branch
         env:
           GH_TOKEN: ${{ github.token }}
+          PREVIOUS_CHECKOUT: ${{ steps.previous.outcome }}
         run: |
           set -euo pipefail
 
@@ -382,6 +552,16 @@ jobs:
           git --git-dir="$git_dir" --work-tree="$output" config user.name github-actions[bot]
           git --git-dir="$git_dir" --work-tree="$output" config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git --git-dir="$git_dir" --work-tree="$output" add -A
+
+          if [[ "$PREVIOUS_CHECKOUT" == "success" ]]; then
+            published="$(git -C "$GITHUB_WORKSPACE/previous-pages" rev-parse 'HEAD^{tree}')"
+            staged="$(git --git-dir="$git_dir" --work-tree="$output" write-tree)"
+            if [[ "$staged" == "$published" ]]; then
+              echo "pages-live already carries tree $staged; nothing to push"
+              exit 0
+            fi
+          fi
+
           git --git-dir="$git_dir" --work-tree="$output" commit \
             -m "docs: publish status for ${GITHUB_SHA}"
           git --git-dir="$git_dir" remote add origin \
