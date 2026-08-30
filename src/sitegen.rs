@@ -1112,6 +1112,11 @@ pub enum SitegenError {
     MissingRetainedHistory {
         targets: Vec<String>,
     },
+    /// The current tree carries promoted frames without the gallery manifest
+    /// that always accompanies a real promotion.
+    PartialEvidencePublication {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for SitegenError {
@@ -1224,6 +1229,11 @@ impl fmt::Display for SitegenError {
                 "the published history names {} image(s) no previous publication supplied: {}",
                 targets.len(),
                 targets.join(", ")
+            ),
+            Self::PartialEvidencePublication { path } => write!(
+                formatter,
+                "{} is published without the gallery manifest that must accompany a promotion",
+                path.display()
             ),
         }
     }
@@ -2049,10 +2059,16 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
             "{{STATUS}}",
             render_status(inputs, current_task, &source_commit, updated_at),
         ),
-        ("{{PLAY}}", render_play(inputs.playable.as_ref())),
+        (
+            "{{PLAY}}",
+            mark_reconcilable("play", &render_play(inputs.playable.as_ref())),
+        ),
         (
             "{{MODE}}",
-            render_mode(inputs.playable.is_some(), evidence.is_some()),
+            mark_reconcilable(
+                "mode",
+                &render_mode(inputs.playable.is_some(), evidence.is_some()),
+            ),
         ),
         (
             "{{COMPARISON}}",
@@ -2329,7 +2345,7 @@ pub fn assemble_site(
         disposition,
         BuildDisposition::RetainLastGreen | BuildDisposition::FailedRetainLastGreen
     );
-    let evidence = evidence_publication(current);
+    let evidence = evidence_publication(current)?;
 
     prepare_assembly_output(output)?;
 
@@ -2357,8 +2373,14 @@ pub fn assemble_site(
         copy_previous_artifacts(previous, output, &retained)?;
     }
 
-    // A build never publishes a game it did not earn.
-    let protected: &[&str] = if retains_game {
+    // A build never publishes a game it did not earn. A first run has no
+    // previous game to retain either, so any playable-looking artifact an
+    // inconsistent `current` tree happens to carry is refused here rather
+    // than trusted: the public `assemble_site` API is called directly by
+    // more than the generator's own pipeline, and `FirstRunStatusOnly` is a
+    // guarantee that no game is published, not merely a default.
+    let protected: &[&str] = if retains_game || disposition == BuildDisposition::FirstRunStatusOnly
+    {
         &PLAYABLE_ARTIFACTS
     } else {
         &[]
@@ -2366,6 +2388,13 @@ pub fn assemble_site(
     copy_site_tree(current, current, output, protected)?;
 
     reconcile_last_green(output)?;
+    // `build_site` rendered the current run's own honest state before this
+    // assembly ever ran, blind to whatever game the disposition above just
+    // decided to keep alive. When this run produced no candidate of its own,
+    // the page it wrote still shows the pending state; bring it into
+    // agreement with the retained package this build really carries forward,
+    // never with the current run's own commit.
+    reconcile_playable_display(output, disposition)?;
     require_retained_history(output)?;
     validate_assembled_links(output)?;
     Ok(disposition)
@@ -2404,14 +2433,28 @@ enum EvidencePublication {
     Absent,
 }
 
-fn evidence_publication(current: &Path) -> EvidencePublication {
-    if current.join(CURRENT_SCREENSHOTS).is_dir() {
+/// Classifies what the current tree publishes about verification, refusing
+/// to assume promoted frames and the gallery manifest are an atomic pair.
+///
+/// A build that really promoted frames always writes both together, so a
+/// `screenshots/current` directory with no `gallery.json` beside it is not a
+/// promoted run at all: it is a partial or inconsistent tree that assembly
+/// must name rather than silently treat as a complete promotion.
+fn evidence_publication(current: &Path) -> Result<EvidencePublication, SitegenError> {
+    let has_current_frames = current.join(CURRENT_SCREENSHOTS).is_dir();
+    let has_gallery = current.join(GALLERY_FILE).is_file();
+    if has_current_frames && !has_gallery {
+        return Err(SitegenError::PartialEvidencePublication {
+            path: current.join(CURRENT_SCREENSHOTS),
+        });
+    }
+    Ok(if has_current_frames {
         EvidencePublication::Promoted
     } else if current.join(VERIFICATION_FILE).is_file() {
         EvidencePublication::ProjectionOnly
     } else {
         EvidencePublication::Absent
-    }
+    })
 }
 
 /// Carries named artifacts of a previous publication forward.
@@ -2582,7 +2625,9 @@ pub fn validate_site_output(
         }
     }
 
-    for element in document.select(&selector("a[href], img[src], link[href], script[src]")) {
+    for element in document.select(&selector(
+        "a[href], img[src], link[href], script[src], iframe[src]",
+    )) {
         let attribute = if element.value().attr("href").is_some() {
             "href"
         } else {
@@ -2659,7 +2704,9 @@ pub fn validate_assembled_links(output: &Path) -> Result<(), SitegenError> {
         .filter_map(|element| element.value().attr("id").map(str::to_owned))
         .collect::<BTreeSet<_>>();
 
-    for element in document.select(&selector("a[href], img[src], link[href], script[src]")) {
+    for element in document.select(&selector(
+        "a[href], img[src], link[href], script[src], iframe[src]",
+    )) {
         let attribute = if element.value().attr("href").is_some() {
             "href"
         } else {
@@ -3166,6 +3213,151 @@ fn render_pending_play() -> String {
           <span><kbd>Space</kbd> Repair</span>
         </div>"#
                 .to_owned()
+}
+
+/// The playable panel for a build that carries no candidate of its own
+/// forward, but whose assembly retained a previous publication's package.
+///
+/// Unlike [`render_play`], this never cites a workflow run: the retained
+/// package was never produced or proven by the current run, so it carries no
+/// run proof of its own, only the commit its own retained metadata names.
+fn render_retained_play(source_commit: &str) -> String {
+    format!(
+        r#"<div class="play-frame play-frame-live">
+          <iframe class="play-embed" src="play/index.html" title="Playable Cell Shift data centre build" loading="lazy"></iframe>
+        </div>
+        <div class="control-strip" aria-label="Game controls">
+          <span><kbd>Arrow keys</kbd> Move</span>
+          <span><kbd>Q</kbd>/<kbd>E</kbd> Orbit</span>
+          <span><kbd>Space</kbd> Repair</span>
+        </div>
+        <dl class="provenance">
+          <div><dt>Playable build</dt><dd><code>{}</code></dd></div>
+          <div><dt>Retained from</dt><dd>A previous verified publication; this run did not verify it.</dd></div>
+          <div><dt>Direct link</dt><dd><a href="play/index.html">Open the playable build</a></dd></div>
+        </dl>"#,
+        escape_html(&short_sha(source_commit)),
+    )
+}
+
+/// The publication mode badge for a build displaying a retained game.
+fn render_retained_mode(verified: bool) -> String {
+    let detail = if verified {
+        "Playable build retained from a previous publication; current evidence verified separately"
+    } else {
+        "Playable build retained from a previous publication; current run did not verify"
+    };
+    format!(
+        r#"<div class="hero-badge" aria-label="Current publication mode">
+          <span>Mode</span>
+          <strong>Retained</strong>
+          <small>{detail}</small>
+        </div>"#
+    )
+}
+
+/// Wraps one rendered section in a stable HTML comment pair so a later
+/// assembly can find and, when it must, replace it without ever touching the
+/// rest of the page it did not write.
+fn mark_reconcilable(name: &str, html: &str) -> String {
+    format!("<!--{name}-->{html}<!--/{name}-->")
+}
+
+/// The exact byte range of one `mark_reconcilable` section, including its
+/// delimiting comments.
+fn marked_span(html: &str, name: &str) -> Option<(usize, usize)> {
+    let open = format!("<!--{name}-->");
+    let close = format!("<!--/{name}-->");
+    let start = html.find(&open)?;
+    let content_start = start + open.len();
+    let close_start = html[content_start..].find(&close)? + content_start;
+    Some((start, close_start + close.len()))
+}
+
+fn replace_marked(html: &str, name: &str, replacement: &str) -> String {
+    match marked_span(html, name) {
+        Some((start, end)) => format!("{}{replacement}{}", &html[..start], &html[end..]),
+        None => html.to_owned(),
+    }
+}
+
+/// Whether the current run's own verification evidence, exactly as published
+/// in the assembled tree, proved the current commit.
+///
+/// Reads the published projection rather than any input the build accepted,
+/// so this always names what the page actually stands behind, retained or
+/// not.
+fn current_evidence_succeeded(output: &Path) -> bool {
+    let Ok(json) = fs::read_to_string(output.join(VERIFICATION_FILE)) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|value| value.get("succeeded")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Brings the assembled homepage into agreement with the playable build the
+/// disposition really kept alive.
+///
+/// `build_site` renders the current run's own honest state before it knows
+/// anything this assembly will decide, so a run that produced no candidate of
+/// its own always leaves the pending panel behind, even when a retained game
+/// is about to be carried forward. This is the one place that reconciles the
+/// two: it never touches a page that already shows a game of its own, and it
+/// only ever attributes a retained game to the commit its own retained
+/// metadata names, never to the current run's commit. A retained package or
+/// manifest that is missing, incomplete, or unparsable is treated exactly
+/// like no retained game at all, so the page stays pending rather than
+/// inventing provenance for something that cannot be trusted.
+fn reconcile_playable_display(
+    output: &Path,
+    disposition: BuildDisposition,
+) -> Result<(), SitegenError> {
+    if !matches!(
+        disposition,
+        BuildDisposition::RetainLastGreen | BuildDisposition::FailedRetainLastGreen
+    ) {
+        return Ok(());
+    }
+    let index_path = output.join("index.html");
+    let Ok(html) = fs::read_to_string(&index_path) else {
+        return Ok(());
+    };
+    let Some((play_start, play_end)) = marked_span(&html, "play") else {
+        return Ok(());
+    };
+    // A build that already shows a game of its own is left exactly as it is.
+    if html[play_start..play_end].contains("play-embed") {
+        return Ok(());
+    }
+
+    let package = output.join("play");
+    if !package.is_dir() || !missing_playable_parts(&package).is_empty() {
+        return Ok(());
+    }
+    let Ok(manifest_json) = fs::read_to_string(output.join(LAST_GREEN_FILE)) else {
+        return Ok(());
+    };
+    let Ok(manifest) = serde_json::from_str::<LastGreenManifest>(&manifest_json) else {
+        return Ok(());
+    };
+    if manifest.source_commit.trim().is_empty() {
+        return Ok(());
+    }
+
+    let verified = current_evidence_succeeded(output);
+    let patched = replace_marked(
+        &html,
+        "play",
+        &mark_reconcilable("play", &render_retained_play(&manifest.source_commit)),
+    );
+    let patched = replace_marked(
+        &patched,
+        "mode",
+        &mark_reconcilable("mode", &render_retained_mode(verified)),
+    );
+    write_file(&index_path, patched.as_bytes())
 }
 
 fn render_comparison(

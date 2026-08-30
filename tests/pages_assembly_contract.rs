@@ -139,6 +139,271 @@ fn web_failure_retains_previous_game_with_failure_disposition() {
     assert_eq!(sha256(output.path().join("play/game_bg.wasm")), old_hash);
 }
 
+// ---------------------------------------------------------------------------
+// The homepage displayed by assembly must agree with the game assembly
+// really retained, distinct from whatever the failing current run produced.
+// ---------------------------------------------------------------------------
+
+/// A previous publication's complete package plus the retained metadata that
+/// names the commit it was built from.
+fn previous_retained_playable(name: &str) -> TempDirectory {
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    fixture_site(name, &files)
+}
+
+/// A `current` tree exactly as `build_site` leaves one when the run produced
+/// no playable candidate of its own: the reconcilable `{{PLAY}}`/`{{MODE}}`
+/// sections are marked, and the pending panel carries no `play-embed` iframe.
+const PENDING_CURRENT_PAGE: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play--><div class="play-frame" role="img" aria-label="pending"><div class="empty-state play-empty"><h2>No verified playable build yet</h2></div></div><!--/play-->
+<!--mode--><div class="hero-badge"><strong>Status</strong><small>Game pending verification</small></div><!--/mode-->
+</main></body></html>"#;
+
+#[test]
+fn a_failed_run_with_a_complete_retained_package_shows_the_playable_iframe() {
+    let previous = previous_retained_playable("previous-retained-playable");
+    let current = fixture_site(
+        "current-failed-no-candidate",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("failed-retained-playable-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        // The current run's own commit, distinct from the retained one.
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains(r#"<iframe class="play-embed" src="play/index.html""#),
+        "the retained package must be embedded: {index}"
+    );
+    assert!(
+        index.contains(r#"<a href="play/index.html">"#),
+        "a direct play link must point at the retained package: {index}"
+    );
+    assert!(
+        !index.contains("No verified playable build yet"),
+        "the pending panel must not survive a real retained package: {index}"
+    );
+    assert!(
+        index.contains("22222222"),
+        "the retained commit must be named honestly: {index}"
+    );
+    assert!(
+        !index.contains("1111111111111111111111111111111111111111"),
+        "the failed current commit must never be credited with the retained game: {index}"
+    );
+    assert!(
+        index.contains(">Retained<"),
+        "the mode badge must distinguish a retained game from a current one: {index}"
+    );
+    assert!(!index.contains(">Status<"), "{index}");
+    // The retained iframe path really resolves against the assembled tree.
+    validate_assembled_links(output.path()).unwrap();
+}
+
+#[test]
+fn a_status_only_retention_without_failure_also_shows_the_playable_iframe() {
+    let previous = previous_retained_playable("previous-retained-playable-status-only");
+    let current = fixture_site(
+        "current-status-only-no-candidate",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("status-only-retained-playable-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains(r#"<iframe class="play-embed" src="play/index.html""#),
+        "{index}"
+    );
+}
+
+#[test]
+fn a_run_that_already_shows_its_own_game_is_left_exactly_as_it_is() {
+    let previous = previous_retained_playable("previous-retained-playable-superseded");
+    let current = fixture_site(
+        "current-with-its-own-game",
+        &[(
+            "index.html",
+            r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play--><div class="play-frame play-frame-live"><iframe class="play-embed" src="play/index.html"></iframe></div><!--/play-->
+<!--mode--><div class="hero-badge"><strong>Verified</strong></div><!--/mode-->
+</main></body></html>"#,
+        )],
+    );
+    let output = TempDirectory::new("already-playable-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(index.contains(">Verified<"), "{index}");
+}
+
+#[test]
+fn malformed_retained_metadata_leaves_the_homepage_pending() {
+    let mut files = vec![("last-green.json", "not json")];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-malformed-metadata", &files);
+    let current = fixture_site(
+        "current-failed-malformed-metadata",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("malformed-metadata-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "a retained package with unparsable metadata must never be trusted: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+#[test]
+fn an_incomplete_retained_package_leaves_the_homepage_pending() {
+    let previous = fixture_site(
+        "previous-incomplete-package",
+        &[
+            (
+                "last-green.json",
+                r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":null,"game_files":["play/index.html"],"screenshot_files":[]}"#,
+            ),
+            ("play/index.html", "old shell"),
+        ],
+    );
+    let current = fixture_site(
+        "current-failed-incomplete-retained",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("incomplete-retained-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "an incomplete retained package must never be embedded: {index}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The hub iframe path itself is validated after assembly, not only the
+// anchor links beside it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_broken_iframe_target_is_refused_after_assembly() {
+    let mut current_files = vec![(
+        "index.html",
+        r#"<!doctype html><html><head><title>Hub</title></head><body><main><iframe class="play-embed" src="play/missing.html" title="game"></iframe></main></body></html>"#,
+    )];
+    current_files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("current-broken-iframe", &current_files);
+    let output = TempDirectory::new("broken-iframe-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::BrokenLocalLink { .. })),
+        "{result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The public assembly API must never leak a game a disposition promises it
+// never publishes, and must never assume promoted evidence is atomic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn first_run_status_only_never_publishes_an_inconsistent_current_playable_package() {
+    let mut current_files = vec![("index.html", "CURRENT SOURCE: FAILED")];
+    current_files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("current-inconsistent-first-run", &current_files);
+    let output = TempDirectory::new("first-run-inconsistent-output");
+
+    let disposition = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FirstRunStatusOnly);
+    assert!(!output.path().join("play").exists());
+    assert!(!output.path().join("last-green.json").exists());
+}
+
+#[test]
+fn promoted_frames_without_a_gallery_manifest_are_refused_as_partial_evidence() {
+    let current = fixture_site(
+        "current-partial-evidence",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("screenshots/current/01-healthy-center-ne.png", "frame"),
+        ],
+    );
+    let output = TempDirectory::new("partial-evidence-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(
+            &result,
+            Err(SitegenError::PartialEvidencePublication { .. })
+        ),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn assemble_cli_reports_status_only_retention_without_failure_label() {
     let previous = fixture_site(

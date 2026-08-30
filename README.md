@@ -561,7 +561,15 @@ seconds and shows five approved palette classes across the full 1152x648 canvas.
 
 A green run publishes the package under `play/` together with `last-green.json`.
 Any failing run retains the previous verified game, because `assemble_site`
-treats `play/` and `last-green.json` as one retained domain.
+treats `play/` and `last-green.json` as one retained domain. `assemble_site`
+also reconciles the homepage itself: `build_site` renders a run's own honest
+state before assembly ever decides what it retains, so a run with no candidate
+of its own still leaves the pending panel behind. When assembly keeps a
+previous package alive, it rewrites that panel to embed the retained game and
+name the commit `last-green.json` actually records, never the failing commit
+of the current run — and only once the retained package and manifest both
+prove complete and parse; anything malformed or incomplete leaves the page
+pending instead.
 
 Three containment rules keep publication and the gate from destroying anything:
 
