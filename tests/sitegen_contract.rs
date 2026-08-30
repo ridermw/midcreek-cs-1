@@ -458,7 +458,7 @@ mod progress_contract {
             assert_eq!(output.status.code(), Some(0));
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                "pages-verification\n"
+                "pages-status-always\n"
             );
             assert!(output.stderr.is_empty());
         }
@@ -546,16 +546,16 @@ mod progress_contract {
                 ),
                 (
                     "pages-verification",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["pages-playable", "autonomous-verification"][..],
-                    "Publish comparisons, screenshots, challenges, and test evidence.",
-                    None,
+                    "Published the strict public projection of the verification and browser-gate reports, the current frames beside the approved references, the deduplicated screenshot history, and the sanitized gate and metric evidence.",
+                    Some("HEAD"),
                 ),
                 (
                     "pages-status-always",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["pages-verification"][..],
-                    "Retain the last green game while publishing current status.",
+                    "Wiring the Pages workflow to publish this evidence on every push while retaining the last green game, screenshots, and history.",
                     None,
                 ),
                 (
@@ -598,6 +598,7 @@ mod progress_contract {
                     "a-hundred-megabyte-wasm-game-cannot-be-published",
                     "generated-materials-rendered-far-brighter-than-the-authored-palette",
                     "the-overhead-trays-hid-the-technician-at-two-of-the-four-headings",
+                    "history-images-arrive-after-the-build-that-links-them",
                 ]
             );
             for challenge in &document.challenges {
@@ -642,7 +643,7 @@ mod progress_contract {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             assert_eq!(
                 sha256(root.join("docs/implementation-plan.md")),
-                "567400415c0a6296ba765de2cfae0a3f0575170a4f754a320f50ef69202ff49a"
+                "e2fb52fc73d63e96a512d8da7b2d916b0a2ef712b8cf085bbc738d105af8cc7c"
             );
         }
 

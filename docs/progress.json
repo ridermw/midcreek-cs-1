@@ -105,22 +105,22 @@
     {
       "id": "pages-verification",
       "title": "Publish comparisons, evidence, and verification",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "pages-playable",
         "autonomous-verification"
       ],
-      "summary": "Publish comparisons, screenshots, challenges, and test evidence.",
-      "completed_commit": null
+      "summary": "Published the strict public projection of the verification and browser-gate reports, the current frames beside the approved references, the deduplicated screenshot history, and the sanitized gate and metric evidence.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "pages-status-always",
       "title": "Publish current status while retaining last-green artifacts",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "pages-verification"
       ],
-      "summary": "Retain the last green game while publishing current status.",
+      "summary": "Wiring the Pages workflow to publish this evidence on every push while retaining the last green game, screenshots, and history.",
       "completed_commit": null
     },
     {
@@ -223,6 +223,15 @@
       "impact": "The projected-worker-crop contract found no hard hat and no hi-vis pixels at all in the settled north-west capture and only 0.04 percent in the south-west one. The technician was completely behind a cable tray, which is a real playability failure rather than a measurement artefact: at half the headings the player could not see their own character while standing at a rack.",
       "approach": "An orthographic camera at 57 degrees elevation projects anything at height h onto the ground point cot(57 deg) / sqrt(2) times h away along each ground axis, which is 0.459h per axis. At the original 4 m the trays landed 1.84 m away, right on top of a technician standing at a rack face. Every height was checked against the 6 m rack row spacing rather than nudged.",
       "resolution": "OVERHEAD_TRAY_HEIGHT is now 6.54 m, the height whose 3 m per-axis offset is exactly half the rack row spacing, so a tray hung over an aisle always projects over a rack row and never over the walkway. The trays were also narrowed and their hanging hose runs removed. All fourteen frames now carry hard hat and hi-vis pixels inside the projected worker crop, and the constant carries the derivation beside it so it cannot be tuned away.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "history-images-arrive-after-the-build-that-links-them",
+      "title": "The screenshot history links images the build that renders the page never writes",
+      "status": "resolved",
+      "impact": "Site generation validates that every local link resolves to a real file, which is what keeps a published page from shipping a broken image. The visual history breaks that assumption: only the newest accepted point is written by the build that renders the page, and every earlier point is a file the assembly step copies forward from the previous pages-live branch. Rendering the history therefore failed validation, and rendering it without images would have published a history nobody can look at.",
+      "approach": "The alternative of passing the whole previous site into the generator was rejected: the generator would then have to trust and copy an arbitrary directory of images, which is exactly the containment the publication rules exist to prevent. Instead the generated site declares what it expects assembly to supply.",
+      "resolution": "build_site publishes gallery.json beside index.html, and validate_site_output reads that manifest and accepts a screenshots/history/ link the manifest declares. A history link the manifest does not declare is still a broken link, assemble_site now carries screenshots/history/ forward through a green replacement, and a failed build renders the history without images because it publishes no manifest of its own.",
       "resolved_commit": "HEAD"
     }
   ]

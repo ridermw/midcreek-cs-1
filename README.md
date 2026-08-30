@@ -561,7 +561,8 @@ seconds and shows five approved palette classes across the full 1152x648 canvas.
 
 A green run publishes the package under `play/` together with `last-green.json`.
 Any failing run retains the previous verified game, because `assemble_site`
-treats `play/`, `screenshots/`, and `last-green.json` as retained artifacts.
+treats `play/`, `screenshots/`, `gallery.json`, and `last-green.json` as
+retained artifacts.
 
 Three containment rules keep publication and the gate from destroying anything:
 
@@ -749,6 +750,71 @@ The rendered contract keeps everything under
 `stdout.log`, and `stderr.log`. Every metric failure names the frame, the
 metric, the measured value, and the bound it had to satisfy.
 
+## Published verification evidence
+
+The Pages hub never reads a raw report. `VerificationEvidence::project` takes
+the game's own `report.json`, parsed through the game's own
+`VerificationReport`, and the browser gate's own `browser-gate.json`, and
+produces one strict `VerificationSummary`. Both raw shapes deny unknown fields,
+so a document that grew a command line, a stream capture, an environment map,
+or a hand-edited key is refused instead of being published unread.
+
+The projection carries named gates with counts and durations, published metric
+values, relative artifact paths, the source, asset, reference, and semantic
+hashes, and selected camera, ticket, and UI facts. It carries no command line,
+no captured output, no host or environment value, no absolute path, and no
+`failure_reason`: a failure publishes the named stage it stopped in and the
+metrics that missed their bounds, and the workflow run keeps the rest.
+
+Four containment rules apply before a single pixel is copied:
+
+- every artifact path is resolved strictly inside the directory that declared
+  it, so an absolute path, a `..` escape, a symbolic link, and a link above the
+  directory are all refused;
+- a missing artifact and an undecodable image are refused;
+- an image whose size disagrees with its own report is refused;
+- a report whose approved-reference hashes are not the ones this repository
+  vendors is refused, so the current frame can never be published beside key
+  art it was not measured against.
+
+A green run publishes all fourteen reviewed captures under
+`screenshots/current/`, the reported technician rectangle of the centre frame
+as `worker-crop.png`, the browser canvas proof as `browser-canvas.png`, and the
+sanitized projection as `verification.json`.
+
+```text
+report.json + browser-gate.json
+        |
+        v
+   strict projection ---> verification.json
+        |
+        +--> screenshots/current/   (14 frames, worker crop, browser canvas)
+        |
+        +--> gallery.json ---> screenshots/history/<short SHA>/
+```
+
+`update_gallery` appends one history point only when the semantic hash of the
+canonical report differs from the latest entry. An unchanged hash, a rerun of a
+commit that is already recorded, and a failed run all return the previous
+history untouched, so a documentation-only push cannot duplicate a screenshot
+and a failure cannot erase one. A green run whose hash did not move still
+republishes the current frames.
+
+A failed run writes `verification.json` and nothing else, so `screenshots/` and
+`gallery.json` stay absent from the generated tree and `assemble_site` retains
+whatever the last green publication left there. `gallery.json` is a retained
+artifact alongside `play/`, `screenshots/`, and `last-green.json`, and a green
+replacement now carries `screenshots/history/` forward rather than dropping it.
+
+Because older history images arrive at assembly rather than at generation, the
+published `gallery.json` is what vouches for them: `validate_site_output`
+accepts a `screenshots/history/` link the manifest declares and still rejects
+one it does not.
+
+The site generator and its CLI are native-only. Publication reads the
+repository, decodes verified frames, and writes files, so the browser game
+carries none of it; `scripts/build-web.sh` builds only `--bin midcreek-cs-1`.
+
 ## Foundation gates
 
 ```bash
@@ -801,3 +867,20 @@ real loopback socket and proves single, fragmented, and control-interleaved
 messages reassemble, and that an unexpected continuation frame, an unfinished
 message, and an oversized message each fail with a `GateFailure` instead of
 hanging. `cargo test --test sitegen_contract` runs it too.
+
+Publication previews build from committed fixtures, one verified and one
+failed:
+
+```bash
+cargo run --bin sitegen -- build \
+  --inputs tests/fixtures/sitegen/verified-game/inputs.json \
+  --output target/site-preview
+cargo run --bin sitegen -- build \
+  --inputs tests/fixtures/sitegen/failed-verification/inputs.json \
+  --output target/site-preview-failed
+```
+
+The verified preview publishes fourteen frames, the worker crop, the browser
+canvas, `gallery.json`, and one history point. The failed preview publishes
+`verification.json`, the failed stage, and the failed metrics, and writes no
+screenshots at all.

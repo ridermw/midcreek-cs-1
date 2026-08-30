@@ -242,7 +242,7 @@ Only one material handle per `PaletteRole` may be created at runtime.
 - `src/operations.rs` — seeded fault scheduler, tickets, repair state machine.
 - `src/hud.rs` — ticket stack, badges, controls, status visualization.
 - `src/verification.rs` — explicit verification stages, screenshots, semantic report, watchdog.
-- `src/sitegen.rs` — canonical progress validation, static-site rendering, gallery history, and last-green assembly.
+- `src/sitegen.rs` — canonical progress validation, the strict public projection of the verification and browser-gate reports, static-site rendering, gallery history, and last-green assembly. Native-only: publication decodes verified frames and writes files, so the browser build never carries it.
 - `src/bin/sitegen.rs` — `validate`, `build`, and `assemble` CLI.
 - `src/web.rs` — WASM-only browser readiness bridge.
 - `assets/source/technician.ron`
@@ -522,7 +522,10 @@ No gate may require a person to play, resize, inspect, score, or approve anythin
 | Published plans and diagrams are current | `sitegen check` parses `docs/implementation-plan.md`, validates progress links, and rejects generated-source drift. |
 | Browser game is playable | Pinned WASM build plus headless Chromium requires `data-game-state="ready"`, a nonblank canvas, working control-key suppression, and no captured browser errors. |
 | Failed pushes preserve a working game | Assembly fixtures prove failed native/render/WASM runs update status while retaining prior game and screenshot hashes. |
-| Concept comparisons are authentic | Published reference files must match approved source SHA-256 values and expose their provenance. |
+| Concept comparisons are authentic | Published reference files must match approved source SHA-256 values and expose their provenance, and a report whose recorded reference hashes disagree with the approved manifest is refused. |
+| Published evidence is sanitized | The site renders only a strict projection of `report.json` and `browser-gate.json`; both raw shapes deny unknown fields, and no command line, captured output, host or environment value, absolute path, or free-text failure reason is published. |
+| Published artifacts are contained | Every declared frame resolves strictly inside the directory that declared it; an absolute path, a `..` escape, a symbolic link, a missing file, an undecodable image, and a size that disagrees with its own report are all refused before a byte is copied. |
+| Screenshot history is honest | A history point is appended only when the semantic hash moves; an unchanged hash, a recorded commit, and a failed run leave the history untouched, and a green run whose hash did not move still republishes the current frames. |
 | Pages deployment succeeds | GitHub's Pages deployment API must report success for the pushed `main` commit. |
 
 ## Failure Registry
