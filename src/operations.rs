@@ -876,6 +876,15 @@ impl MovementLock {
     pub const fn ticket(&self) -> Option<TicketId> {
         self.ticket
     }
+
+    /// A lock held by `ticket`. The repair interaction is the only thing that
+    /// takes one at runtime; this exists so contracts can state a locked
+    /// technician directly, without driving a whole repair to get there.
+    pub const fn held_by(ticket: TicketId) -> Self {
+        Self {
+            ticket: Some(ticket),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

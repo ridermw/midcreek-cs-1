@@ -1815,6 +1815,51 @@ fn advance(run: &mut VerificationRun) -> Result<(), String> {
     Ok(())
 }
 
+/// Everything a stalled stage was looking at, in one line.
+///
+/// A stage that burns its frame budget has always been waiting on some piece of
+/// game state, and the bare stage name never says which. This lands in
+/// `failure_reason`, which only a failing report carries, so the canonical
+/// semantics of a successful report are untouched.
+fn stall_facts(run: &VerificationRun, state: &Snapshot) -> String {
+    let held = run
+        .held
+        .iter()
+        .map(|key| key_name(*key))
+        .collect::<Vec<_>>()
+        .join("+");
+    let queue = state
+        .queue
+        .ordered()
+        .iter()
+        .map(|ticket| format!("{}@{}", ticket.id.value(), ticket.rack))
+        .collect::<Vec<_>>()
+        .join(",");
+    let racks = state
+        .rack_states
+        .iter()
+        .map(|rack| format!("{rack:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "player ({:.3}, {:.3}); clip {}; lock {}; outcome {:?}; held [{}]; queue [{}]; racks [{}]; \
+         tick {}; frame {}",
+        state.player.x,
+        state.player.y,
+        clip_name(state.clip),
+        state
+            .lock
+            .ticket()
+            .map_or_else(|| "released".to_owned(), |ticket| ticket.to_string()),
+        state.last.outcome,
+        held,
+        queue,
+        racks,
+        state.tick,
+        run.frame,
+    )
+}
+
 /// Whether the current stage has burned its frame budget.
 fn budget_exhausted(run: &VerificationRun) -> bool {
     if matches!(
@@ -2431,8 +2476,9 @@ fn step_stage(
 ) -> Result<(), String> {
     if budget_exhausted(run) {
         return Err(format!(
-            "stage {} exceeded {STAGE_FRAME_BUDGET} frames",
-            run.machine.stage().name()
+            "stage {} exceeded {STAGE_FRAME_BUDGET} frames; {}",
+            run.machine.stage().name(),
+            stall_facts(run, state)
         ));
     }
 
@@ -2623,20 +2669,24 @@ fn step_stage(
                 .copied()
                 .unwrap_or_default();
             let keys = arrows_towards(&basis, state.player, spot, ARRIVAL_TOLERANCE);
-            hold_keys(run, world, window, &keys);
-            if !keys.is_empty() {
-                return Ok(());
-            }
-            if state.lock.is_locked() {
-                return advance(run);
-            }
-            match state.last.outcome {
-                InteractionOutcome::Started { .. } => advance(run),
-                _ if state.clip == PlayerClip::Idle && run.stage_frame.is_multiple_of(4) => {
+            match begin_repair_action(state, keys.is_empty(), run.stage_frame) {
+                BeginRepairAction::HandOver => {
+                    hold_keys(run, world, window, &[]);
+                    advance(run)
+                }
+                BeginRepairAction::Walk => {
+                    hold_keys(run, world, window, &keys);
+                    Ok(())
+                }
+                BeginRepairAction::Tap => {
+                    hold_keys(run, world, window, &[]);
                     tap_key(run, world, window, REPAIR_KEY);
                     Ok(())
                 }
-                _ => Ok(()),
+                BeginRepairAction::Settle => {
+                    hold_keys(run, world, window, &[]);
+                    Ok(())
+                }
             }
         }
 
@@ -2805,6 +2855,44 @@ fn step_stage(
 
         VerificationStage::WriteReport => advance(run),
         VerificationStage::Success | VerificationStage::Failure => Ok(()),
+    }
+}
+
+/// What one observed frame of [`VerificationStage::BeginRepair`] should do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BeginRepairAction {
+    /// Release every held key and move on to the repair capture.
+    HandOver,
+    /// Keep holding the arrow keys that walk towards the repair spot.
+    Walk,
+    /// Standing on the spot and idle: press the real repair key.
+    Tap,
+    /// Standing on the spot, waiting out the tap cadence.
+    Settle,
+}
+
+/// Decides one frame of the repair hand-over.
+///
+/// Order matters here, and it is the whole point of this function. Accepting a
+/// repair is irreversible: the movement lock takes the controls and the
+/// interaction records [`InteractionOutcome::Started`]. Once either is true the
+/// harness must stop navigating, because the lock it just asked for is exactly
+/// what stops the technician reaching the arrival tolerance. Checking arrival
+/// first lets a sub-centimetre drift past the accepted repair edge mask the
+/// success forever: the stage holds a movement key against a locked
+/// technician, the repair runs to completion underneath it, and the stage burns
+/// its whole frame budget without ever looking at the state it caused.
+fn begin_repair_action(state: &Snapshot, arrived: bool, stage_frame: u64) -> BeginRepairAction {
+    if state.lock.is_locked() || matches!(state.last.outcome, InteractionOutcome::Started { .. }) {
+        return BeginRepairAction::HandOver;
+    }
+    if !arrived {
+        return BeginRepairAction::Walk;
+    }
+    if state.clip == PlayerClip::Idle && stage_frame.is_multiple_of(4) {
+        BeginRepairAction::Tap
+    } else {
+        BeginRepairAction::Settle
     }
 }
 
@@ -4548,4 +4636,313 @@ pub fn blank_hud_fixture(base: &RgbImage, panels: &[PixelRect]) -> RgbImage {
         fill(&mut image, *rect, rgb(PaletteRole::FloorLight));
     }
     image
+}
+
+// ---------------------------------------------------------------------------
+// Stage driver tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::{
+        design::PropId,
+        operations::{RackEntry, TicketId},
+    };
+
+    /// A scratch output directory nothing in these tests ever writes into.
+    fn scratch_output() -> VerifyOutput {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("midcreek-stage-{}-{unique}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        VerifyOutput::prepare(&path).expect("the scratch directory must prepare")
+    }
+
+    /// The two racks the journey reasons about, laid out like the real hall.
+    fn journey_roster() -> RackRoster {
+        RackRoster::from_entries(
+            RACK_ROW_X
+                .into_iter()
+                .enumerate()
+                .map(|(rack, x)| RackEntry {
+                    rack,
+                    id: PropId::new(format!("rack-row-{:02}", rack + 1)),
+                    entity: Entity::PLACEHOLDER,
+                    center: Vec2::new(x, 0.0),
+                    half_extents: Vec2::new(0.6, 4.0),
+                })
+                .collect(),
+        )
+    }
+
+    /// The exact ground point [`VerificationStage::BeginRepair`] walks to.
+    fn journey_spot(roster: &RackRoster) -> Vec2 {
+        let entry = roster.get(JOURNEY_RACK).expect("the journey rack exists");
+        journey_repair_spot(entry.center, entry.half_extents)
+    }
+
+    /// A snapshot of a fully booted hall, parameterised only by the state the
+    /// repair hand-over actually reads.
+    fn begin_repair_snapshot(
+        roster: RackRoster,
+        player: Vec2,
+        clip: PlayerClip,
+        lock: MovementLock,
+        outcome: InteractionOutcome,
+    ) -> Snapshot {
+        let racks = roster.len();
+        Snapshot {
+            assets: AssetLoadState::Ready,
+            hall: HallState::Ready,
+            rig: PlayerRigState::Ready,
+            rig_healthy: true,
+            parts: required_player_parts()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            roster,
+            queue: TicketQueue::default(),
+            tick: 2_192,
+            orbit: CameraOrbit::default(),
+            lock,
+            last: LastInteraction {
+                outcome,
+                tick: 2_100,
+                presses: 2,
+                started: 1,
+                rejected: 1,
+            },
+            hud: HudReport::default(),
+            player,
+            clip,
+            rack_states: vec![RackState::Repairing; racks],
+            scheduler: (3, 0, 0, 0),
+            viewport: Some(UVec2::new(
+                VERIFICATION_WINDOW_WIDTH,
+                VERIFICATION_WINDOW_HEIGHT,
+            )),
+        }
+    }
+
+    /// A run parked on [`VerificationStage::BeginRepair`], plus the world and
+    /// window the driver writes its real key messages into.
+    fn begin_repair_run() -> (World, Entity, VerificationRun) {
+        let mut world = World::new();
+        world.init_resource::<Messages<KeyboardInput>>();
+        world.insert_resource(ViewBasis::default());
+        let window = world.spawn_empty().id();
+
+        let mut run = VerificationRun::new(scratch_output(), None);
+        while run.stage() != VerificationStage::BeginRepair {
+            run.machine
+                .advance()
+                .expect("the documented order reaches begin-repair");
+        }
+        (world, window, run)
+    }
+
+    /// Runs up to `frames` real driver frames, stopping the moment the stage
+    /// hands over, so each test observes exactly one stage's behaviour.
+    fn step_frames(
+        world: &mut World,
+        run: &mut VerificationRun,
+        state: &Snapshot,
+        window: Entity,
+        frames: u64,
+    ) -> Result<(), String> {
+        let entry = run.stage();
+        for _ in 0..frames {
+            run.frame += 1;
+            run.stage_frame += 1;
+            for key in std::mem::take(&mut run.release_next) {
+                write_key(world, window, key, ButtonState::Released);
+            }
+            step_stage(world, run, state, window)?;
+            if run.stage() != entry {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The retained failure exactly: the repair is running, the technician is
+    /// held still off the arrival spot, and a movement key is down.
+    #[test]
+    fn begin_repair_hands_over_when_a_running_repair_holds_the_technician_off_the_spot() {
+        let (mut world, window, mut run) = begin_repair_run();
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        let state = begin_repair_snapshot(
+            roster,
+            spot + Vec2::new(0.0, -1.5),
+            PlayerClip::Repair,
+            MovementLock::held_by(TicketId::new(2)),
+            InteractionOutcome::Started {
+                ticket: TicketId::new(2),
+                rack: JOURNEY_RACK,
+            },
+        );
+
+        step_frames(&mut world, &mut run, &state, window, 8).expect("the stage must not fail");
+
+        assert_eq!(
+            run.stage(),
+            VerificationStage::RepairCapture,
+            "an accepted repair is irreversible: begin-repair must hand over instead of \
+             navigating against the movement lock"
+        );
+        assert!(
+            run.held.is_empty(),
+            "begin-repair must release every movement key on hand-over, still held: {:?}",
+            run.held
+        );
+    }
+
+    /// The retained report can observe a repair that already finished: the
+    /// hand-over must still happen, not stall waiting for a lock that is gone.
+    #[test]
+    fn begin_repair_hands_over_when_the_started_repair_already_released_the_lock() {
+        let (mut world, window, mut run) = begin_repair_run();
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        let state = begin_repair_snapshot(
+            roster,
+            spot + Vec2::new(2.0, 1.0),
+            PlayerClip::Idle,
+            MovementLock::default(),
+            InteractionOutcome::Started {
+                ticket: TicketId::new(2),
+                rack: JOURNEY_RACK,
+            },
+        );
+
+        step_frames(&mut world, &mut run, &state, window, 8).expect("the stage must not fail");
+
+        assert_eq!(run.stage(), VerificationStage::RepairCapture);
+        assert!(run.held.is_empty(), "still held: {:?}", run.held);
+    }
+
+    /// The lock alone is enough, even with no recorded outcome yet.
+    #[test]
+    fn begin_repair_hands_over_on_the_movement_lock_alone() {
+        let (mut world, window, mut run) = begin_repair_run();
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        let state = begin_repair_snapshot(
+            roster,
+            spot + Vec2::new(-0.9, 0.4),
+            PlayerClip::Repair,
+            MovementLock::held_by(TicketId::new(2)),
+            InteractionOutcome::None,
+        );
+
+        step_frames(&mut world, &mut run, &state, window, 4).expect("the stage must not fail");
+
+        assert_eq!(run.stage(), VerificationStage::RepairCapture);
+        assert!(run.held.is_empty(), "still held: {:?}", run.held);
+    }
+
+    /// Navigation is still the behaviour before any repair starts.
+    #[test]
+    fn begin_repair_still_walks_to_the_spot_before_any_repair_starts() {
+        let (mut world, window, mut run) = begin_repair_run();
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        let state = begin_repair_snapshot(
+            roster,
+            spot + Vec2::new(0.0, -4.0),
+            PlayerClip::Walk,
+            MovementLock::default(),
+            InteractionOutcome::OutOfRange {
+                nearest_rack: Some(JOURNEY_RACK),
+                nearest_distance: 4.0,
+            },
+        );
+
+        step_frames(&mut world, &mut run, &state, window, 6).expect("the stage must not fail");
+
+        assert_eq!(
+            run.stage(),
+            VerificationStage::BeginRepair,
+            "an unstarted repair still has to walk to the spot"
+        );
+        assert!(
+            !run.held.is_empty(),
+            "the walk to the repair spot must really hold arrow keys down"
+        );
+    }
+
+    /// Arriving with no repair started still taps the real repair key.
+    #[test]
+    fn begin_repair_taps_the_repair_key_once_it_has_arrived() {
+        let (mut world, window, mut run) = begin_repair_run();
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        let state = begin_repair_snapshot(
+            roster,
+            spot,
+            PlayerClip::Idle,
+            MovementLock::default(),
+            InteractionOutcome::OutOfRange {
+                nearest_rack: Some(JOURNEY_RACK),
+                nearest_distance: 4.0,
+            },
+        );
+
+        step_frames(&mut world, &mut run, &state, window, 4).expect("the stage must not fail");
+
+        assert_eq!(run.stage(), VerificationStage::BeginRepair);
+        assert!(run.held.is_empty(), "arriving releases the arrow keys");
+        assert!(
+            run.observations
+                .keys
+                .iter()
+                .any(|key| key.key == key_name(REPAIR_KEY) && key.state == "pressed"),
+            "begin-repair must press the real repair key: {:?}",
+            run.observations.keys
+        );
+    }
+
+    /// A stage that burns its budget has to say what the game actually looked
+    /// like, so a rare timing failure is diagnosable from the retained report.
+    #[test]
+    fn a_stage_budget_failure_reports_the_state_that_stalled_it() {
+        let (mut world, window, mut run) = begin_repair_run();
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        let state = begin_repair_snapshot(
+            roster,
+            spot + Vec2::new(0.0, -1.5),
+            PlayerClip::Repair,
+            MovementLock::held_by(TicketId::new(2)),
+            InteractionOutcome::Started {
+                ticket: TicketId::new(2),
+                rack: JOURNEY_RACK,
+            },
+        );
+        run.stage_frame = STAGE_FRAME_BUDGET + 1;
+
+        let reason = step_stage(&mut world, &mut run, &state, window)
+            .expect_err("the exhausted budget must fail");
+
+        for fact in [
+            "begin-repair",
+            "player",
+            "clip",
+            "lock",
+            "outcome",
+            "held",
+            "queue",
+            "racks",
+        ] {
+            assert!(
+                reason.contains(fact),
+                "the budget failure must name {fact}: {reason}"
+            );
+        }
+    }
 }
