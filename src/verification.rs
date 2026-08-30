@@ -322,6 +322,13 @@ pub enum VerifyOutputError {
         /// The offending path.
         path: PathBuf,
     },
+    /// The writable probe name is already taken by something this run did not
+    /// create, so proving the directory writable would mean overwriting,
+    /// following, or unlinking a stranger.
+    StaleProbe {
+        /// The offending path.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for VerifyOutputError {
@@ -361,6 +368,12 @@ impl fmt::Display for VerifyOutputError {
             Self::UnsafeArtifact { name, path } => write!(
                 formatter,
                 "refusing to write {name} because {} is not a regular file",
+                path.display()
+            ),
+            Self::StaleProbe { path } => write!(
+                formatter,
+                "refusing to prove {} writable because the probe name is already taken; this run \
+                 did not create it and will not overwrite, follow, or remove it",
                 path.display()
             ),
         }
@@ -453,11 +466,45 @@ impl VerifyOutput {
             }
         }
 
+        // The probe is the one file `prepare` creates, and it may only ever be
+        // a file `prepare` created. Anything already sitting on the name is
+        // refused outright rather than reused: a regular file is debris from a
+        // crashed run and not ours to truncate, and a symbolic link is worse
+        // than that — `fs::write` follows it, so a link aimed at any file this
+        // process can write would be overwritten with the probe text and then
+        // unlinked by the cleanup below, all under a name the caller never
+        // supplied.
         let probe = path.join(PROBE_FILE_NAME);
-        fs::write(&probe, b"probe").map_err(|error| VerifyOutputError::Unwritable {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
+        if fs::symlink_metadata(&probe).is_ok() {
+            return Err(VerifyOutputError::StaleProbe { path: probe });
+        }
+        // `create_new` closes the gap between that check and this write rather
+        // than trusting it: `O_CREAT | O_EXCL` fails on an existing entry and
+        // fails on a symbolic link, so the handle below is always a regular
+        // file this call has just made.
+        let created = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(VerifyOutputError::StaleProbe { path: probe });
+            }
+            Err(error) => {
+                return Err(VerifyOutputError::Unwritable {
+                    path: path.to_path_buf(),
+                    reason: error.to_string(),
+                });
+            }
+        };
+        io::Write::write_all(&mut file, b"probe").map_err(|error| {
+            VerifyOutputError::Unwritable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }
         })?;
+        drop(file);
         fs::remove_file(&probe).map_err(|error| VerifyOutputError::Unwritable {
             path: path.to_path_buf(),
             reason: error.to_string(),
@@ -2214,13 +2261,32 @@ fn capture(
             if !poll_capture(world, run)? {
                 return Ok(false);
             }
-            if let Some((staged, facts)) = run.staged_facts.take() {
-                run.observations
-                    .frames
-                    .insert(staged.file_name().to_owned(), facts);
+            // The readback landed, and the facts that describe it must be the
+            // facts this stage measured for this frame. Neither branch below
+            // may report success: a landed capture with nothing staged would
+            // publish a frame the report says nothing about, and a landed
+            // capture holding somebody else's facts would publish a frame
+            // described by the wrong photograph. Both leave `pending` exactly
+            // as it was, so nothing advances on a failure.
+            match run.staged_facts.take() {
+                Some((staged, facts)) if staged == frame => {
+                    run.observations
+                        .frames
+                        .insert(frame.file_name().to_owned(), facts);
+                    run.pending = None;
+                    Ok(true)
+                }
+                Some((staged, _)) => Err(format!(
+                    "{} landed, but the staged facts belong to {}",
+                    frame.file_name(),
+                    staged.file_name()
+                )),
+                None => Err(format!(
+                    "{} landed with no staged facts; the stage never measured the frame it \
+                     photographed",
+                    frame.file_name()
+                )),
             }
-            run.pending = None;
-            Ok(true)
         }
     }
 }
@@ -4555,7 +4621,28 @@ fn evaluate_equipment(
         if !category.requires_every_prop() {
             continue;
         }
-        for prop in measurable {
+        // Every prop of this family carries its own evidence, so the loop runs
+        // over everything that projects into the viewport rather than over
+        // whatever happened to be measurable. An empty region set is not proof
+        // that a prop is out of shot — `on_screen` is the projection's own
+        // answer to that — so a prop that is in shot and measured nothing is a
+        // failure in its own right, not a prop to quietly skip. Skipping it is
+        // exactly how a rack row that stopped projecting a usable region would
+        // have vanished from the contract while every other row kept it green.
+        for prop in on_screen {
+            if prop.measured.is_empty() {
+                failures.push(failure(
+                    name,
+                    &format!("equipment-{}-unmeasured", prop.facts.id),
+                    0.0,
+                    format!(
+                        "{} projects into the viewport, so it must keep at least one region of \
+                         {EQUIPMENT_REGION_MIN_PIXELS} pixels to be judged on",
+                        prop.facts.id
+                    ),
+                ));
+                continue;
+            }
             if prop.qualifies() {
                 continue;
             }
@@ -5163,8 +5250,27 @@ mod tests {
     /// into one. Holding the guard for the length of the test is what stops
     /// the suite scattering directories through the system temp directory,
     /// one per run, forever.
+    ///
+    /// Both ends of that fail closed. A stale directory that cannot be cleared
+    /// means the fixture is about to run against somebody else's leftovers, and
+    /// a scratch directory that cannot be removed means the leak this guard
+    /// exists to prevent has happened anyway; a discarded `Result` would report
+    /// neither.
     struct Scratch {
         output: VerifyOutput,
+    }
+
+    /// Removes `path` and everything under it, treating "it was not there" as
+    /// success and every other failure as a failure.
+    ///
+    /// This is split out so the distinction is testable: the whole point is
+    /// that `NotFound` is the one error a pre-clean may swallow.
+    fn clear_scratch(path: &Path) -> io::Result<()> {
+        match fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     impl Scratch {
@@ -5173,7 +5279,13 @@ mod tests {
             let unique = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir()
                 .join(format!("midcreek-stage-{}-{unique}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
+            clear_scratch(&path).unwrap_or_else(|error| {
+                panic!(
+                    "a stale scratch directory {} could not be cleared, so this fixture would \
+                     have run against somebody else's leftovers: {error}",
+                    path.display()
+                )
+            });
             Self {
                 output: VerifyOutput::prepare(&path).expect("the scratch directory must prepare"),
             }
@@ -5186,7 +5298,22 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(self.output.root());
+            let root = self.output.root();
+            let Err(error) = clear_scratch(root) else {
+                return;
+            };
+            // Panicking inside a `drop` that is already unwinding aborts the
+            // process and would bury the real failure, so the teardown failure
+            // is reported the only other way it can be.
+            assert!(
+                std::thread::panicking(),
+                "the scratch directory {} could not be removed: {error}",
+                root.display()
+            );
+            eprintln!(
+                "the scratch directory {} could not be removed while unwinding: {error}",
+                root.display()
+            );
         }
     }
 
@@ -5624,6 +5751,121 @@ mod tests {
         assert!(
             reason.contains(other.file_name()) && reason.contains(CAPTURE_TEST_FRAME.file_name()),
             "the failure must name what was waited on and what was outstanding: {reason}"
+        );
+    }
+
+    /// The staging slot and the outstanding capture have to agree, and a
+    /// landed readback with nothing staged is not a success.
+    #[test]
+    fn a_landed_capture_with_no_staged_facts_fails_and_leaves_the_capture_outstanding() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        run.staged_facts = None;
+
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a landed frame nobody measured cannot be reported");
+        assert!(
+            reason.contains(CAPTURE_TEST_FRAME.file_name()) && reason.contains("no staged facts"),
+            "the failure must name the frame it could not describe: {reason}"
+        );
+        assert!(
+            run.observations.frames.is_empty(),
+            "nothing may be reported for a frame with no measured facts"
+        );
+        assert!(
+            run.pending.is_some(),
+            "a failure must not clear the capture as though it had succeeded"
+        );
+    }
+
+    /// The same, for facts staged against a different frame.
+    #[test]
+    fn a_landed_capture_holding_another_frames_facts_fails_without_reporting_either() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        let other = FrameName::HealthyCenterNorthEast;
+        assert_ne!(other, CAPTURE_TEST_FRAME);
+        let (_, facts) = run
+            .staged_facts
+            .take()
+            .expect("the request staged this frame's facts");
+        run.staged_facts = Some((other, facts));
+
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("one frame's photograph may not be described by another's facts");
+        assert!(
+            reason.contains(CAPTURE_TEST_FRAME.file_name()) && reason.contains(other.file_name()),
+            "the failure must name both frames: {reason}"
+        );
+        assert!(
+            run.observations.frames.is_empty(),
+            "neither frame may be reported"
+        );
+        assert!(
+            run.pending.is_some(),
+            "a failure must not clear the capture as though it had succeeded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scratch hygiene
+    // -----------------------------------------------------------------------
+
+    /// The scratch pre-clean swallows exactly one error and no others: a
+    /// directory that was never there is nothing to clear, and anything else
+    /// means the fixture is about to run on top of somebody else's state.
+    #[test]
+    fn clearing_scratch_forgives_a_missing_directory_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!(
+            "midcreek-scratch-clear-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        clear_scratch(&root).expect("a directory that was never there is already clear");
+
+        fs::create_dir_all(root.join("nested")).expect("the test owns this directory");
+        fs::write(root.join("nested/frame.png"), b"x").expect("the test owns this file");
+        clear_scratch(&root).expect("a real scratch tree clears");
+        assert!(!root.exists());
+
+        // A path whose parent is a regular file cannot be a directory, and the
+        // operating system says so with something other than `NotFound`.
+        let blocker = root.with_extension("file");
+        let _ = fs::remove_file(&blocker);
+        fs::write(&blocker, b"not a directory").expect("the test owns this file");
+        let error = clear_scratch(&blocker.join("under-a-file"))
+            .expect_err("a path under a regular file is not a clearable directory");
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "this fixture only proves anything if the error is not the forgiven one: {error}"
+        );
+        fs::remove_file(&blocker).expect("the test owns this file");
+    }
+
+    /// The guard really does remove what it made, so the fail-closed teardown
+    /// is not firing on every test.
+    #[test]
+    fn a_scratch_guard_removes_its_own_directory() {
+        let root = {
+            let scratch = Scratch::new();
+            let root = scratch.output.root().to_path_buf();
+            assert!(root.is_dir(), "the guard prepared a real directory");
+            root
+        };
+        assert!(
+            !root.exists(),
+            "the guard must remove {} when it drops",
+            root.display()
         );
     }
 

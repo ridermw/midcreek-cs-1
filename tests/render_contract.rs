@@ -305,6 +305,71 @@ fn the_writable_probe_is_a_declared_owned_name_and_never_survives() {
     );
 }
 
+/// A probe name that is already taken belongs to somebody else, and `prepare`
+/// must refuse rather than reuse it.
+///
+/// A plain file there is debris from a crashed run and not ours to truncate. A
+/// symbolic link is the dangerous case: `fs::write` follows it, so a link left
+/// pointing at any file this process can write would have been overwritten
+/// with the probe text and then unlinked by the cleanup, under a name the
+/// caller never supplied and inside a directory whose whole contract is that
+/// it touches only names it declared.
+#[test]
+fn verify_output_refuses_a_probe_name_it_did_not_create() {
+    // A regular file on the name.
+    let temp = TempDir::new("probe-file");
+    let probe = temp.join(PROBE_FILE_NAME);
+    fs::write(&probe, b"someone got here first").expect("the test owns this file");
+
+    let error = VerifyOutput::prepare(temp.path())
+        .expect_err("a probe name this run did not create must be refused");
+    assert_eq!(
+        error,
+        VerifyOutputError::StaleProbe {
+            path: probe.clone()
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(&probe).expect("the stale probe survives"),
+        "someone got here first",
+        "the refusal must leave the file it refused exactly as it found it"
+    );
+
+    // A symbolic link on the name, aimed at a file outside the directory.
+    let linked = TempDir::new("probe-symlink-target");
+    let target = linked.join("private.txt");
+    fs::write(&target, b"do not touch").expect("the test owns this file");
+    let temp = TempDir::new("probe-symlink");
+    let probe = temp.join(PROBE_FILE_NAME);
+    std::os::unix::fs::symlink(&target, &probe).expect("the test owns this link");
+
+    let error = VerifyOutput::prepare(temp.path())
+        .expect_err("a probe name held by a symbolic link must be refused");
+    assert_eq!(
+        error,
+        VerifyOutputError::StaleProbe {
+            path: probe.clone()
+        }
+    );
+    assert!(
+        fs::symlink_metadata(&probe)
+            .expect("the link survives")
+            .file_type()
+            .is_symlink(),
+        "the refusal must not unlink what it refused"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("the link target survives"),
+        "do not touch",
+        "the refusal must never have written through the link"
+    );
+
+    // And the refusal is specific: the same directory prepares once the name
+    // is free again, so this is not simply a directory that never prepares.
+    fs::remove_file(&probe).expect("the test owns this link");
+    VerifyOutput::prepare(temp.path()).expect("a free probe name prepares");
+}
+
 #[test]
 fn verify_output_artifact_paths_stay_inside_the_prepared_root() {
     let temp = TempDir::new("artifact-paths");
@@ -1981,25 +2046,251 @@ fn category_regions(facts: &FrameFacts, category: EquipmentCategory) -> Vec<Rect
         .collect()
 }
 
-/// Whether any rectangle of `left` shares a pixel with any rectangle of
-/// `right`, once both are snapped to the frame the way the analyzers snap them.
+/// The fraction of one prop's measured rectangles that a set of masked
+/// rectangles actually paints over.
 ///
-/// Masking paints real pixels out, so a prop whose own measured rectangle
-/// overlaps the rectangles being masked genuinely loses evidence. Deciding
-/// that from the reported geometry is what lets the mutation tests allow
-/// exactly the collateral the hall's authored layout forces and no more —
-/// rather than exempting a named pair of families outright, which would also
-/// hide a tray and a rack that had stopped being drawn at all.
-fn regions_overlap(facts: &FrameFacts, left: &[RectFacts], right: &[RectFacts]) -> bool {
+/// Counted per pixel rather than per rectangle, so overlapping masks are not
+/// double counted and a rectangle that clips a corner contributes only the
+/// corner. This is the quantity the collateral exemption is decided on: a
+/// masked region either removed enough of a prop's evidence to explain that
+/// prop failing, or it did not.
+fn masked_coverage(facts: &FrameFacts, masked: &[RectFacts], prop: &[RectFacts]) -> f64 {
     let snap = |rect: &RectFacts| PixelRect::snap(*rect, facts.width, facts.height);
-    left.iter().map(snap).any(|a| {
-        right.iter().map(snap).any(|b| {
-            a.x < b.x + b.width
-                && b.x < a.x + a.width
-                && a.y < b.y + b.height
-                && b.y < a.y + a.height
-        })
-    })
+    let masks = masked.iter().map(snap).collect::<Vec<_>>();
+    let mut total = 0u64;
+    let mut covered = 0u64;
+    for rect in prop.iter().map(snap) {
+        total += rect.area();
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                if masks.iter().any(|mask| {
+                    x >= mask.x
+                        && x < mask.x + mask.width
+                        && y >= mask.y
+                        && y < mask.y + mask.height
+                }) {
+                    covered += 1;
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    covered as f64 / total as f64
+}
+
+/// How much of a prop's own measured area a mask has to remove before that
+/// prop failing counts as explained collateral rather than a regression.
+///
+/// A shared edge or a clipped corner is not an explanation. The authored
+/// coupling this exists for — a tray hung over an aisle projecting onto the
+/// rack row behind it — covers most of the rack segment it lands on, so half
+/// is a threshold the real overlap clears comfortably while a grazing
+/// rectangle cannot. Anything below it and the secondary failure has to stand
+/// on its own as a genuine regression.
+const COLLATERAL_COVERAGE_MIN: f64 = 0.5;
+
+/// Whether masking `masked` removed enough of `prop`'s measured pixels to
+/// explain `prop` failing too.
+///
+/// The earlier form of this asked only whether the two rectangle sets
+/// intersected at all, which a single shared pixel satisfied — so a prop that
+/// merely touched the masked family was excused from every contract it
+/// subsequently failed, whatever the real cause.
+fn mask_explains_collateral(facts: &FrameFacts, masked: &[RectFacts], prop: &[RectFacts]) -> bool {
+    masked_coverage(facts, masked, prop) >= COLLATERAL_COVERAGE_MIN
+}
+
+/// A shared pixel is not an explanation.
+///
+/// The collateral exemption exists for the one authored coupling in the hall —
+/// a tray hung over an aisle projects onto the rack row behind it — and it has
+/// to be earned by the mask actually removing that prop's evidence. Deciding
+/// it on bare intersection meant one touching pixel excused a prop from every
+/// contract it went on to fail.
+#[test]
+fn collateral_is_explained_by_covered_pixels_and_not_by_a_shared_edge() {
+    let facts = synthetic_facts();
+    let rect = |x: f64, y: f64, width: f64, height: f64| RectFacts {
+        x,
+        y,
+        width,
+        height,
+    };
+    let prop = vec![rect(100.0, 100.0, 100.0, 100.0)];
+
+    // One pixel of overlap in the corner: 1 of 10,000 covered.
+    let corner = vec![rect(199.0, 199.0, 1.0, 1.0)];
+    let coverage = masked_coverage(&facts, &corner, &prop);
+    assert!(
+        (coverage - 0.0001).abs() < 1.0e-9,
+        "a one-pixel touch covers one pixel in ten thousand, measured {coverage}"
+    );
+    assert!(
+        !mask_explains_collateral(&facts, &corner, &prop),
+        "a single shared pixel may never excuse a prop from failing"
+    );
+
+    // No pixels at all, in both directions.
+    assert_eq!(masked_coverage(&facts, &[], &prop), 0.0);
+    assert!(!mask_explains_collateral(&facts, &[], &prop));
+    assert_eq!(masked_coverage(&facts, &corner, &[]), 0.0);
+    assert!(
+        !mask_explains_collateral(&facts, &corner, &[]),
+        "a prop that measured nothing has no evidence a mask could have removed"
+    );
+
+    // A rectangle that shares an edge but no interior pixel.
+    let abutting = vec![rect(200.0, 100.0, 50.0, 100.0)];
+    assert_eq!(masked_coverage(&facts, &abutting, &prop), 0.0);
+    assert!(!mask_explains_collateral(&facts, &abutting, &prop));
+
+    // Just under and just over the threshold.
+    let half = vec![rect(100.0, 100.0, 100.0, 49.0)];
+    assert!(!mask_explains_collateral(&facts, &half, &prop));
+    let over = vec![rect(100.0, 100.0, 100.0, 51.0)];
+    assert!(mask_explains_collateral(&facts, &over, &prop));
+
+    // Overlapping masks are counted once, not twice: two rectangles that each
+    // cover a third and share most of it must not add up to an explanation.
+    let overlapping = vec![
+        rect(100.0, 100.0, 100.0, 34.0),
+        rect(100.0, 110.0, 100.0, 24.0),
+    ];
+    let coverage = masked_coverage(&facts, &overlapping, &prop);
+    assert!(
+        coverage < COLLATERAL_COVERAGE_MIN,
+        "double counting overlapping masks would manufacture an explanation, measured {coverage}"
+    );
+    assert!(!mask_explains_collateral(&facts, &overlapping, &prop));
+
+    // The real coupling still qualifies.
+    let most = vec![rect(90.0, 90.0, 120.0, 120.0)];
+    assert!((masked_coverage(&facts, &most, &prop) - 1.0).abs() < 1.0e-9);
+    assert!(mask_explains_collateral(&facts, &most, &prop));
+}
+
+/// An empty region set is not proof that a prop is out of shot.
+///
+/// `on_screen` is the projection's own answer to "is this in the viewport";
+/// `regions` is the separate question of whether anything measurable survived
+/// clipping and the minimum-area floor. The per-prop rack-row contract used to
+/// iterate only the measurable props, so a row that projected into the frame
+/// and measured nothing was skipped in silence — indistinguishable, to the
+/// gate, from a row that was legitimately off screen.
+#[test]
+fn an_on_screen_prop_with_no_measured_region_fails_instead_of_being_skipped() {
+    /// One rack row's projected rectangle, laid out so four fit side by side.
+    fn row_rect(row: usize) -> RectFacts {
+        RectFacts {
+            x: 40.0 + 300.0 * row as f64,
+            y: 200.0,
+            width: 200.0,
+            height: 200.0,
+        }
+    }
+
+    fn rack_row(row: usize, on_screen: bool, measurable: bool) -> EquipmentFacts {
+        EquipmentFacts {
+            id: format!("rack-row-{:02}", row + 1),
+            category: EquipmentCategory::RackRows.name().to_owned(),
+            world_bounds: [[-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]],
+            projected_bounds: [0.0, 0.0, 1.0, 1.0],
+            on_screen,
+            regions: if measurable {
+                vec![row_rect(row)]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// A frame whose four rack rows are exactly as described, with every
+    /// measurable row painted so it satisfies the rack role groups.
+    fn evaluate(rows: [EquipmentFacts; 4]) -> Vec<String> {
+        let mut facts = synthetic_facts();
+        facts.equipment = rows.to_vec();
+        let mut image = synthetic_frame(FIXTURE_WIDTH, FIXTURE_HEIGHT);
+        for prop in &facts.equipment {
+            for rect in &prop.regions {
+                let snapped = PixelRect::snap(*rect, facts.width, facts.height);
+                for y in snapped.y..snapped.y + snapped.height {
+                    for x in snapped.x..snapped.x + snapped.width {
+                        // Four fifths rack white, one fifth ink: comfortably
+                        // over the role floor for both required groups.
+                        let role = if y < snapped.y + snapped.height / 5 {
+                            PaletteRole::Ink
+                        } else {
+                            PaletteRole::RackWhite
+                        };
+                        image.put_pixel(x, y, image::Rgb(role.color().to_u8_array_no_alpha()));
+                    }
+                }
+            }
+        }
+        let regions = frame_regions(&facts);
+        evaluate_frame(
+            FrameName::HealthyCenterNorthEast,
+            &facts,
+            &FrameMetrics::compute(&image, &regions),
+            reference_metrics(),
+        )
+        .into_iter()
+        .map(|failure| failure.metric)
+        .collect()
+    }
+
+    // All four rows in shot and measurable: no rack-row prop complains.
+    let healthy = evaluate([
+        rack_row(0, true, true),
+        rack_row(1, true, true),
+        rack_row(2, true, true),
+        rack_row(3, true, true),
+    ]);
+    for row in 1..=4 {
+        for suffix in ["", "-unmeasured"] {
+            let metric = format!("equipment-rack-row-{row:02}{suffix}");
+            assert!(
+                !healthy.contains(&metric),
+                "a fully measured hall must not report {metric}: {healthy:?}"
+            );
+        }
+    }
+
+    // The fourth row projects into the viewport and measures nothing. That is
+    // the case this contract exists for, and it has to be a failure naming
+    // that row alone.
+    let unmeasured = evaluate([
+        rack_row(0, true, true),
+        rack_row(1, true, true),
+        rack_row(2, true, true),
+        rack_row(3, true, false),
+    ]);
+    assert!(
+        unmeasured.contains(&"equipment-rack-row-04-unmeasured".to_owned()),
+        "an on-screen rack row with no measurable region must fail: {unmeasured:?}"
+    );
+    for row in 1..=3 {
+        let metric = format!("equipment-rack-row-{row:02}-unmeasured");
+        assert!(
+            !unmeasured.contains(&metric),
+            "the measured rows must stay green, got {metric}"
+        );
+    }
+
+    // The same row genuinely off screen is the documented exclusion, and must
+    // not be reported — otherwise the new failure would just be noise.
+    let off_screen = evaluate([
+        rack_row(0, true, true),
+        rack_row(1, true, true),
+        rack_row(2, true, true),
+        rack_row(3, false, false),
+    ]);
+    assert!(
+        !off_screen.contains(&"equipment-rack-row-04-unmeasured".to_owned()),
+        "a row that really is out of shot carries no region and no failure: {off_screen:?}"
+    );
 }
 
 /// Every mandatory contract one image fails, by metric name.
@@ -2108,6 +2399,20 @@ fn rendered_run_projects_every_required_equipment_family_from_real_bounds() {
                     "{frame:?} {} is off screen and must contribute no region",
                     prop.id
                 );
+            } else if prop.regions.is_empty() {
+                // The other direction, which is the one an empty region set
+                // used to be allowed to fake. A prop that projects into the
+                // viewport and measures nothing carries no evidence, and the
+                // gate has to know which props those are by name rather than
+                // discovering the set has quietly grown.
+                assert!(
+                    EXPECTED_ON_SCREEN_SLIVERS.contains(&(frame.file_name(), prop.id.as_str())),
+                    "{frame:?} {} projects into the viewport at {:?} but measured no region; \
+                     an unmeasured prop is not proof of being out of shot, so it has to be \
+                     either measurable or pinned",
+                    prop.id,
+                    prop.projected_bounds
+                );
             }
             for rect in &prop.regions {
                 let snapped = PixelRect::snap(*rect, facts.width, facts.height);
@@ -2188,6 +2493,58 @@ const EXPECTED_OFF_SCREEN: [(&str, &str); 1] = [("07-settled-sw.png", "utility-c
 /// heading sees all four. This list is exhaustive and exact: a row that
 /// disappears anywhere else, or a row that reappears here, fails.
 const EXPECTED_OFF_SCREEN_ROWS: [(&str, &str); 1] = [("01-healthy-center-ne.png", "rack-row-04")];
+
+/// The props that project into the viewport but measure nothing, by frame and
+/// prop identifier.
+///
+/// These are painted floor markings the camera catches edge-on at the bottom
+/// of the frame: the whole prop is in shot by a few pixels of height, so every
+/// segment it is split into clips to a sliver below the
+/// [`EQUIPMENT_REGION_MIN_PIXELS`] floor and is dropped before measurement.
+/// That is a real and acceptable outcome — a four-pixel band carries no stable
+/// ratio — but it is *not* the same thing as being off screen, and letting the
+/// two look alike is exactly how an unmeasured prop hides. Every one is named
+/// here, so a prop that newly stops being measurable fails until somebody
+/// decides it is this and not a regression.
+///
+/// No rack row appears here, and none can: a rack row is two metres tall, so
+/// it cannot reduce to a sliver while it is still in shot. The rows are the
+/// one family contracted prop by prop, which is why that matters.
+const EXPECTED_ON_SCREEN_SLIVERS: [(&str, &str); 10] = [
+    ("01-healthy-center-ne.png", "floor-marking-aisle-03-east"),
+    ("06-settled-se.png", "floor-marking-hazard-east"),
+    ("06-settled-se.png", "floor-marking-hazard-north"),
+    ("06-settled-se.png", "floor-marking-hazard-south"),
+    ("07-settled-sw.png", "floor-marking-hazard-east"),
+    ("07-settled-sw.png", "floor-marking-hazard-north"),
+    ("07-settled-sw.png", "floor-marking-hazard-south"),
+    ("08-settled-nw.png", "floor-marking-hazard-east"),
+    ("08-settled-nw.png", "floor-marking-hazard-north"),
+    ("08-settled-nw.png", "floor-marking-hazard-south"),
+];
+
+/// No rack row may be pinned as an unmeasured sliver: the rows are the family
+/// every prop of which carries its own evidence, and a two-metre cabinet in
+/// shot always projects a measurable region.
+#[test]
+fn no_individually_contracted_prop_is_pinned_as_an_unmeasured_sliver() {
+    for (frame, id) in EXPECTED_ON_SCREEN_SLIVERS {
+        assert!(
+            !id.starts_with("rack-row-"),
+            "{frame} {id}: a rack row may never be excused as a sliver"
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for entry in EXPECTED_ON_SCREEN_SLIVERS {
+        assert!(seen.insert(entry), "{entry:?} is pinned twice");
+    }
+    for (frame, id) in EXPECTED_OFF_SCREEN_ROWS {
+        assert!(
+            !EXPECTED_ON_SCREEN_SLIVERS.contains(&(frame, id)),
+            "{frame} {id} cannot be both off screen and an on-screen sliver"
+        );
+    }
+}
 
 /// The measured share, for one category on one frame, of the weakest role
 /// group in whichever of that category's regions carries the most evidence.
@@ -2340,13 +2697,15 @@ fn masking_one_equipment_category_fails_that_category_alone() {
                             .equipment
                             .iter()
                             .find(|prop| prop.id == id)
-                            .is_some_and(|prop| regions_overlap(facts, &regions, &prop.regions))
+                            .is_some_and(|prop| {
+                                mask_explains_collateral(facts, &regions, &prop.regions)
+                            })
                     })
                     .collect::<Vec<_>>();
                 assert!(
                     props.is_empty(),
-                    "{frame:?}: masking {} must leave every {} prop it does not physically \
-                     overlap green, got {props:?}",
+                    "{frame:?}: masking {} must leave green every {} prop whose own \
+                     measured area it did not mostly paint over, got {props:?}",
                     category.name(),
                     other.name()
                 );
@@ -2396,12 +2755,13 @@ fn masking_one_rack_row_fails_only_that_rack_row() {
                 "{frame:?}: masking {id} must fail its own contract, got {failures:?}"
             );
             for (other, other_regions) in &rows {
-                if other == id || regions_overlap(facts, regions, other_regions) {
+                if other == id || mask_explains_collateral(facts, regions, other_regions) {
                     continue;
                 }
                 assert!(
                     !failures.contains(&format!("equipment-{other}")),
-                    "{frame:?}: masking {id} must leave {other} green, got {failures:?}"
+                    "{frame:?}: masking {id} must leave {other} green unless it painted \
+                     over most of {other}, got {failures:?}"
                 );
             }
         }
@@ -2498,7 +2858,7 @@ fn semantic_report_reproduces_in_a_different_output_directory() {
                 &run.canonical,
                 &Banned {
                     keys: Vec::new(),
-                    substrings: vec![other.to_string_lossy().into_owned()],
+                    values: vec![other.to_string_lossy().into_owned()],
                 },
                 label,
             );
@@ -2576,50 +2936,108 @@ fn assert_scan_is_clean(canonical: &str, banned: &Banned, label: &str) {
 
 /// Everything a canonical report may never carry.
 ///
-/// The two halves are matched differently on purpose. A *key* is banned as a
-/// whole JSON key — `"user":` and never a bare `user` — because the words are
-/// short and generic, and a schema that one day gains `user_presses` or
-/// `elapsed_ticks` would otherwise start failing a privacy scan for a name
-/// that leaks nothing. A *substring* is banned anywhere it appears, because
-/// what those entries name is an absolute path or a host root, which has no
-/// legitimate place in the document at any depth.
+/// The scan walks the parsed document rather than grepping its text, because
+/// the two questions it asks are structural. A *key* is judged by name and
+/// matched whole, so a schema that one day gains `user_presses` or
+/// `elapsed_ticks` is not failed for a name that leaks nothing. A *value* is
+/// judged by shape: the report's paths are all repository-relative by
+/// contract, so anything absolute is a leak whatever key it hides under, and
+/// so is any value carrying this host's own names.
 struct Banned {
     keys: Vec<String>,
-    substrings: Vec<String>,
+    /// Values that identify this machine or the directory it ran in.
+    values: Vec<String>,
 }
 
-/// Every banned key or substring one canonical document actually carries.
+/// Whether one string value is an absolute path in any form the report might
+/// pick up.
+///
+/// Report values are read after JSON unescaping, so a Windows path that was
+/// serialized as `"C:\\Users\\bob"` is examined here as `C:\Users\bob` — which
+/// is why the drive test is one character and a colon rather than a search for
+/// doubled backslashes. Any drive letter counts, not just `C`.
+fn is_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    // UNC, `\\server\share`, and its forward-slash spelling.
+    if value.starts_with("\\\\") || value.starts_with("//") {
+        return true;
+    }
+    // Unix absolute, and a Windows root-relative `\path`.
+    if value.starts_with('/') || value.starts_with('\\') {
+        return true;
+    }
+    // Any drive letter: `C:\`, `d:/`, or a bare `C:`.
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    false
+}
+
+/// Whether one string value climbs out of the directory it is relative to.
+fn escapes_upwards(value: &str) -> bool {
+    value.split(['/', '\\']).any(|component| component == "..")
+}
+
+/// Every banned key or value one canonical document actually carries.
+///
+/// Reported as `key = value` so a failure names the leak rather than the rule.
 fn scan_violations(canonical: &str, banned: &Banned) -> Vec<String> {
-    banned
-        .keys
-        .iter()
-        .map(|key| format!("\"{key}\":"))
-        .filter(|needle| canonical.contains(needle.as_str()))
-        .chain(
-            banned
-                .substrings
-                .iter()
-                .filter(|needle| canonical.contains(needle.as_str()))
-                .cloned(),
-        )
-        .collect()
+    let document: serde_json::Value =
+        serde_json::from_str(canonical).expect("a canonical report is JSON");
+    let mut found = Vec::new();
+    walk_json(&document, "", banned, &mut found);
+    found
+}
+
+/// Walks every key and string value of one parsed document.
+fn walk_json(value: &serde_json::Value, key: &str, banned: &Banned, found: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, child) in fields {
+                if banned.keys.iter().any(|banned| banned == name) {
+                    found.push(format!("key {name}"));
+                }
+                walk_json(child, name, banned, found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_json(item, key, banned, found);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if is_absolute_path(text) {
+                found.push(format!("absolute path at {key}: {text}"));
+            }
+            if escapes_upwards(text) {
+                found.push(format!("upward path at {key}: {text}"));
+            }
+            for needle in &banned.values {
+                if !needle.is_empty() && text.contains(needle.as_str()) {
+                    found.push(format!("host value at {key}: {text}"));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Everything a canonical report may never carry, whoever produced it.
 fn banned_report_substrings() -> Banned {
-    let mut substrings = [
-        "/Users/",
-        "/home/",
-        "/tmp/",
-        "/var/folders/",
-        "C:\\",
-        "BEVY_ASSET_ROOT",
-    ]
-    .map(str::to_owned)
-    .to_vec();
-    substrings.push(repository().to_string_lossy().into_owned());
-    if let Some(home) = std::env::var_os("HOME") {
-        substrings.push(home.to_string_lossy().into_owned());
+    let mut values = vec![repository().to_string_lossy().into_owned()];
+    for name in ["HOME", "USER", "LOGNAME", "HOSTNAME"] {
+        if let Some(value) = std::env::var_os(name) {
+            let value = value.to_string_lossy().into_owned();
+            if value.len() >= 3 {
+                values.push(value);
+            }
+        }
+    }
+    if let Ok(host) = std::process::Command::new("hostname").output() {
+        let host = String::from_utf8_lossy(&host.stdout).trim().to_owned();
+        if host.len() >= 3 {
+            values.push(host);
+        }
     }
     Banned {
         keys: [
@@ -2628,7 +3046,11 @@ fn banned_report_substrings() -> Banned {
             "elapsed",
             "duration_ms",
             "hostname",
+            "host",
             "user",
+            "username",
+            "cwd",
+            "BEVY_ASSET_ROOT",
             "CARGO",
             "RUST_LOG",
             "HOME",
@@ -2636,37 +3058,72 @@ fn banned_report_substrings() -> Banned {
         ]
         .map(str::to_owned)
         .to_vec(),
-        substrings,
+        values,
     }
 }
 
-/// The scan has to catch what it exists to catch and nothing else: a key that
-/// merely *contains* a banned word is a legitimate schema name.
+/// The scan has to catch what it exists to catch and nothing else.
+///
+/// Every positive fixture is a leak the report would be wrong to publish;
+/// every negative one is a value the report legitimately carries today.
 #[test]
-fn the_privacy_scan_matches_whole_keys_rather_than_bare_words() {
+fn the_privacy_scan_reads_paths_and_keys_rather_than_bare_words() {
     let banned = banned_report_substrings();
+    let document = |body: &str| format!("{{\"frames\": {body}}}");
+
     for leak in [
-        "{\"user\": \"mattheww\"}",
-        "{\"timestamp\": 1}",
-        "{\"elapsed\": 1}",
-        "{\"HOME\": \"/x\"}",
-        "{\"PATH\": \"/x\"}",
-        "{\"frames\": \"/var/folders/mh/x\"}",
+        // Keys, whatever their value.
+        "{\"user\": 1}".to_owned(),
+        "{\"timestamp\": 1}".to_owned(),
+        "{\"elapsed\": 1}".to_owned(),
+        "{\"hostname\": 1}".to_owned(),
+        "{\"cwd\": 1}".to_owned(),
+        "{\"HOME\": 1}".to_owned(),
+        "{\"PATH\": 1}".to_owned(),
+        "{\"BEVY_ASSET_ROOT\": 1}".to_owned(),
+        // Unix absolute paths, under an innocent key.
+        document("\"/var/folders/mh/x/report.json\""),
+        document("\"/home/runner/work/midcreek\""),
+        document("\"/Users/someone/frames\""),
+        // Windows drives, on any letter, as the document really carries them.
+        document(r#""C:\\Users\\someone\\frames""#),
+        document(r#""D:\\build\\midcreek""#),
+        document(r#""z:/build/midcreek""#),
+        // UNC, both spellings.
+        document(r#""\\\\build-server\\share\\frames""#),
+        document("\"//build-server/share/frames\""),
+        // Upward escapes at any depth.
+        document("\"../../etc/passwd\""),
+        document("\"assets/../../../etc/passwd\""),
+        // Nested inside arrays and objects, not just at the top level.
+        "{\"gameplay\": {\"keys\": [{\"stage\": \"/Users/someone\"}]}}".to_owned(),
     ] {
         assert!(
-            !scan_violations(leak, &banned).is_empty(),
+            !scan_violations(&leak, &banned).is_empty(),
             "the scan must catch {leak}"
         );
     }
+
     for innocent in [
-        "{\"user_presses\": 2}",
-        "{\"elapsed_ticks\": 2}",
-        "{\"pathological\": 2}",
-        "{\"repaired_rack\": 1}",
+        // The repository-relative values the report is built out of.
+        document("\"assets/generated/hall.glb\""),
+        document("\"src/verification.rs\""),
+        document("\"01-healthy-center-ne.png\""),
+        document("\"assets/references/key-art.png\""),
+        // Keys that merely contain a banned word.
+        "{\"user_presses\": 2}".to_owned(),
+        "{\"elapsed_ticks\": 2}".to_owned(),
+        "{\"pathological\": 2}".to_owned(),
+        "{\"repaired_rack\": 1}".to_owned(),
+        // A value that contains a colon but is not a drive.
+        document("\"rack-row-01:segment-3\""),
+        // A stage name with a dot that is not an upward component.
+        document("\"begin-repair.stage\""),
     ] {
         assert!(
-            scan_violations(innocent, &banned).is_empty(),
-            "the scan must not fail a legitimate schema key: {innocent}"
+            scan_violations(&innocent, &banned).is_empty(),
+            "the scan must not fail a legitimate value: {innocent}, got {:?}",
+            scan_violations(&innocent, &banned)
         );
     }
 }
@@ -2679,15 +3136,28 @@ fn the_real_canonical_report_carries_no_wall_clock_host_path_or_environment() {
 
     // The scan has to be load-bearing rather than vacuous: doctoring the real
     // document with the absolute output root it was written into, a host
-    // clock, and an environment name must be caught by the same scan.
+    // clock, and an environment name must be caught by the same scan. Each
+    // injection is a well-formed field, because the scan now parses the
+    // document rather than grepping it.
     for injected in [
-        run.root.to_string_lossy().into_owned(),
-        "\"generated_at\": \"2026-01-01T00:00:00Z\"".to_owned(),
-        "\"BEVY_ASSET_ROOT\": \"x\"".to_owned(),
+        format!(
+            "\"leaked_root\": {},",
+            serde_json::to_string(&run.root.to_string_lossy().into_owned())
+                .expect("a path serializes")
+        ),
+        "\"generated_at\": \"2026-01-01T00:00:00Z\",".to_owned(),
+        "\"BEVY_ASSET_ROOT\": \"x\",".to_owned(),
+        "\"leaked_unc\": \"\\\\\\\\build-server\\\\share\",".to_owned(),
+        "\"leaked_drive\": \"D:\\\\build\\\\midcreek\",".to_owned(),
     ] {
         let doctored = run
             .canonical
             .replace("\"frames\":", &format!("{injected}\n  \"frames\":"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&doctored).is_ok(),
+            "the doctored document must stay parseable, or the scan is not being exercised: \
+             {injected}"
+        );
         assert!(
             !scan_violations(&doctored, &banned).is_empty(),
             "the scan must catch {injected:?}"
