@@ -155,13 +155,68 @@ fn verify_output_rejects_a_path_that_is_not_a_directory() {
     );
 }
 
+/// Creates a symbolic link to a directory, or reports why this platform would
+/// not.
+///
+/// The link contracts are real safety contracts — `prepare` must refuse a
+/// linked output directory and must refuse a linked probe name — so the tests
+/// that exercise them have to be able to make a link. Unix always can. Windows
+/// needs Developer Mode or the `SeCreateSymbolicLinkPrivilege`, and a machine
+/// without it cannot exercise the contract at all; that is a missing privilege
+/// rather than a broken contract, and it is reported loudly instead of quietly
+/// passing.
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+/// The same, for a link standing where a regular file is expected.
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+/// Whether a failed link attempt is this platform declining to let an
+/// unprivileged process make one, rather than a real error.
+///
+/// Only Windows ever declines. On Unix a failure here is a genuine fault and
+/// must fail the test, because a skipped safety contract is indistinguishable
+/// from a passing one.
+fn link_privilege_missing(error: &std::io::Error) -> bool {
+    cfg!(windows)
+        && matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+        )
+}
+
 #[test]
 fn verify_output_rejects_a_symbolic_link() {
     let temp = TempDir::new("symlink");
     let real = temp.join("real");
     fs::create_dir_all(&real).expect("the test owns this directory");
     let link = temp.join("link");
-    std::os::unix::fs::symlink(&real, &link).expect("the test owns this link");
+    if let Err(error) = symlink_dir(&real, &link) {
+        assert!(
+            link_privilege_missing(&error),
+            "the test owns this link: {error}"
+        );
+        eprintln!(
+            "skipping the symbolic-link refusal contract: this Windows session may not create \
+             symbolic links ({error}). The contract is exercised on every Unix run and in CI."
+        );
+        return;
+    }
 
     assert_eq!(
         VerifyOutput::prepare(&link),
@@ -169,6 +224,16 @@ fn verify_output_rejects_a_symbolic_link() {
     );
 }
 
+/// A directory the process cannot write to has to be refused before a run
+/// commits to it.
+///
+/// Unix only, and gated rather than skipped at runtime: the fixture works by
+/// clearing the write bit, and Windows has no mode bits — making a directory
+/// unwritable there means editing an ACL, which is a different fixture rather
+/// than the same one spelled differently. `prepare`'s refusal is
+/// platform-independent; what is Unix-specific is the only cheap way to
+/// produce the condition.
+#[cfg(unix)]
 #[test]
 fn verify_output_rejects_an_unwritable_directory() {
     let temp = TempDir::new("unwritable");
@@ -191,6 +256,62 @@ fn verify_output_rejects_an_unwritable_directory() {
         .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut restore, 0o700);
     let _ = fs::set_permissions(&locked, restore);
+}
+
+/// Nothing in this file may reach a platform-specific API without a gate.
+///
+/// This is the compile coverage for a file that cannot be cross-compiled here:
+/// the render contract is built and run on Unix, so an ungated
+/// `std::os::unix::...` breaks the Windows build without anything local
+/// noticing. Reading the source back and insisting every such call sits under
+/// its own `#[cfg]` is the cheapest check that actually fails when the mistake
+/// is reintroduced.
+#[test]
+fn every_platform_specific_call_in_this_file_is_gated() {
+    let path = repository().join("tests/render_contract.rs");
+    let source = fs::read_to_string(&path).expect("the test can read its own source");
+    let lines = source.lines().collect::<Vec<_>>();
+
+    let mut checked = 0usize;
+    let mut gate: Option<&str> = None;
+    for (index, line) in lines.iter().enumerate() {
+        // Attributes and item boundaries at column zero delimit one top-level
+        // item, so a gate applies until that item closes.
+        if *line == "#[cfg(unix)]" {
+            gate = Some("unix");
+        } else if *line == "#[cfg(windows)]" {
+            gate = Some("windows");
+        } else if *line == "}" {
+            gate = None;
+        }
+
+        let family = if line.contains("std::os::unix") {
+            "unix"
+        } else if line.contains("std::os::windows") {
+            "windows"
+        } else {
+            continue;
+        };
+        // Doc comments and this assertion's own two family names are prose,
+        // not calls.
+        if line.trim_start().starts_with("///") || line.contains("line.contains") {
+            continue;
+        }
+        checked += 1;
+        assert_eq!(
+            gate,
+            Some(family),
+            "{}:{} reaches a {family} API from an item gated {gate:?}: {}",
+            path.display(),
+            index + 1,
+            line.trim()
+        );
+    }
+    assert!(
+        checked >= 4,
+        "this guard only means something while the file really does use platform APIs, found \
+         {checked}"
+    );
 }
 
 #[test]
@@ -341,7 +462,18 @@ fn verify_output_refuses_a_probe_name_it_did_not_create() {
     fs::write(&target, b"do not touch").expect("the test owns this file");
     let temp = TempDir::new("probe-symlink");
     let probe = temp.join(PROBE_FILE_NAME);
-    std::os::unix::fs::symlink(&target, &probe).expect("the test owns this link");
+    if let Err(error) = symlink_file(&target, &probe) {
+        assert!(
+            link_privilege_missing(&error),
+            "the test owns this link: {error}"
+        );
+        eprintln!(
+            "skipping the linked-probe refusal contract: this Windows session may not create \
+             symbolic links ({error}). The file half above ran, and the link half is exercised \
+             on every Unix run and in CI."
+        );
+        return;
+    }
 
     let error = VerifyOutput::prepare(temp.path())
         .expect_err("a probe name held by a symbolic link must be refused");
@@ -2046,71 +2178,133 @@ fn category_regions(facts: &FrameFacts, category: EquipmentCategory) -> Vec<Rect
         .collect()
 }
 
-/// The fraction of one prop's measured rectangles that a set of masked
-/// rectangles actually paints over.
+/// Every pixel rectangle of one prop, snapped the way the analyzers snap them.
+fn snapped(facts: &FrameFacts, rects: &[RectFacts]) -> Vec<PixelRect> {
+    rects
+        .iter()
+        .map(|rect| PixelRect::snap(*rect, facts.width, facts.height))
+        .collect()
+}
+
+/// Whether one pixel falls inside any of a set of rectangles.
+fn inside(rects: &[PixelRect], x: u32, y: u32) -> bool {
+    rects.iter().any(|rect| {
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    })
+}
+
+/// Straight-line RGB distance between one pixel and one authored role.
+fn role_distance(pixel: image::Rgb<u8>, role: PaletteRole) -> f64 {
+    let role = role.color().to_u8_array_no_alpha();
+    (0..3)
+        .map(|channel| f64::from(pixel.0[channel]) - f64::from(role[channel]))
+        .map(|delta| delta * delta)
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// What a mask did to one prop's own evidence.
 ///
-/// Counted per pixel rather than per rectangle, so overlapping masks are not
-/// double counted and a rectangle that clips a corner contributes only the
-/// corner. This is the quantity the collateral exemption is decided on: a
-/// masked region either removed enough of a prop's evidence to explain that
-/// prop failing, or it did not.
-fn masked_coverage(facts: &FrameFacts, masked: &[RectFacts], prop: &[RectFacts]) -> f64 {
-    let snap = |rect: &RectFacts| PixelRect::snap(*rect, facts.width, facts.height);
-    let masks = masked.iter().map(snap).collect::<Vec<_>>();
-    let mut total = 0u64;
-    let mut covered = 0u64;
-    for rect in prop.iter().map(snap) {
-        total += rect.area();
+/// Both numbers are counted from real pixels rather than inferred from
+/// rectangle geometry, because geometry cannot tell the difference between a
+/// prop whose own pixels were painted over and a prop that never had any and
+/// was reading its neighbour's through an overlapping rectangle.
+struct CollateralEvidence {
+    /// Pixels inside the prop's regions that matched one of the category's
+    /// required roles *before* the mask and lie under it.
+    removed_role_pixels: u64,
+    /// The largest measurable area the mask left untouched in any one region.
+    ///
+    /// This is the load-bearing quantity. A prop the mask left a judgeable
+    /// region of is still answerable on that region: if it fails there, it
+    /// failed on evidence the mask never touched, and the mask explains
+    /// nothing.
+    judgeable_pixels: u64,
+}
+
+/// Measures what masking `masked` actually took away from `prop`.
+fn collateral_evidence(
+    base: &RgbImage,
+    facts: &FrameFacts,
+    masked: &[RectFacts],
+    prop: &[RectFacts],
+    category: EquipmentCategory,
+) -> CollateralEvidence {
+    let masks = snapped(facts, masked);
+    let roles = category
+        .role_groups()
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect::<Vec<_>>();
+    let mut removed_role_pixels = 0u64;
+    let mut judgeable_pixels = 0u64;
+    for rect in snapped(facts, prop) {
+        let mut untouched = 0u64;
         for y in rect.y..rect.y + rect.height {
             for x in rect.x..rect.x + rect.width {
-                if masks.iter().any(|mask| {
-                    x >= mask.x
-                        && x < mask.x + mask.width
-                        && y >= mask.y
-                        && y < mask.y + mask.height
-                }) {
-                    covered += 1;
+                if !inside(&masks, x, y) {
+                    untouched += 1;
+                    continue;
+                }
+                let pixel = *base.get_pixel(x, y);
+                if roles
+                    .iter()
+                    .any(|role| role_distance(pixel, *role) <= PALETTE_TOLERANCE)
+                {
+                    removed_role_pixels += 1;
                 }
             }
         }
+        judgeable_pixels = judgeable_pixels.max(untouched);
     }
-    if total == 0 {
-        return 0.0;
+    CollateralEvidence {
+        removed_role_pixels,
+        judgeable_pixels,
     }
-    covered as f64 / total as f64
 }
 
-/// How much of a prop's own measured area a mask has to remove before that
-/// prop failing counts as explained collateral rather than a regression.
+/// Whether masking one family explains a *different* prop failing too.
 ///
-/// A shared edge or a clipped corner is not an explanation. The authored
-/// coupling this exists for — a tray hung over an aisle projecting onto the
-/// rack row behind it — covers most of the rack segment it lands on, so half
-/// is a threshold the real overlap clears comfortably while a grazing
-/// rectangle cannot. Anything below it and the secondary failure has to stand
-/// on its own as a genuine regression.
-const COLLATERAL_COVERAGE_MIN: f64 = 0.5;
-
-/// Whether masking `masked` removed enough of `prop`'s measured pixels to
-/// explain `prop` failing too.
+/// Two conditions, and the second is the one that does the work.
 ///
-/// The earlier form of this asked only whether the two rectangle sets
-/// intersected at all, which a single shared pixel satisfied — so a prop that
-/// merely touched the masked family was excused from every contract it
-/// subsequently failed, whatever the real cause.
-fn mask_explains_collateral(facts: &FrameFacts, masked: &[RectFacts], prop: &[RectFacts]) -> bool {
-    masked_coverage(facts, masked, prop) >= COLLATERAL_COVERAGE_MIN
+/// The mask must have removed some of that prop's own required-role pixels —
+/// a mask that painted over nothing the contract measures cannot explain a
+/// contract failing. And it must have left the prop nothing measurable to be
+/// judged on: less than [`EQUIPMENT_REGION_MIN_PIXELS`] untouched in every one
+/// of its regions.
+///
+/// That second condition is what a rectangle-overlap fraction could never
+/// express. A prop with a judgeable region left over *was* judged, on pixels
+/// the mask never touched, and it failed there — so it had no evidence of its
+/// own in the first place and was reading its neighbour's through an
+/// overlapping rectangle. That is exactly the regression the mutation tests
+/// exist to catch, and half the rectangle being covered would have excused it.
+fn mask_explains_collateral(
+    base: &RgbImage,
+    facts: &FrameFacts,
+    masked: &[RectFacts],
+    prop: &[RectFacts],
+    category: EquipmentCategory,
+) -> bool {
+    let evidence = collateral_evidence(base, facts, masked, prop, category);
+    evidence.removed_role_pixels > 0 && evidence.judgeable_pixels < EQUIPMENT_REGION_MIN_PIXELS
 }
 
-/// A shared pixel is not an explanation.
+/// Geometry cannot tell a painted-over prop from a prop that never had pixels
+/// of its own.
 ///
 /// The collateral exemption exists for the one authored coupling in the hall —
 /// a tray hung over an aisle projects onto the rack row behind it — and it has
-/// to be earned by the mask actually removing that prop's evidence. Deciding
-/// it on bare intersection meant one touching pixel excused a prop from every
-/// contract it went on to fail.
+/// to be earned by the mask actually taking that prop's evidence away. A
+/// rectangle-overlap fraction cannot express that. A prop whose measured
+/// rectangle merely straddles its neighbour's reads the neighbour's pixels as
+/// its own; mask the neighbour and it fails, and any overlap threshold it
+/// happens to clear excuses it. The rule is therefore about what the mask left
+/// behind: a prop with a judgeable region still standing was judged on pixels
+/// the mask never touched, and failing there is its own fault.
 #[test]
-fn collateral_is_explained_by_covered_pixels_and_not_by_a_shared_edge() {
+fn collateral_is_attributed_to_removed_role_pixels_and_not_to_rectangle_overlap() {
+    const ROWS: EquipmentCategory = EquipmentCategory::RackRows;
     let facts = synthetic_facts();
     let rect = |x: f64, y: f64, width: f64, height: f64| RectFacts {
         x,
@@ -2118,57 +2312,210 @@ fn collateral_is_explained_by_covered_pixels_and_not_by_a_shared_edge() {
         width,
         height,
     };
-    let prop = vec![rect(100.0, 100.0, 100.0, 100.0)];
 
-    // One pixel of overlap in the corner: 1 of 10,000 covered.
-    let corner = vec![rect(199.0, 199.0, 1.0, 1.0)];
-    let coverage = masked_coverage(&facts, &corner, &prop);
+    /// Paints one rectangle as authored rack: mostly rack white over an inked
+    /// band, which is what the rack role groups are measured on.
+    fn paint_rack(image: &mut RgbImage, rect: PixelRect) {
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                let role = if y < rect.y + rect.height / 5 {
+                    PaletteRole::Ink
+                } else {
+                    PaletteRole::RackWhite
+                };
+                image.put_pixel(x, y, image::Rgb(role.color().to_u8_array_no_alpha()));
+            }
+        }
+    }
+
+    // A real prop: two hundred pixels square of authored rack.
+    let real = rect(100.0, 100.0, 200.0, 200.0);
+    let mut base = synthetic_frame(FIXTURE_WIDTH, FIXTURE_HEIGHT);
+    paint_rack(&mut base, PixelRect::snap(real, facts.width, facts.height));
+
+    // A one-pixel touch removes no role pixels worth speaking of and leaves
+    // the whole region judgeable.
+    let corner = vec![rect(299.0, 299.0, 1.0, 1.0)];
+    let touch = collateral_evidence(&base, &facts, &corner, &[real], ROWS);
     assert!(
-        (coverage - 0.0001).abs() < 1.0e-9,
-        "a one-pixel touch covers one pixel in ten thousand, measured {coverage}"
+        touch.judgeable_pixels >= EQUIPMENT_REGION_MIN_PIXELS,
+        "a one-pixel touch leaves the prop entirely judgeable"
     );
     assert!(
-        !mask_explains_collateral(&facts, &corner, &prop),
+        !mask_explains_collateral(&base, &facts, &corner, &[real], ROWS),
         "a single shared pixel may never excuse a prop from failing"
     );
 
-    // No pixels at all, in both directions.
-    assert_eq!(masked_coverage(&facts, &[], &prop), 0.0);
-    assert!(!mask_explains_collateral(&facts, &[], &prop));
-    assert_eq!(masked_coverage(&facts, &corner, &[]), 0.0);
+    // Nothing on either side explains nothing.
+    assert!(!mask_explains_collateral(&base, &facts, &[], &[real], ROWS));
     assert!(
-        !mask_explains_collateral(&facts, &corner, &[]),
+        !mask_explains_collateral(&base, &facts, &corner, &[], ROWS),
         "a prop that measured nothing has no evidence a mask could have removed"
     );
 
-    // A rectangle that shares an edge but no interior pixel.
-    let abutting = vec![rect(200.0, 100.0, 50.0, 100.0)];
-    assert_eq!(masked_coverage(&facts, &abutting, &prop), 0.0);
-    assert!(!mask_explains_collateral(&facts, &abutting, &prop));
-
-    // Just under and just over the threshold.
-    let half = vec![rect(100.0, 100.0, 100.0, 49.0)];
-    assert!(!mask_explains_collateral(&facts, &half, &prop));
-    let over = vec![rect(100.0, 100.0, 100.0, 51.0)];
-    assert!(mask_explains_collateral(&facts, &over, &prop));
-
-    // Overlapping masks are counted once, not twice: two rectangles that each
-    // cover a third and share most of it must not add up to an explanation.
-    let overlapping = vec![
-        rect(100.0, 100.0, 100.0, 34.0),
-        rect(100.0, 110.0, 100.0, 24.0),
-    ];
-    let coverage = masked_coverage(&facts, &overlapping, &prop);
-    assert!(
-        coverage < COLLATERAL_COVERAGE_MIN,
-        "double counting overlapping masks would manufacture an explanation, measured {coverage}"
+    // An abutting rectangle shares an edge and no interior pixel.
+    let abutting = vec![rect(300.0, 100.0, 50.0, 200.0)];
+    assert_eq!(
+        collateral_evidence(&base, &facts, &abutting, &[real], ROWS).removed_role_pixels,
+        0
     );
-    assert!(!mask_explains_collateral(&facts, &overlapping, &prop));
+    assert!(!mask_explains_collateral(
+        &base,
+        &facts,
+        &abutting,
+        &[real],
+        ROWS
+    ));
 
-    // The real coupling still qualifies.
-    let most = vec![rect(90.0, 90.0, 120.0, 120.0)];
-    assert!((masked_coverage(&facts, &most, &prop) - 1.0).abs() < 1.0e-9);
-    assert!(mask_explains_collateral(&facts, &most, &prop));
+    // Sixty per cent of the rectangle covered: the old geometric rule called
+    // this an explanation. What it really leaves is 16,000 untouched pixels,
+    // far more than the measurable floor, so the prop is still answerable.
+    let most = vec![rect(100.0, 100.0, 200.0, 120.0)];
+    let partial = collateral_evidence(&base, &facts, &most, &[real], ROWS);
+    assert!(
+        partial.removed_role_pixels > 0,
+        "the mask really did paint over rack pixels"
+    );
+    assert_eq!(partial.judgeable_pixels, 200 * 80);
+    assert!(
+        !mask_explains_collateral(&base, &facts, &most, &[real], ROWS),
+        "a prop the mask left a judgeable region of has to answer on that region"
+    );
+
+    // Covered down to a sliver: nothing measurable is left, so no verdict on
+    // this prop is possible and the mask genuinely explains its silence.
+    let nearly_all = vec![rect(100.0, 100.0, 200.0, 198.0)];
+    let smothered = collateral_evidence(&base, &facts, &nearly_all, &[real], ROWS);
+    assert!(smothered.removed_role_pixels > 0);
+    assert!(smothered.judgeable_pixels < EQUIPMENT_REGION_MIN_PIXELS);
+    assert!(mask_explains_collateral(
+        &base,
+        &facts,
+        &nearly_all,
+        &[real],
+        ROWS
+    ));
+
+    // A mask that removes no role pixels at all cannot explain a role metric
+    // failing, however much of the rectangle it covers. The synthetic frame is
+    // a whole scene, so the control here is a plain floor: the one surface the
+    // equipment role groups deliberately exclude.
+    let bare = RgbImage::from_pixel(
+        FIXTURE_WIDTH,
+        FIXTURE_HEIGHT,
+        image::Rgb(PaletteRole::FloorLight.color().to_u8_array_no_alpha()),
+    );
+    let evidence = collateral_evidence(&bare, &facts, &nearly_all, &[real], ROWS);
+    assert_eq!(
+        evidence.removed_role_pixels, 0,
+        "the floor carries none of the rack roles, so there was nothing of the contract's to take"
+    );
+    assert!(!mask_explains_collateral(
+        &bare,
+        &facts,
+        &nearly_all,
+        &[real],
+        ROWS
+    ));
+}
+
+/// The regression the geometric rule could not express: a prop that never
+/// spawned, whose rectangle straddles a real neighbour, and which was passing
+/// on the neighbour's pixels all along.
+///
+/// Masking the neighbour is what exposes it. Under a rectangle-overlap rule
+/// the borrower is excused precisely because it overlaps — the more of its
+/// evidence it was borrowing, the more certainly it is let off. Attribution
+/// refuses: the borrower keeps a judgeable region of its own, is judged on it,
+/// and has nothing there.
+#[test]
+fn a_prop_borrowing_its_neighbours_pixels_is_not_excused_by_the_overlap() {
+    const ROWS: EquipmentCategory = EquipmentCategory::RackRows;
+    let facts = synthetic_facts();
+    let rect = |x: f64, y: f64, width: f64, height: f64| RectFacts {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    // The neighbour really is drawn, from x = 100 to x = 340.
+    let neighbour = rect(100.0, 100.0, 240.0, 200.0);
+    let mut base = synthetic_frame(FIXTURE_WIDTH, FIXTURE_HEIGHT);
+    let painted = PixelRect::snap(neighbour, facts.width, facts.height);
+    for y in painted.y..painted.y + painted.height {
+        for x in painted.x..painted.x + painted.width {
+            let role = if y < painted.y + painted.height / 5 {
+                PaletteRole::Ink
+            } else {
+                PaletteRole::RackWhite
+            };
+            image::GenericImage::put_pixel(
+                &mut base,
+                x,
+                y,
+                image::Rgb(role.color().to_u8_array_no_alpha()),
+            );
+        }
+    }
+
+    // The borrower spans x = 220 to x = 420. Its first 120 columns sit on the
+    // neighbour and its last 80 are bare floor: it never drew anything.
+    let borrower = rect(220.0, 100.0, 200.0, 200.0);
+    let overlap_fraction = 120.0 / 200.0;
+    assert!(
+        overlap_fraction >= 0.5,
+        "the borrower has to clear the retired geometric threshold, or this proves nothing"
+    );
+
+    let evidence = collateral_evidence(&base, &facts, &[neighbour], &[borrower], ROWS);
+    assert!(
+        evidence.removed_role_pixels > 0,
+        "masking the neighbour really does take rack pixels out of the borrower's rectangle"
+    );
+    assert_eq!(
+        evidence.judgeable_pixels,
+        80 * 200,
+        "the borrower's own eighty columns are untouched by the mask"
+    );
+    assert!(
+        evidence.judgeable_pixels >= EQUIPMENT_REGION_MIN_PIXELS,
+        "and they are far more than enough to be judged on"
+    );
+    assert!(
+        !mask_explains_collateral(&base, &facts, &[neighbour], &[borrower], ROWS),
+        "a prop that was reading its neighbour's pixels must fail on its own emptiness, not be \
+         excused for overlapping the thing it was borrowing from"
+    );
+
+    // And the evidence really was borrowed: measured on the unmasked frame the
+    // borrower qualifies, and on the masked one it does not.
+    let region_name = equipment_region("rack-row-02", 0);
+    let regions = BTreeMap::from([(
+        region_name.clone(),
+        PixelRect::snap(borrower, facts.width, facts.height),
+    )]);
+    let share = |image: &RgbImage| {
+        let metrics = FrameMetrics::compute(image, &regions);
+        let region = metrics
+            .region(&region_name)
+            .expect("the region is measured");
+        ROWS.role_groups()
+            .iter()
+            .map(|group| group.iter().map(|role| region.near(*role)).sum::<f64>())
+            .fold(f64::INFINITY, f64::min)
+    };
+    let before = share(&base);
+    let masked = mask_regions(&base, &facts, &[neighbour]);
+    let after = share(&masked);
+    assert!(
+        before >= EQUIPMENT_ROLE_MIN,
+        "the borrower passes on borrowed pixels, measured {before:.4}"
+    );
+    assert!(
+        after < EQUIPMENT_ROLE_MIN,
+        "and fails the moment they are taken away, measured {after:.4}"
+    );
 }
 
 /// An empty region set is not proof that a prop is out of shot.
@@ -2685,9 +3032,10 @@ fn masking_one_equipment_category_fails_that_category_alone() {
                 // the aisles, and at every centre heading a tray projects onto
                 // the rack row behind it, so masking either family paints over
                 // some of the other's pixels. Deciding it from the measured
-                // rectangles rather than exempting the pair by name means a
-                // tray that had stopped being drawn — and so overlapped
-                // nothing — could not use the exemption.
+                // pixels rather than from rectangle geometry means a prop
+                // that was reading its neighbour's pixels through an
+                // overlapping rectangle cannot use the exemption: it keeps a
+                // judgeable region of its own and has to answer on it.
                 let props = equipment
                     .iter()
                     .filter(|metric| is_prop_metric(metric, facts, other))
@@ -2698,14 +3046,20 @@ fn masking_one_equipment_category_fails_that_category_alone() {
                             .iter()
                             .find(|prop| prop.id == id)
                             .is_some_and(|prop| {
-                                mask_explains_collateral(facts, &regions, &prop.regions)
+                                mask_explains_collateral(
+                                    run.frame(frame),
+                                    facts,
+                                    &regions,
+                                    &prop.regions,
+                                    other,
+                                )
                             })
                     })
                     .collect::<Vec<_>>();
                 assert!(
                     props.is_empty(),
-                    "{frame:?}: masking {} must leave green every {} prop whose own \
-                     measured area it did not mostly paint over, got {props:?}",
+                    "{frame:?}: masking {} must leave green every {} prop it did not both \
+                     strip of its own role pixels and leave unjudgeable, got {props:?}",
                     category.name(),
                     other.name()
                 );
@@ -2755,13 +3109,21 @@ fn masking_one_rack_row_fails_only_that_rack_row() {
                 "{frame:?}: masking {id} must fail its own contract, got {failures:?}"
             );
             for (other, other_regions) in &rows {
-                if other == id || mask_explains_collateral(facts, regions, other_regions) {
+                if other == id
+                    || mask_explains_collateral(
+                        run.frame(frame),
+                        facts,
+                        regions,
+                        other_regions,
+                        EquipmentCategory::RackRows,
+                    )
+                {
                     continue;
                 }
                 assert!(
                     !failures.contains(&format!("equipment-{other}")),
-                    "{frame:?}: masking {id} must leave {other} green unless it painted \
-                     over most of {other}, got {failures:?}"
+                    "{frame:?}: masking {id} must leave {other} green unless it stripped \
+                     {other} of its own role pixels and left it unjudgeable, got {failures:?}"
                 );
             }
         }
@@ -2858,7 +3220,8 @@ fn semantic_report_reproduces_in_a_different_output_directory() {
                 &run.canonical,
                 &Banned {
                     keys: Vec::new(),
-                    values: vec![other.to_string_lossy().into_owned()],
+                    locations: vec![other.to_string_lossy().into_owned()],
+                    identities: Vec::new(),
                 },
                 label,
             );
@@ -2945,8 +3308,56 @@ fn assert_scan_is_clean(canonical: &str, banned: &Banned, label: &str) {
 /// so is any value carrying this host's own names.
 struct Banned {
     keys: Vec<String>,
-    /// Values that identify this machine or the directory it ran in.
-    values: Vec<String>,
+    /// Absolute locations this run happened to sit in: long, unambiguous, and
+    /// meaningless as a fragment of anything legitimate, so matched anywhere.
+    locations: Vec<String>,
+    /// Short identifiers naming the machine or the person at it.
+    ///
+    /// These are ordinary words — a login can be `asset`, a host can be `src`
+    /// — so they are never matched as bare substrings. A raw `contains` on a
+    /// five-letter login turns `assets/generated/hall.glb` into a privacy
+    /// violation, which is a false alarm on the most common value in the
+    /// document. They are matched only where the match means something: the
+    /// whole value, or one complete path component of it.
+    identities: Vec<String>,
+}
+
+/// Whether one string value leaks `identity` — the login or the machine name —
+/// in a place where the match actually means something.
+///
+/// Deliberately not a substring test, and deliberately not a bare component
+/// test either. These values are short, ordinary words, and the report is full
+/// of ordinary words: a login of `asset` makes every `assets/generated/...`
+/// path a violation under `contains`, and a login of `src` condemns
+/// `src/verification.rs` under any whole-component match. Both are the
+/// report's own vocabulary, and both are false alarms on the most common
+/// values in the document.
+///
+/// A leak is the identity standing where an identity stands:
+///
+/// * as the entire value, which is a bare login or machine name and can be
+///   nothing else; or
+/// * as the component directly beneath a home or user root —
+///   `home/asset/frames`, `Users/asset/frames` — which is the shape a home
+///   directory takes when it reaches the document with its leading separator
+///   stripped.
+///
+/// Absolute paths are refused outright elsewhere, so this only has to catch
+/// the relative spellings that survive that check.
+fn leaks_identity(value: &str, identity: &str) -> bool {
+    /// The path segments a user directory hangs directly off.
+    const USER_ROOTS: [&str; 4] = ["home", "Users", "users", "usr"];
+
+    if identity.len() < 2 {
+        return false;
+    }
+    if value == identity {
+        return true;
+    }
+    let components = value.split(['/', '\\']).collect::<Vec<_>>();
+    components
+        .windows(2)
+        .any(|pair| USER_ROOTS.contains(&pair[0]) && pair[1] == identity)
 }
 
 /// Whether one string value is an absolute path in any form the report might
@@ -3012,9 +3423,14 @@ fn walk_json(value: &serde_json::Value, key: &str, banned: &Banned, found: &mut 
             if escapes_upwards(text) {
                 found.push(format!("upward path at {key}: {text}"));
             }
-            for needle in &banned.values {
+            for needle in &banned.locations {
                 if !needle.is_empty() && text.contains(needle.as_str()) {
-                    found.push(format!("host value at {key}: {text}"));
+                    found.push(format!("absolute location at {key}: {text}"));
+                }
+            }
+            for identity in &banned.identities {
+                if leaks_identity(text, identity) {
+                    found.push(format!("identity at {key}: {text}"));
                 }
             }
         }
@@ -3024,21 +3440,28 @@ fn walk_json(value: &serde_json::Value, key: &str, banned: &Banned, found: &mut 
 
 /// Everything a canonical report may never carry, whoever produced it.
 fn banned_report_substrings() -> Banned {
-    let mut values = vec![repository().to_string_lossy().into_owned()];
-    for name in ["HOME", "USER", "LOGNAME", "HOSTNAME"] {
+    let mut locations = vec![repository().to_string_lossy().into_owned()];
+    if let Some(home) = std::env::var_os("HOME") {
+        locations.push(home.to_string_lossy().into_owned());
+    }
+    let mut identities = Vec::new();
+    for name in ["USER", "LOGNAME", "HOSTNAME"] {
         if let Some(value) = std::env::var_os(name) {
-            let value = value.to_string_lossy().into_owned();
-            if value.len() >= 3 {
-                values.push(value);
-            }
+            identities.push(value.to_string_lossy().into_owned());
         }
     }
     if let Ok(host) = std::process::Command::new("hostname").output() {
         let host = String::from_utf8_lossy(&host.stdout).trim().to_owned();
-        if host.len() >= 3 {
-            values.push(host);
+        identities.push(host.clone());
+        // A fully qualified name leaks the same machine as its first label.
+        if let Some((label, _)) = host.split_once('.') {
+            identities.push(label.to_owned());
         }
     }
+    locations.retain(|value| value.len() >= 3);
+    identities.retain(|value| value.len() >= 2);
+    identities.sort();
+    identities.dedup();
     Banned {
         keys: [
             "timestamp",
@@ -3058,7 +3481,8 @@ fn banned_report_substrings() -> Banned {
         ]
         .map(str::to_owned)
         .to_vec(),
-        values,
+        locations,
+        identities,
     }
 }
 
@@ -3124,6 +3548,87 @@ fn the_privacy_scan_reads_paths_and_keys_rather_than_bare_words() {
             scan_violations(&innocent, &banned).is_empty(),
             "the scan must not fail a legitimate value: {innocent}, got {:?}",
             scan_violations(&innocent, &banned)
+        );
+    }
+}
+
+/// A login or a machine name is an ordinary word, and the report is full of
+/// ordinary words.
+///
+/// This is the false-positive half of the privacy contract. Matching a short
+/// identity as a bare substring condemns the most common values in the
+/// document: a developer called `asset` would fail on every generated asset
+/// path, and a machine called `src` on every source path the report pins. The
+/// scan therefore matches an identity only as a whole value or a whole path
+/// component — which is exactly how it looks when it really has leaked.
+#[test]
+fn a_short_login_or_host_name_does_not_condemn_the_paths_that_contain_it() {
+    let document = |body: &str| format!("{{\"frames\": {body}}}");
+
+    // Every one of these is a real, short identity that collides with the
+    // report's own vocabulary.
+    for identity in ["asset", "src", "png", "rack", "ne", "midcreek", "test"] {
+        let banned = Banned {
+            keys: Vec::new(),
+            locations: Vec::new(),
+            identities: vec![identity.to_owned()],
+        };
+
+        for innocent in [
+            document("\"assets/generated/hall.glb\""),
+            document("\"assets/references/key-art.png\""),
+            document("\"src/verification.rs\""),
+            document("\"src/design.rs\""),
+            document("\"01-healthy-center-ne.png\""),
+            document("\"14-low-resolution-queue.png\""),
+            document("\"rack-row-01\""),
+            document("\"midcreek-cs-1\""),
+            "{\"repaired_rack\": 1}".to_owned(),
+        ] {
+            let found = scan_violations(&innocent, &banned);
+            assert!(
+                found.is_empty(),
+                "an identity of {identity:?} must not condemn {innocent}, got {found:?}"
+            );
+        }
+
+        // And the same identity is still caught where it genuinely leaks.
+        for leak in [
+            document(&format!("\"{identity}\"")),
+            document(&format!("\"home/{identity}/frames\"")),
+            document(&format!("\"home/{identity}/work/midcreek/report.json\"")),
+            document(&format!("\"Users\\\\{identity}\\\\frames\"")),
+        ] {
+            let found = scan_violations(&leak, &banned);
+            assert!(
+                !found.is_empty(),
+                "an identity of {identity:?} standing on its own must be caught in {leak}"
+            );
+        }
+    }
+
+    // A one-character identity is too ambiguous to judge on and is dropped
+    // rather than matched against every path separator in the document.
+    let banned = Banned {
+        keys: Vec::new(),
+        locations: Vec::new(),
+        identities: vec!["a".to_owned()],
+    };
+    assert!(scan_violations(&document("\"a\""), &banned).is_empty());
+
+    // The real machine's own identities must not condemn the real document's
+    // vocabulary either, which is the case this test exists to prevent
+    // regressing on somebody else's laptop.
+    let live = banned_report_substrings();
+    for innocent in [
+        document("\"assets/generated/hall.glb\""),
+        document("\"src/verification.rs\""),
+        document("\"01-healthy-center-ne.png\""),
+    ] {
+        let found = scan_violations(&innocent, &live);
+        assert!(
+            found.is_empty(),
+            "this machine's own login or host name must not condemn {innocent}, got {found:?}"
         );
     }
 }
