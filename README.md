@@ -853,12 +853,13 @@ carries none of it; `scripts/build-web.sh` builds only `--bin midcreek-cs-1`.
 The hub reports the current commit on every push, whether or not that commit is
 green. Three jobs make that possible.
 
-**Verify** runs every named native gate through `scripts/run-gate.sh`: published
-progress data, formatting, Clippy, generated asset freshness, the library and
-binary tests, the asset, application, site-generation, and Pages-assembly
-contracts, the serialized rendered image contracts, and the release build. The
-runner measures one gate, appends one line naming it, its status, and its
-duration, and always exits zero, so a red gate never hides the ones after it:
+**Verify** runs every named native gate through `scripts/run-gate.sh`: the
+workflow lint, published progress data, formatting, Clippy, generated asset
+freshness, the library and binary tests, the asset, application,
+site-generation, and Pages-assembly contracts, the serialized rendered image
+contracts, and the release build. The runner measures one gate, appends one
+line naming it, its status, and its duration, and always exits zero, so a red
+gate never hides the ones after it:
 
 ```text
 {"name":"Rendered image contracts","status":"failed","duration_ms":31184}
@@ -870,6 +871,15 @@ the measured lines into a strict result manifest, uploads both in an
 `if: always()` step, and only then fails once in a verdict step of its own. The
 run's captured stdout and stderr stay behind as Actions artifacts and never
 travel with the evidence.
+
+The workflow is the one program here that cannot be run locally, and a mistake
+in it — a `runner` expression in a job-level `env:`, which GitHub evaluates
+before a runner exists — is a run that never starts rather than a run that goes
+red. `scripts/actionlint.sh` therefore lints every workflow with GitHub's own
+context-availability rules, pinned to actionlint v1.7.7, cached under
+`target/tools`, and checked against that pin before the binary is trusted. It
+is the first gate `scripts/check.sh` runs and the first gate CI measures, so
+the cheapest failure is also the earliest one.
 
 **Build web** runs only when Verify concluded success. It installs the pinned
 toolchain through `scripts/install-wasm-toolchain.sh`, packages the game, and
@@ -884,8 +894,12 @@ result artifacts exist without failing on a skipped or missing one, and hands
 every upstream outcome to `sitegen inputs`, which decides in one place:
 
 - the merged gate matrix, synthesizing `skipped_dependency` and failed rows for
-  a job that produced no manifest, so a silent upload failure is visible rather
-  than absent;
+  a job that produced no usable manifest, so a silent upload failure is visible
+  rather than absent. A manifest that measured no gates at all — what a job
+  that fell over before its first gate uploads — is read exactly like a missing
+  one, so a run that failed resolving Chrome publishes an explicit
+  `Web package and browser gate` failure and its missing result manifest rather
+  than an empty table;
 - whether the declared verification evidence really projects. A job that passed
   and left an unprojectable report publishes a failed
   `Published verification evidence` row and a status-only page, never a crash;

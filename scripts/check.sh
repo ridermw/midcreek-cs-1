@@ -5,16 +5,17 @@
 #
 # It runs, in order:
 #
-#   1. rustfmt in check mode;
-#   2. Clippy over every target and feature with warnings denied;
-#   3. the autonomous asset generator in --check mode;
-#   4. sitegen validation of the published progress data;
-#   5. every pure, integration, and site test;
-#   6. the rendered verification contract, which launches the real game and
+#   1. actionlint over every workflow, pinned to one version;
+#   2. rustfmt in check mode;
+#   3. Clippy over every target and feature with warnings denied;
+#   4. the autonomous asset generator in --check mode;
+#   5. sitegen validation of the published progress data;
+#   6. every pure, integration, and site test;
+#   7. the rendered verification contract, which launches the real game and
 #      analyses its fourteen real frames;
-#   7. the packaged WebAssembly build and its headless browser gate, when a
+#   8. the packaged WebAssembly build and its headless browser gate, when a
 #      browser and the pinned wasm-bindgen toolchain are available;
-#   8. the release build.
+#   9. the release build.
 #
 # The rendered contract needs a real renderer. On a headless Linux machine that
 # means Xvfb: a missing display or a missing renderer is a hard failure here,
@@ -60,6 +61,12 @@ esac
 # ---------------------------------------------------------------------------
 # Pure gates
 # ---------------------------------------------------------------------------
+
+# The workflow is the one program here that can only run on a push to main, so
+# it is linted before anything expensive: a run that cannot start proves
+# nothing about the gates it was supposed to carry.
+step "workflow lint"
+./scripts/actionlint.sh
 
 step "rustfmt"
 cargo fmt --all --check

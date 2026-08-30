@@ -408,6 +408,7 @@ mod workflow_contract {
         let verify = verify_job(&workflow);
         let gates = step(verify, "Run the native gates");
         let named = [
+            "Workflow lint",
             "Published progress data",
             "Rust formatting",
             "Clippy lints",
@@ -469,7 +470,7 @@ mod workflow_contract {
         let collect = step(verify, "Collect the verification evidence");
 
         assert!(
-            verify.contains("RESULT: ${{ runner.temp }}/native"),
+            verify.contains(r#"echo "RESULT=$RUNNER_TEMP/native" >> "$GITHUB_ENV""#),
             "{verify}"
         );
         assert!(collect.contains("if: always()"), "{collect}");
@@ -692,6 +693,207 @@ mod workflow_contract {
             "{publish}"
         );
         assert!(step(publish, "Deploy Pages").contains("actions/deploy-pages@"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow semantic linting
+    // -----------------------------------------------------------------------
+
+    /// GitHub evaluates a job-level `env:` before a runner exists, so a
+    /// `runner` expression there is not a value that resolves late — it is a
+    /// workflow the API refuses to start. No gate in this repository can run
+    /// if the run never begins, so the rule is asserted directly.
+    #[test]
+    fn no_job_level_env_names_the_runner_context() {
+        let workflow = workflow_source();
+
+        for block in job_level_env_blocks(&workflow) {
+            assert!(
+                !block.contains("runner."),
+                "a job-level env: may not name the runner context: {block}"
+            );
+        }
+        assert!(
+            !workflow.contains("RESULT: ${{ runner.temp }}"),
+            "the result root must be resolved from $RUNNER_TEMP in a step"
+        );
+        assert!(
+            !workflow.contains("GATES: ${{ runner.temp }}"),
+            "the gate file must be resolved from $RUNNER_TEMP in a step"
+        );
+
+        for (job, root) in [
+            (verify_job(&workflow), "native"),
+            (web_job(&workflow), "web"),
+        ] {
+            let resolve = step(job, &format!("Resolve the {root} result root"));
+            assert!(
+                resolve.contains(&format!(r#"echo "RESULT=$RUNNER_TEMP/{root}""#)),
+                "{resolve}"
+            );
+            assert!(
+                resolve.contains(&format!(r#"echo "GATES=$RUNNER_TEMP/{root}/gates.jsonl""#)),
+                "{resolve}"
+            );
+            assert!(resolve.contains(r#">> "$GITHUB_ENV""#), "{resolve}");
+        }
+    }
+
+    /// The rule above is GitHub's, not this repository's, so it is proved with
+    /// GitHub's own rules rather than with a string match: the pinned linter
+    /// has to accept the workflow as it stands and reject the shape it used to
+    /// have.
+    #[test]
+    fn the_pinned_linter_accepts_this_workflow_and_rejects_the_shape_it_replaced() {
+        let clean = run_actionlint(&[repository()
+            .join(".github/workflows/pages.yml")
+            .to_string_lossy()
+            .into_owned()]);
+        assert!(
+            clean.status.success(),
+            "the checked-in workflow should lint clean:\n{}{}",
+            String::from_utf8_lossy(&clean.stdout),
+            String::from_utf8_lossy(&clean.stderr)
+        );
+
+        let directory = TempDirectory::new("actionlint-regression");
+        let regression = directory.path().join("regression.yml");
+        fs::write(
+            &regression,
+            concat!(
+                "name: Regression\n",
+                "on:\n",
+                "  push:\n",
+                "    branches: [main]\n",
+                "jobs:\n",
+                "  verify:\n",
+                "    runs-on: ubuntu-latest\n",
+                "    env:\n",
+                "      RESULT: ${{ runner.temp }}/native\n",
+                "    steps:\n",
+                "      - run: echo \"$RESULT\"\n",
+            ),
+        )
+        .expect("the regression workflow should be writable");
+
+        let dirty = run_actionlint(&[regression.to_string_lossy().into_owned()]);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&dirty.stdout),
+            String::from_utf8_lossy(&dirty.stderr)
+        );
+        assert!(
+            !dirty.status.success(),
+            "a job-level runner context must fail the gate: {report}"
+        );
+        assert!(
+            report.contains(r#"context "runner" is not allowed here"#),
+            "{report}"
+        );
+    }
+
+    /// A linter that changes its rules under the gate is a gate that changes
+    /// its verdict, so the version is pinned, the cache lives inside this
+    /// repository, and the binary is checked against the pin before it runs.
+    #[test]
+    fn the_workflow_linter_is_pinned_cached_and_verified_before_it_is_trusted() {
+        let script = fs::read_to_string(repository().join("scripts/actionlint.sh"))
+            .expect("the workflow linter should be checked in");
+
+        assert!(
+            script.contains(r#"ACTIONLINT_VERSION="1.7.7""#),
+            "the linter version should be pinned: {script}"
+        );
+        assert!(
+            script.contains(r#"actionlint@v$ACTIONLINT_VERSION"#),
+            "the install should request exactly the pinned version: {script}"
+        );
+        assert!(
+            script.contains(r#"^[0-9]+(\.[0-9]+)*$"#),
+            "the version must be checked before it becomes a path: {script}"
+        );
+        assert!(
+            script.contains(r#"cache="$tools/actionlint/$ACTIONLINT_VERSION""#),
+            "the cache should be versioned: {script}"
+        );
+        assert!(
+            script.contains(r#"tools="$repository/target/tools""#),
+            "the cache should live inside this repository: {script}"
+        );
+        assert!(
+            script.contains(r#"refusing a tools cache outside the repository"#),
+            "a redirected cache should be refused: {script}"
+        );
+        assert!(
+            script.contains(r#"this gate is pinned to v$ACTIONLINT_VERSION"#),
+            "the binary should be verified before it is trusted: {script}"
+        );
+
+        let check = fs::read_to_string(repository().join("scripts/check.sh"))
+            .expect("the clean-push gate should be checked in");
+        let lint = check
+            .find("./scripts/actionlint.sh")
+            .expect("the clean-push gate should lint the workflows");
+        let clippy = check
+            .find("cargo clippy")
+            .expect("the clean-push gate should run Clippy");
+        assert!(
+            lint < clippy,
+            "the workflow lint should run before the expensive gates: {check}"
+        );
+    }
+
+    /// The lint is a named row on the published site like every other gate, so
+    /// it is measured by the recording runner and reported even when a later
+    /// gate fails.
+    #[test]
+    fn ci_measures_the_workflow_lint_as_its_first_named_gate() {
+        let workflow = workflow_source();
+        let gates = step(verify_job(&workflow), "Run the native gates");
+
+        assert!(
+            gates.contains(r#"run-gate.sh "$GATES" "Workflow lint" --"#),
+            "{gates}"
+        );
+        let lint = gates
+            .find(r#""Workflow lint" --"#)
+            .expect("the lint should be a named gate");
+        assert!(
+            gates[lint..]
+                .lines()
+                .nth(1)
+                .is_some_and(|command| command.contains("./scripts/actionlint.sh")),
+            "{gates}"
+        );
+        assert!(
+            gates[..lint].matches("run-gate.sh").count() == 1,
+            "the workflow lint should be the first measured gate: {gates}"
+        );
+    }
+
+    fn run_actionlint(targets: &[String]) -> std::process::Output {
+        Command::new(repository().join("scripts/actionlint.sh"))
+            .args(targets)
+            .current_dir(repository())
+            .output()
+            .expect("the workflow linter should be runnable")
+    }
+
+    /// Every `env:` mapping declared directly on a job, at the indent GitHub
+    /// evaluates before a runner exists.
+    fn job_level_env_blocks(workflow: &str) -> Vec<&str> {
+        let mut blocks = Vec::new();
+        let mut rest = workflow;
+        while let Some(offset) = rest.find("\n    env:\n") {
+            let body = &rest[offset + "\n    env:\n".len()..];
+            let end = body
+                .find("\n    ")
+                .or_else(|| body.find("\n  "))
+                .unwrap_or(body.len());
+            blocks.push(&body[..end]);
+            rest = &body[end..];
+        }
+        blocks
     }
 
     fn workflow_source() -> String {
@@ -2559,7 +2761,11 @@ mod result_manifest_safety {
     /// its own manifest saying otherwise publishes a failure.
     #[test]
     fn a_job_and_its_manifest_both_have_to_agree_on_success() {
-        let passed = manifest("verify", Some("verification"), &[]);
+        let passed = manifest(
+            "verify",
+            Some("verification"),
+            &[("Rendered image contracts", None)],
+        );
         let failed = JobResult {
             status: GateStatus::Failed,
             ..passed.clone()
@@ -2586,6 +2792,164 @@ mod result_manifest_safety {
             assert_eq!(report.status(), GateStatus::Failed, "{report:?}");
             assert_eq!(report.evidence(), None, "{report:?}");
         }
+    }
+
+    /// A job that fell over before its first gate still uploads a manifest,
+    /// and that manifest measured nothing. Reading it as a result would let a
+    /// failed run publish a matrix with no row saying the job failed at all.
+    /// It has to be read exactly like a manifest that never arrived.
+    #[test]
+    fn a_native_failure_before_its_first_gate_publishes_the_job_and_its_manifest() {
+        let native = JobReport {
+            outcome: JobOutcome::Failure,
+            result: Some(JobResult {
+                status: GateStatus::Failed,
+                ..manifest("verify", None, &[])
+            }),
+        };
+        let web = JobReport::absent(JobOutcome::Skipped);
+
+        let merged = merge_job_results(
+            "1111111111111111111111111111111111111111",
+            "https://github.com/ridermw/midcreek-cs-1/actions/runs/1",
+            &native,
+            &web,
+        )
+        .expect("an empty manifest should publish, not crash");
+
+        assert_eq!(
+            merged
+                .gates
+                .iter()
+                .map(|gate| (gate.name.as_str(), gate.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Native verification", GateStatus::Failed),
+                ("Native verification result manifest", GateStatus::Failed),
+                (
+                    "Web package and browser gate",
+                    GateStatus::SkippedDependency
+                ),
+            ],
+        );
+        assert_eq!(native.status(), GateStatus::Failed);
+        assert_eq!(merged.native, GateStatus::Failed);
+    }
+
+    /// The web job resolves the preinstalled Chrome before its first gate, so
+    /// a runner without Chrome fails exactly there: the job ran, uploaded an
+    /// empty manifest, and measured nothing. The site still has to say so.
+    #[test]
+    fn a_web_failure_resolving_chrome_publishes_the_job_and_its_manifest() {
+        let native = JobReport {
+            outcome: JobOutcome::Success,
+            result: Some(manifest(
+                "verify",
+                Some("verification"),
+                &[("Clippy lints", None)],
+            )),
+        };
+        let web = JobReport {
+            outcome: JobOutcome::Failure,
+            result: Some(JobResult {
+                status: GateStatus::Failed,
+                ..manifest("build-web", None, &[])
+            }),
+        };
+
+        let merged = merge_job_results(
+            "1111111111111111111111111111111111111111",
+            "https://github.com/ridermw/midcreek-cs-1/actions/runs/1",
+            &native,
+            &web,
+        )
+        .expect("an empty web manifest should publish, not crash");
+
+        assert_eq!(
+            merged
+                .gates
+                .iter()
+                .map(|gate| (gate.name.as_str(), gate.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Clippy lints", GateStatus::Passed),
+                ("Web package and browser gate", GateStatus::Failed),
+                (
+                    "Web package and browser gate result manifest",
+                    GateStatus::Failed
+                ),
+            ],
+        );
+        assert_eq!(merged.native, GateStatus::Passed);
+        assert_eq!(merged.web, GateStatus::Failed);
+    }
+
+    /// An empty manifest is incomplete whatever it declares about itself, so
+    /// a forged one cannot publish a green job or project its evidence.
+    #[test]
+    fn an_empty_manifest_can_neither_pass_a_job_nor_project_its_evidence() {
+        let forged = JobReport {
+            outcome: JobOutcome::Success,
+            result: Some(manifest("verify", Some("verification"), &[])),
+        };
+
+        assert_eq!(forged.publishable_result(), None);
+        assert_eq!(forged.status(), GateStatus::Failed);
+        assert_eq!(forged.evidence(), None);
+
+        let merged = merge_job_results(
+            "1111111111111111111111111111111111111111",
+            "https://github.com/ridermw/midcreek-cs-1/actions/runs/1",
+            &forged,
+            &JobReport::absent(JobOutcome::Skipped),
+        )
+        .expect("a forged empty manifest should publish as a failure");
+
+        assert!(
+            merged
+                .gates
+                .iter()
+                .any(|gate| gate.name == "Native verification result manifest"
+                    && gate.status == GateStatus::Failed),
+            "{merged:?}"
+        );
+    }
+
+    /// A job whose manifest really measured its gates is still published from
+    /// that manifest, so the incomplete-manifest rule cannot swallow a real
+    /// matrix.
+    #[test]
+    fn a_manifest_that_measured_gates_is_still_published_from_its_own_rows() {
+        let native = JobReport {
+            outcome: JobOutcome::Success,
+            result: Some(manifest(
+                "verify",
+                Some("verification"),
+                &[("Rust formatting", None), ("Clippy lints", None)],
+            )),
+        };
+
+        let merged = merge_job_results(
+            "1111111111111111111111111111111111111111",
+            "https://github.com/ridermw/midcreek-cs-1/actions/runs/1",
+            &native,
+            &JobReport::absent(JobOutcome::Skipped),
+        )
+        .expect("a measured manifest should publish");
+
+        assert_eq!(
+            merged
+                .gates
+                .iter()
+                .map(|gate| gate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Rust formatting",
+                "Clippy lints",
+                "Web package and browser gate",
+            ],
+        );
+        assert_eq!(native.evidence(), Some("verification"));
     }
 
     fn manifest(job: &str, evidence: Option<&str>, gates: &[(&str, Option<&str>)]) -> JobResult {

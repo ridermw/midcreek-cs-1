@@ -15,14 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      RESULT: ${{ runner.temp }}/native
-      GATES: ${{ runner.temp }}/native/gates.jsonl
     steps:
       - name: Check out source
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      # The runner's temporary directory is a runner fact, and a job-level
+      # `env:` is evaluated before a runner exists. It is resolved here, from
+      # the environment the runner really hands the step, so every later step
+      # names one workflow-owned result root instead of rebuilding the path.
+      - name: Resolve the native result root
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native"
+          echo "RESULT=$RUNNER_TEMP/native" >> "$GITHUB_ENV"
+          echo "GATES=$RUNNER_TEMP/native/gates.jsonl" >> "$GITHUB_ENV"
 
       - name: Install Linux build prerequisites
         run: |
@@ -51,6 +59,9 @@ jobs:
           BEVY_ASSET_ROOT: ${{ github.workspace }}
         run: |
           set -uo pipefail
+
+          ./scripts/run-gate.sh "$GATES" "Workflow lint" -- \
+            ./scripts/actionlint.sh
 
           ./scripts/run-gate.sh "$GATES" "Published progress data" -- \
             cargo run --quiet --bin sitegen -- validate \
@@ -156,12 +167,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      RESULT: ${{ runner.temp }}/web
-      GATES: ${{ runner.temp }}/web/gates.jsonl
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      # As in Verify: the runner context does not exist when a job-level `env:`
+      # is evaluated, so the result root is resolved from the runner's own
+      # environment in a step.
+      - name: Resolve the web result root
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/web"
+          echo "RESULT=$RUNNER_TEMP/web" >> "$GITHUB_ENV"
+          echo "GATES=$RUNNER_TEMP/web/gates.jsonl" >> "$GITHUB_ENV"
 
       - name: Install Linux build prerequisites
         run: |

@@ -270,6 +270,19 @@ pub struct JobResult {
     pub evidence: Option<String>,
 }
 
+impl JobResult {
+    /// Whether this manifest measured a single named gate.
+    ///
+    /// A job that fell over before its first gate still uploads a manifest,
+    /// and that manifest is empty: it records that the job existed and nothing
+    /// about what it proved. Publishing from it would put a run on the site
+    /// with no row explaining why it failed, so an empty manifest is treated
+    /// as the incomplete result it is.
+    pub fn measured_a_gate(&self) -> bool {
+        !self.gates.is_empty()
+    }
+}
+
 /// The outcome GitHub Actions reports for one job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobOutcome {
@@ -333,6 +346,20 @@ impl JobReport {
         }
     }
 
+    /// The manifest the site may publish this job from.
+    ///
+    /// A manifest that measured no gates is incomplete, whatever it declares
+    /// about itself, so it is read exactly like a manifest that never
+    /// arrived. Everything the site says about the job — its status, its
+    /// evidence, and its rows in the published matrix — then comes from the
+    /// one path that already knows how to explain a job that reported
+    /// nothing.
+    pub fn publishable_result(&self) -> Option<&JobResult> {
+        self.result
+            .as_ref()
+            .filter(|result| result.measured_a_gate())
+    }
+
     /// The status the site publishes for this job.
     ///
     /// The job outcome and the manifest both have to agree on success. A job
@@ -341,7 +368,7 @@ impl JobReport {
     /// published as failures.
     pub fn status(&self) -> GateStatus {
         let outcome = self.outcome.status();
-        match &self.result {
+        match self.publishable_result() {
             Some(result) if result.status != GateStatus::Passed => GateStatus::Failed,
             Some(_) => outcome,
             None if outcome == GateStatus::SkippedDependency => GateStatus::SkippedDependency,
@@ -358,8 +385,7 @@ impl JobReport {
         if self.status() != GateStatus::Passed {
             return None;
         }
-        self.result
-            .as_ref()
+        self.publishable_result()
             .and_then(|result| result.evidence.as_deref())
     }
 }
@@ -475,8 +501,11 @@ fn validate_relative_directory(field: &str, value: &str) -> Result<(), SitegenEr
 ///
 /// Publish runs whatever the upstream jobs did, so every gap has to become a
 /// published fact rather than a missing row: a skipped job publishes a
-/// `skipped_dependency` gate, and a job that ran without leaving a result
-/// manifest publishes both a failed job gate and the missing manifest itself.
+/// `skipped_dependency` gate, and a job that ran without leaving a usable
+/// result manifest publishes both a failed job gate and the missing manifest
+/// itself. A manifest that measured no gates at all — what a job that fell
+/// over before its first gate uploads — is a gap of exactly that kind, and is
+/// published the same way rather than as silence.
 pub fn merge_job_results(
     source_commit: &str,
     run_url: &str,
@@ -485,7 +514,7 @@ pub fn merge_job_results(
 ) -> Result<WorkflowSummary, SitegenError> {
     let mut gates = Vec::new();
     for (report, label) in [(native, NATIVE_JOB_GATE), (web, WEB_JOB_GATE)] {
-        match &report.result {
+        match report.publishable_result() {
             Some(result) => {
                 validate_job_result(result)?;
                 gates.extend(result.gates.iter().cloned());
