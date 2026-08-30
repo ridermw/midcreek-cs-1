@@ -626,9 +626,21 @@ requires every other one to be refused without moving the machine.
 - the operations model is reset to a pristine origin once the hall is ready, so
   ticket 1 always opens on tick 240, ticket 2 on 480, and ticket 3 on 720
   whatever the disk did during asset loading;
-- every capture costs exactly `CAPTURE_FRAMES` simulated frames and every
-  resize exactly `RESIZE_FRAMES`, so GPU readback latency can never leak into
-  simulated time;
+- a capture costs the journey no simulated time at all: the request frame
+  records the frame's facts, spawns the real screenshot observer, and stops the
+  clock, and the readback is then waited out on the condition that matters —
+  the observer's own record plus a complete file on disk — for as many
+  zero-time render pumps as the machine needs, before exactly one `1/60` step
+  resumes the journey. A zero-delta frame simulates nothing: no tick, no rack
+  timer, no seeded draw, no movement, no animation. Readback latency therefore
+  cannot reach the report, and a slow renderer cannot be mistaken for a lost
+  callback. A landed readback must also be a PNG of the size the contract
+  names, so a window server that hands back a half-resolution surface fails the
+  run naming both sizes instead of reaching the gate as an unexplained pixel
+  difference. A callback that has not arrived inside `CAPTURE_TIMEOUT` of wall
+  clock really is lost, and fails the run naming the frame, the stage, the pump
+  count, and what the artifact looked like on disk. A resize still costs
+  exactly `RESIZE_FRAMES`;
 - MSAA off and the magenta clear colour, which are the *only* two render
   settings verification changes. Bypassed tonemapping and disabled deband
   dither are the shipped camera's own cel-shift display contract
@@ -734,6 +746,13 @@ proven against the same image the gate accepted a moment earlier.
   naming that stage;
 - `hang` also disables the app watchdog, so the 50-second parent watchdog has
   to kill that exact child. Frames already captured are kept.
+
+`--verify-capture-delay <pumps>` is the injected slow GPU: every screenshot
+readback is held open for that many further zero-time render pumps after the
+observer has already recorded it. It changes only how many pumps a capture
+costs, which is exactly the quantity the evidence must be independent of, so
+the render contract runs the whole journey twice with different values and
+requires the canonical report and all fourteen frames to match byte for byte.
 
 `--verify-flood <bytes>` is the pipe fixture: the binary writes that many bytes
 to *both* stdout and stderr and exits successfully. The parent drains both

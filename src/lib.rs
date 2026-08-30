@@ -100,6 +100,7 @@ pub fn run() {
 pub fn run_verification(
     output: verification::VerifyOutput,
     fault: Option<verification::VerificationFault>,
+    capture_delay: u64,
 ) -> std::process::ExitCode {
     use bevy::window::{PresentMode, WindowResolution};
 
@@ -123,7 +124,11 @@ pub fn run_verification(
             }),
     )
     .add_plugins(CellShiftPlugin)
-    .add_plugins(verification::VerificationPlugin::new(output, fault));
+    .add_plugins(verification::VerificationPlugin::new(
+        output,
+        fault,
+        capture_delay,
+    ));
 
     match app.run() {
         AppExit::Success => std::process::ExitCode::SUCCESS,

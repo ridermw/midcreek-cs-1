@@ -806,13 +806,16 @@ pub const FIXED_STEP_SECONDS: f64 = 1.0 / 60.0;
 /// pixel of it on screen means the camera rendered past the 72 m apron.
 pub const SENTINEL_CLEAR: Srgba = Srgba::rgb(1.0, 0.0, 1.0);
 
-/// How many frames one capture is allowed, and always costs.
+/// How long one screenshot readback may take before it is declared lost.
 ///
-/// A capture always consumes exactly this many simulated frames, whether the
-/// readback lands on the first or the last of them. That is what makes the
-/// canonical report reproducible: capture latency is a property of the GPU, and
-/// it must never leak into simulated time.
-pub const CAPTURE_FRAMES: u64 = 24;
+/// This is a wall clock, not a frame count, because that is what the readback
+/// really is: a GPU handing a buffer back on its own schedule. A frame budget
+/// measures how fast the harness can spin, which on an unthrottled software
+/// renderer says nothing at all about whether the callback is late or lost.
+/// The budget is generous — a cold software rasterizer is slow — and sits well
+/// inside [`APP_WATCHDOG`], so a genuinely lost callback is named as a lost
+/// callback rather than swallowed by the global watchdog.
+pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many frames a window resize is allowed, and always costs.
 pub const RESIZE_FRAMES: u64 = 45;
@@ -1351,7 +1354,14 @@ pub fn semantic_hash(canonical: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PendingCapture {
     frame: FrameName,
+    /// The simulated frame the request was made on, for diagnostics.
     requested_on: u64,
+    /// When the request was made, which is what the readback budget measures.
+    requested_at: Instant,
+    /// How many zero-time render pumps this capture has already cost.
+    pumps: u64,
+    /// The pump the observer's record was first seen on.
+    landed_on: Option<u64>,
     completed: bool,
 }
 
@@ -1383,6 +1393,8 @@ pub struct VerificationRun {
     output: VerifyOutput,
     started: Instant,
     watchdog: Duration,
+    capture_timeout: Duration,
+    capture_delay: u64,
     frame: u64,
     stage_frame: u64,
     held: BTreeSet<KeyCode>,
@@ -1406,6 +1418,8 @@ impl VerificationRun {
             fault,
             started: Instant::now(),
             watchdog: APP_WATCHDOG,
+            capture_timeout: CAPTURE_TIMEOUT,
+            capture_delay: 0,
             frame: 0,
             stage_frame: 0,
             held: BTreeSet::new(),
@@ -1418,6 +1432,19 @@ impl VerificationRun {
             observations: Observations::default(),
             finished: false,
         }
+    }
+
+    /// The same run, holding every readback open for `pumps` further render
+    /// pumps after the observer has already recorded it.
+    ///
+    /// This is the injected slow GPU. It changes only how many zero-time pumps
+    /// a capture costs, which is exactly the quantity the canonical report is
+    /// required to be independent of, so two runs that differ only in this
+    /// value must produce byte-identical evidence.
+    #[must_use]
+    pub const fn with_capture_delay(mut self, pumps: u64) -> Self {
+        self.capture_delay = pumps;
+        self
     }
 
     /// The current stage.
@@ -1708,6 +1735,19 @@ fn drive_verification(world: &mut World) {
         return;
     }
 
+    // An outstanding screenshot readback owns the frame. The app keeps
+    // rendering — that is the only thing that moves a readback along — but no
+    // simulated time passes, no counter moves, and nothing is recorded, so the
+    // number of pumps a particular GPU needs can never reach the report.
+    if run.pending.is_some_and(|pending| !pending.completed) {
+        if let Err(reason) = pump_pending_capture(world, &mut run) {
+            run.machine.fail(reason);
+            finish(world, &mut run);
+        }
+        world.insert_resource(run);
+        return;
+    }
+
     run.frame += 1;
     run.stage_frame += 1;
 
@@ -1727,7 +1767,7 @@ fn drive_verification(world: &mut World) {
         });
     }
 
-    if run.fault != Some(VerificationFault::Hang) && run.started.elapsed() > run.watchdog {
+    if watchdog_expired(&run) {
         let stage = run.machine.stage().name();
         run.machine
             .fail(format!("the app watchdog expired in stage {stage}"));
@@ -1958,11 +1998,15 @@ fn arrows_towards(basis: &ViewBasis, from: Vec2, target: Vec2, tolerance: f32) -
 
 /// Requests one capture, or reports whether the outstanding one has landed.
 ///
-/// A capture always costs exactly [`CAPTURE_FRAMES`] simulated frames. That is
-/// deliberate: the readback latency is a property of the GPU, and letting it
-/// change how much simulated time passes would make the canonical report
-/// irreproducible. The callback must still have fired inside the budget, so a
-/// lost callback is a hard failure rather than a silent pass.
+/// A capture costs the journey no simulated time at all. The request frame
+/// records the frame's facts, spawns the real screenshot observer, and stops
+/// the clock; the readback is then waited out on the condition that actually
+/// matters — the observer's own record plus a complete file on disk — for as
+/// many zero-time render pumps as the GPU needs. That is what makes the
+/// canonical report reproducible: readback latency is a property of the
+/// machine, and it never becomes simulated time. A callback that has not
+/// arrived inside [`CAPTURE_TIMEOUT`] of wall clock really is lost, and is a
+/// hard failure that names what it was waiting for.
 fn capture(
     world: &mut World,
     run: &mut VerificationRun,
@@ -1976,39 +2020,158 @@ fn capture(
                 .frames
                 .insert(frame.file_name().to_owned(), facts);
             request_capture(world, run, frame);
+            set_simulated_step(world, Duration::ZERO);
             Ok(false)
         }
-        Some(mut pending) => {
-            if !pending.completed {
-                let landed = world
-                    .get_resource::<CaptureInbox>()
-                    .is_some_and(|inbox| inbox.completed.contains(&frame));
-                if landed {
-                    pending.completed = true;
-                    run.pending = Some(pending);
-                }
-            }
-            let elapsed = run.frame - pending.requested_on;
-            if elapsed < CAPTURE_FRAMES {
+        Some(pending) => {
+            debug_assert_eq!(
+                pending.frame, frame,
+                "a stage only ever waits on the capture it requested"
+            );
+            if !poll_capture(world, run)? {
                 return Ok(false);
-            }
-            if !pending.completed {
-                return Err(format!(
-                    "the screenshot callback for {} never fired within {CAPTURE_FRAMES} frames",
-                    frame.file_name()
-                ));
-            }
-            let path = run.output.frame(frame);
-            let size = fs::metadata(&path)
-                .map_err(|error| format!("{} was never written: {error}", frame.file_name()))?
-                .len();
-            if size == 0 {
-                return Err(format!("{} was written empty", frame.file_name()));
             }
             run.pending = None;
             Ok(true)
         }
     }
+}
+
+/// Runs one zero-time render pump for the outstanding capture.
+///
+/// This is the whole of a pumped frame: the global watchdog still applies, and
+/// the readback is polled. Nothing else the driver does happens here, which is
+/// what keeps an arbitrary number of pumps invisible to the report.
+fn pump_pending_capture(world: &mut World, run: &mut VerificationRun) -> Result<(), String> {
+    if watchdog_expired(run) {
+        let stage = run.machine.stage().name();
+        return Err(format!("the app watchdog expired in stage {stage}"));
+    }
+    poll_capture(world, run)?;
+    Ok(())
+}
+
+/// Whether the global app watchdog has expired.
+fn watchdog_expired(run: &VerificationRun) -> bool {
+    run.fault != Some(VerificationFault::Hang) && run.started.elapsed() > run.watchdog
+}
+
+/// Polls the outstanding readback once, returning whether it has landed.
+///
+/// "Landed" is the real condition and nothing weaker: the observer recorded the
+/// frame — which it only does after Bevy's own `save_to_disk` has returned —
+/// and the file that observer wrote is on disk and not empty.
+fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, String> {
+    let Some(mut pending) = run.pending else {
+        return Ok(true);
+    };
+    if pending.completed {
+        return Ok(true);
+    }
+
+    pending.pumps += 1;
+    if pending.landed_on.is_none()
+        && world
+            .get_resource::<CaptureInbox>()
+            .is_some_and(|inbox| inbox.completed.contains(&pending.frame))
+    {
+        pending.landed_on = Some(pending.pumps);
+    }
+
+    let path = run.output.frame(pending.frame);
+    let served = pending
+        .landed_on
+        .is_some_and(|landed| pending.pumps >= landed + run.capture_delay);
+    if served && fs::metadata(&path).is_ok_and(|file| file.len() > 0) {
+        // The observer only records after `save_to_disk` has returned, so a
+        // recorded frame is a complete file. What it is *not* guaranteed to be
+        // is the contracted size: a window server that hands back a
+        // half-resolution surface writes a perfectly valid short PNG, and
+        // nothing downstream would say so, because the report records the size
+        // the frame was asked for rather than the size it came back at.
+        let expected = pending.frame.size();
+        match png_dimensions(&path) {
+            Some(size) if size == expected => {}
+            Some((width, height)) => {
+                run.pending = Some(pending);
+                set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
+                return Err(format!(
+                    "{} came back {width}x{height}, the contract needs {}x{}",
+                    pending.frame.file_name(),
+                    expected.0,
+                    expected.1
+                ));
+            }
+            None => {
+                run.pending = Some(pending);
+                set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
+                return Err(format!(
+                    "{} is not a readable PNG: {}",
+                    pending.frame.file_name(),
+                    artifact_state(&path)
+                ));
+            }
+        }
+        pending.completed = true;
+        run.pending = Some(pending);
+        set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
+        return Ok(true);
+    }
+
+    if pending.requested_at.elapsed() > run.capture_timeout {
+        let reason = format!(
+            "the screenshot callback for {} never fired within {:?}: stage {}, simulated frame {}, \
+             {} zero-time render pumps, artifact {}",
+            pending.frame.file_name(),
+            run.capture_timeout,
+            run.machine.stage().name(),
+            pending.requested_on,
+            pending.pumps,
+            artifact_state(&path),
+        );
+        error!("{reason}; the artifact path was {}", path.display());
+        run.pending = Some(pending);
+        set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
+        return Err(reason);
+    }
+
+    run.pending = Some(pending);
+    Ok(false)
+}
+
+/// The pixel size a PNG declares, read from its header alone.
+///
+/// This is deliberately a header read rather than a decode: it runs once per
+/// capture on the critical path, and the only question is whether the surface
+/// the window server handed back is the one the contract names.
+fn png_dimensions(path: &Path) -> Option<(u32, u32)> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let header = fs::read(path).ok()?;
+    let header = header.get(..24)?;
+    if header[..8] != SIGNATURE || &header[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
+/// What one capture artifact looks like on disk, in one phrase.
+fn artifact_state(path: &Path) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    match fs::metadata(path) {
+        Ok(file) if file.len() > 0 => format!("{name} holds {} bytes", file.len()),
+        Ok(_) => format!("{name} was written empty"),
+        Err(error) => format!("{name} was never written ({error})"),
+    }
+}
+
+/// Sets the simulated step every following frame advances by.
+fn set_simulated_step(world: &mut World, step: Duration) {
+    world.insert_resource(TimeUpdateStrategy::ManualDuration(step));
 }
 
 /// Spawns the real screenshot entity with the mandated observers.
@@ -2033,6 +2196,9 @@ fn request_capture(world: &mut World, run: &mut VerificationRun, frame: FrameNam
     run.pending = Some(PendingCapture {
         frame,
         requested_on: run.frame,
+        requested_at: Instant::now(),
+        pumps: 0,
+        landed_on: None,
         completed: false,
     });
 }
@@ -3136,12 +3302,22 @@ fn check_camera_render_settings(world: &mut World) -> Result<(), String> {
 pub struct VerificationPlugin {
     output: VerifyOutput,
     fault: Option<VerificationFault>,
+    capture_delay: u64,
 }
 
 impl VerificationPlugin {
     /// A plugin that writes into a prepared output directory.
-    pub fn new(output: VerifyOutput, fault: Option<VerificationFault>) -> Self {
-        Self { output, fault }
+    ///
+    /// `capture_delay` holds every screenshot readback open for that many
+    /// further zero-time render pumps after the observer already recorded it.
+    /// It is a test instrument for the reproducibility contract and is zero for
+    /// every real run.
+    pub fn new(output: VerifyOutput, fault: Option<VerificationFault>, capture_delay: u64) -> Self {
+        Self {
+            output,
+            fault,
+            capture_delay,
+        }
     }
 }
 
@@ -3152,7 +3328,10 @@ impl Plugin for VerificationPlugin {
         )))
         .insert_resource(ClearColor(SENTINEL_CLEAR.into()))
         .init_resource::<CaptureInbox>()
-        .insert_resource(VerificationRun::new(self.output.clone(), self.fault))
+        .insert_resource(
+            VerificationRun::new(self.output.clone(), self.fault)
+                .with_capture_delay(self.capture_delay),
+        )
         .add_systems(
             Update,
             configure_verification_camera.in_set(CellShiftSet::AssetReady),
@@ -3252,6 +3431,14 @@ pub struct VerificationRequest {
     pub output: Option<PathBuf>,
     /// The fault to inject into that run.
     pub fault: Option<VerificationFault>,
+    /// How many further zero-time render pumps every screenshot readback is
+    /// held open for after the observer has already recorded it.
+    ///
+    /// This is the injected slow GPU: it changes only how many pumps a capture
+    /// costs, which is exactly the quantity the canonical report must be
+    /// independent of. It exists so that independence is provable by running
+    /// the same journey twice with different values.
+    pub capture_delay: Option<u64>,
     /// How many bytes the flood fixture writes to each of stdout and stderr
     /// before exiting successfully, when one was requested.
     pub flood: Option<u64>,
@@ -3308,6 +3495,7 @@ pub fn parse_verification_args(
 ) -> Result<VerificationRequest, String> {
     const OUTPUT: &str = "--verify-output";
     const FAULT: &str = "--verify-fault";
+    const DELAY: &str = "--verify-capture-delay";
     const FLOOD: &str = "--verify-flood";
     let mut arguments = arguments.into_iter();
     let mut request = VerificationRequest::default();
@@ -3335,6 +3523,23 @@ pub fn parse_verification_args(
                 }
                 request.fault = Some(VerificationFault::parse(&value)?);
             }
+            DELAY => {
+                let Some(value) = value.or_else(|| arguments.next()) else {
+                    return Err(format!("{DELAY} requires a pump count"));
+                };
+                if request.capture_delay.is_some() {
+                    return Err(format!("{DELAY} was given more than once"));
+                }
+                let pumps = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("{DELAY} requires a pump count, got {value}"))?;
+                if pumps > CAPTURE_DELAY_LIMIT {
+                    return Err(format!(
+                        "{DELAY} accepts at most {CAPTURE_DELAY_LIMIT} pumps, got {pumps}"
+                    ));
+                }
+                request.capture_delay = Some(pumps);
+            }
             FLOOD => {
                 let Some(value) = value.or_else(|| arguments.next()) else {
                     return Err(format!("{FLOOD} requires a byte count"));
@@ -3352,7 +3557,7 @@ pub fn parse_verification_args(
             }
             _ => {
                 return Err(format!(
-                    "unknown argument {argument}; usage: midcreek-cs-1 [{OUTPUT} <directory>] [{FAULT} <fault>] [{FLOOD} <bytes>]"
+                    "unknown argument {argument}; usage: midcreek-cs-1 [{OUTPUT} <directory>] [{FAULT} <fault>] [{DELAY} <pumps>] [{FLOOD} <bytes>]"
                 ));
             }
         }
@@ -3360,11 +3565,22 @@ pub fn parse_verification_args(
     if request.fault.is_some() && request.output.is_none() {
         return Err(format!("{FAULT} only applies to a {OUTPUT} run"));
     }
-    if request.flood.is_some() && (request.output.is_some() || request.fault.is_some()) {
+    if request.capture_delay.is_some() && request.output.is_none() {
+        return Err(format!("{DELAY} only applies to a {OUTPUT} run"));
+    }
+    if request.flood.is_some()
+        && (request.output.is_some() || request.fault.is_some() || request.capture_delay.is_some())
+    {
         return Err(format!("{FLOOD} is a fixture and runs on its own"));
     }
     Ok(request)
 }
+
+/// Largest readback delay the harness will inject.
+///
+/// A capture is bounded by [`CAPTURE_TIMEOUT`] whatever this says, so the limit
+/// exists to turn a typo into a usage error rather than a timed-out run.
+pub const CAPTURE_DELAY_LIMIT: u64 = 600;
 
 // ---------------------------------------------------------------------------
 // Frame analysis
@@ -4726,6 +4942,296 @@ mod tests {
                 VERIFICATION_WINDOW_HEIGHT,
             )),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Capture waiting
+    // -----------------------------------------------------------------------
+
+    /// The one frame `begin_repair_snapshot`'s 960x540 viewport is sized for,
+    /// so a capture test never fails on a viewport mismatch it is not about.
+    const CAPTURE_TEST_FRAME: FrameName = FrameName::LowResolutionQueue;
+
+    /// The fixed frame budget captures used to be waited out with, before the
+    /// wait became conditional. It survives only as the number a callback has
+    /// to beat here, because it is the number the CI renderer really missed.
+    const RETIRED_CAPTURE_FRAMES: u64 = 24;
+
+    /// A world holding exactly what an outstanding capture reads: the
+    /// observers' mailbox and the manual clock the harness drives.
+    fn capture_world() -> World {
+        let mut world = World::new();
+        world.init_resource::<CaptureInbox>();
+        world.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            FIXED_STEP_SECONDS,
+        )));
+        world
+    }
+
+    /// A run parked on the stage that captures [`CAPTURE_TEST_FRAME`].
+    fn capture_run() -> VerificationRun {
+        let mut run = VerificationRun::new(scratch_output(), None);
+        while run.stage() != VerificationStage::LowResolutionCapture {
+            run.machine
+                .advance()
+                .expect("the documented order reaches low-resolution-capture");
+        }
+        run
+    }
+
+    /// A snapshot a capture stage is happy to photograph.
+    fn capture_snapshot() -> Snapshot {
+        let roster = journey_roster();
+        let spot = journey_spot(&roster);
+        begin_repair_snapshot(
+            roster,
+            spot,
+            PlayerClip::Idle,
+            MovementLock::default(),
+            InteractionOutcome::None,
+        )
+    }
+
+    /// Lands the outstanding readback exactly as the real observer does: the
+    /// complete file reaches disk first, and only then is the frame recorded.
+    fn land_capture(world: &mut World, run: &VerificationRun, frame: FrameName) {
+        land_capture_sized(world, run, frame, frame.size());
+    }
+
+    /// The same landing, but writing a frame of an arbitrary pixel size.
+    fn land_capture_sized(
+        world: &mut World,
+        run: &VerificationRun,
+        frame: FrameName,
+        size: (u32, u32),
+    ) {
+        RgbImage::new(size.0, size.1)
+            .save(run.output.frame(frame))
+            .expect("the scratch frame is writable");
+        world.resource_mut::<CaptureInbox>().completed.push(frame);
+    }
+
+    /// The simulated step the manual clock is currently set to.
+    fn simulated_step(world: &World) -> Duration {
+        match world.resource::<TimeUpdateStrategy>() {
+            TimeUpdateStrategy::ManualDuration(step) => *step,
+            _ => panic!("the verification clock is always driven manually"),
+        }
+    }
+
+    /// The readback is a property of the GPU, not of the journey. A callback
+    /// that lands after more render pumps than the old fixed frame budget
+    /// allowed is late, not lost, and the capture must still complete.
+    #[test]
+    fn a_capture_completes_when_the_callback_lands_long_after_the_old_frame_budget() {
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+
+        run.frame += 1;
+        assert!(
+            !capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+                .expect("requesting a capture must not fail"),
+            "the request frame never completes the capture"
+        );
+
+        for pump in 0..(RETIRED_CAPTURE_FRAMES * 4) {
+            run.frame += 1;
+            let landed = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).unwrap_or_else(
+                |reason| {
+                    panic!("pump {pump} must keep waiting for the readback, it failed: {reason}")
+                },
+            );
+            assert!(
+                !landed,
+                "pump {pump} must not claim a readback that never landed"
+            );
+        }
+
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        run.frame += 1;
+        assert!(
+            capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+                .expect("a landed readback completes the capture"),
+            "a late callback must still complete the capture"
+        );
+        assert!(
+            run.pending.is_none(),
+            "a completed capture is no longer outstanding"
+        );
+    }
+
+    /// A capture must cost the journey no simulated time at all, so the number
+    /// of render pumps one machine needs can never reach the report.
+    #[test]
+    fn a_pending_capture_freezes_the_clock_and_the_landing_restores_the_fixed_step() {
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        assert_eq!(
+            simulated_step(&world),
+            Duration::ZERO,
+            "an outstanding capture must stop simulated time"
+        );
+
+        for _ in 0..8 {
+            capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("pumps do not fail");
+            assert_eq!(
+                simulated_step(&world),
+                Duration::ZERO,
+                "every pump of an outstanding capture stays frozen"
+            );
+        }
+
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        assert!(
+            capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the readback landed"),
+            "the landed readback completes the capture"
+        );
+        assert_eq!(
+            simulated_step(&world),
+            Duration::from_secs_f64(FIXED_STEP_SECONDS),
+            "the frame after the readback must advance exactly one fixed step"
+        );
+    }
+
+    /// Any number of zero-time pumps must leave the journey exactly where the
+    /// request frame left it: same frame counters, same recorded facts.
+    #[test]
+    fn zero_time_pumps_leave_every_recorded_journey_fact_untouched() {
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+
+        run.frame = 617;
+        run.stage_frame = 9;
+        run.observations.keys.push(KeyFacts {
+            stage: run.machine.stage().name().to_owned(),
+            key: key_name(REPAIR_KEY),
+            state: "pressed".to_owned(),
+        });
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+
+        let frame = run.frame;
+        let stage_frame = run.stage_frame;
+        let stage = run.stage();
+        let keys = run.observations.keys.clone();
+        let history = run.observations.ticket_history.clone();
+        let interactions = run.observations.interactions.clone();
+        let frames = run.observations.frames.clone();
+
+        for _ in 0..(RETIRED_CAPTURE_FRAMES * 3) {
+            pump_pending_capture(&mut world, &mut run)
+                .expect("a pump before the budget cannot fail");
+        }
+
+        assert_eq!(run.frame, frame, "a pump is not a simulated frame");
+        assert_eq!(
+            run.stage_frame, stage_frame,
+            "a pump does not spend the stage budget"
+        );
+        assert_eq!(run.stage(), stage, "a pump never moves the machine");
+        assert_eq!(run.observations.keys, keys, "a pump writes no key history");
+        assert_eq!(
+            run.observations.ticket_history, history,
+            "a pump opens no ticket"
+        );
+        assert_eq!(
+            run.observations.interactions, interactions,
+            "a pump records no interaction"
+        );
+        assert_eq!(
+            run.observations.frames, frames,
+            "a pump re-records no frame facts"
+        );
+    }
+
+    /// A readback that really is lost has to say which frame, which stage, and
+    /// what state the artifact was left in, or the CI log proves nothing.
+    #[test]
+    fn a_lost_callback_names_its_frame_stage_and_artifact_state() {
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+        run.capture_timeout = Duration::ZERO;
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a callback past its wall-clock budget is lost");
+
+        for fact in [
+            "screenshot callback",
+            CAPTURE_TEST_FRAME.file_name(),
+            "low-resolution-capture",
+            "never written",
+        ] {
+            assert!(
+                reason.contains(fact),
+                "the lost-callback failure must name {fact}: {reason}"
+            );
+        }
+        assert_eq!(
+            simulated_step(&world),
+            Duration::from_secs_f64(FIXED_STEP_SECONDS),
+            "a failed capture still hands the clock back"
+        );
+    }
+
+    /// The injected readback delay is what makes "different pump counts, same
+    /// evidence" provable: it must hold the capture open for exactly the
+    /// requested number of extra pumps and then complete normally.
+    #[test]
+    fn an_injected_readback_delay_holds_the_capture_open_for_exactly_its_pumps() {
+        const DELAY: u64 = 7;
+        let mut world = capture_world();
+        let mut run = capture_run().with_capture_delay(DELAY);
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+
+        for pump in 0..DELAY {
+            assert!(
+                !capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+                    .expect("a delayed pump cannot fail"),
+                "pump {pump} of the injected delay must still be outstanding"
+            );
+        }
+        assert!(
+            capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+                .expect("the delayed readback completes"),
+            "the capture must complete on the pump after its injected delay"
+        );
+    }
+
+    /// A readback that lands at the wrong resolution is a real failure the
+    /// report would otherwise never mention: the recorded frame facts carry
+    /// the size the frame was *asked* for, so a short surface would reach the
+    /// gate as an unexplained pixel difference.
+    #[test]
+    fn a_capture_that_comes_back_the_wrong_size_fails_naming_both_sizes() {
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+        let (width, height) = CAPTURE_TEST_FRAME.size();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        land_capture_sized(
+            &mut world,
+            &run,
+            CAPTURE_TEST_FRAME,
+            (width / 2, height / 2),
+        );
+
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a half-resolution surface is not the contracted frame");
+        assert!(
+            reason.contains(&format!("{}x{}", width / 2, height / 2))
+                && reason.contains(&format!("{width}x{height}")),
+            "the failure must name what came back and what was needed: {reason}"
+        );
     }
 
     /// A run parked on [`VerificationStage::BeginRepair`], plus the world and

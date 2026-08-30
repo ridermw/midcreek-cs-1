@@ -64,10 +64,10 @@ use midcreek_cs_1::{
         RackLeaderLine, TicketQueuePanel, severity_role, state_role,
     },
     operations::{
-        FAULT_INTERVAL, FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction,
-        MovementLock, OperationsClock, RACK_ASSET_KIND, RACK_COOLDOWN, REPAIR_DURATION, REPAIR_KEY,
-        RESOLVED_DISPLAY, RackOperations, RackRoster, RackState, ScheduleBlock, Ticket, TicketId,
-        TicketQueue, TicketSeverity,
+        FAULT_INTERVAL, FAULT_SCHEDULER_SEED, FaultCandidate, FaultScheduler, InteractionOutcome,
+        LastInteraction, MovementLock, OperationsClock, RACK_ASSET_KIND, RACK_COOLDOWN,
+        REPAIR_DURATION, REPAIR_KEY, RESOLVED_DISPLAY, RackOperations, RackRoster, RackState,
+        ScheduleBlock, Ticket, TicketId, TicketQueue, TicketSeverity,
     },
     player::{
         PLAYER_MAX_MOVE_DELTA, PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip,
@@ -4699,6 +4699,138 @@ fn operations_scheduler_opens_the_seeded_queue_on_the_exact_interval_ticks() {
     assert_eq!(still_paused.rng().draws(), 6, "a full queue never rerolls");
     assert_eq!(still_paused.capacity_pauses(), 1);
     assert_eq!(ticket_queue(&app).len(), 3);
+}
+
+/// Everything the seeded scheduler owns, as plain comparable facts.
+///
+/// `FaultScheduler` holds a `ChaCha8Rng` and so cannot derive `PartialEq`;
+/// this is every observable it exposes, which is what a regression needs.
+fn scheduler_facts(
+    app: &App,
+) -> (
+    u64,
+    Duration,
+    bool,
+    Option<FaultCandidate>,
+    Option<ScheduleBlock>,
+    u64,
+    u64,
+    u64,
+    u64,
+) {
+    let scheduler = scheduler(app);
+    (
+        scheduler.rng().draws(),
+        scheduler.elapsed(),
+        scheduler.is_armed(),
+        scheduler.pending(),
+        scheduler.blocked(),
+        scheduler.emitted(),
+        scheduler.capacity_pauses(),
+        scheduler.duplicate_pauses(),
+        scheduler.busy_pauses(),
+    )
+}
+
+/// A frame that advances no simulated time must simulate nothing.
+///
+/// The verification harness holds the clock at zero and keeps rendering while
+/// a screenshot readback is in flight, so an arbitrary number of those frames
+/// must leave every part of the model that owns time exactly where the last
+/// simulated frame left it: the tick tickets are stamped with, every rack
+/// timer, the seeded stream and the candidate it is holding, the queue, the
+/// movement lock, and the technician's position.
+#[test]
+fn zero_delta_frames_never_advance_the_operations_model() {
+    let mut app = operations_hall(&repo_assets());
+
+    // A full queue and an armed scheduler holding a candidate it cannot place:
+    // the one state in which a zero-delta step could emit a ticket out of
+    // nothing, because the interval has already matured.
+    pump(&mut app, FAULT_FRAMES * 4);
+    assert_eq!(ticket_queue(&app).len(), MAX_ACTIVE_TICKETS);
+    assert!(
+        scheduler(&app).is_armed(),
+        "the fourth opportunity must have matured against the full queue"
+    );
+
+    // A running repair, so the rack timers and the movement lock are live too.
+    let rack = ticket_queue(&app).ordered()[0].rack;
+    let spot = repair_spot(&app, rack);
+    place_player(&mut app, spot);
+    hold(&mut app, &[]);
+    app.update();
+    press_space(&mut app);
+    app.update();
+    assert!(
+        movement_lock(&app).is_locked(),
+        "the regression needs a repair holding the controls"
+    );
+    assert_eq!(rack_ops(&app, rack).state(), RackState::Repairing);
+
+    freeze_time(&mut app);
+    app.update();
+
+    let tick = operations_tick(&app);
+    let queue = ticket_queue(&app);
+    let facts = scheduler_facts(&app);
+    let lock = movement_lock(&app);
+    let interaction = last_interaction(&app);
+    let racks = (0..roster(&app).len())
+        .map(|index| rack_ops(&app, index))
+        .collect::<Vec<_>>();
+    let position = player_position(&mut app);
+
+    // Far more frames than any readback needs, held down on the arrow keys so
+    // a zero step is the only thing stopping the technician.
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 600);
+
+    assert_eq!(
+        operations_tick(&app),
+        tick,
+        "a zero-delta frame must not stamp a new tick"
+    );
+    assert_eq!(
+        ticket_queue(&app),
+        queue,
+        "a zero-delta frame opens no ticket"
+    );
+    assert_eq!(
+        scheduler_facts(&app),
+        facts,
+        "a zero-delta frame must not draw, arm, pause, or emit"
+    );
+    assert_eq!(
+        movement_lock(&app),
+        lock,
+        "a zero-delta frame releases no lock"
+    );
+    assert_eq!(
+        last_interaction(&app),
+        interaction,
+        "a zero-delta frame records no interaction"
+    );
+    assert_eq!(
+        (0..roster(&app).len())
+            .map(|index| rack_ops(&app, index))
+            .collect::<Vec<_>>(),
+        racks,
+        "a zero-delta frame must not advance a single rack timer"
+    );
+    assert_eq!(
+        player_position(&mut app),
+        position,
+        "a zero-delta frame moves nobody"
+    );
+
+    // And the moment the clock is handed back, the same model resumes.
+    resume_time(&mut app);
+    app.update();
+    assert_eq!(
+        operations_tick(&app),
+        tick + 1,
+        "the first simulated frame after the freeze must resume the tick"
+    );
 }
 
 #[test]

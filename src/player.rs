@@ -810,6 +810,13 @@ fn move_player(
     mut motion: ResMut<PlayerMotion>,
     mut technicians: Query<&mut Transform, With<Technician>>,
 ) {
+    // A frame that advanced no simulated time moves nobody, and must not
+    // republish motion either: `update_player_animation` reads `PlayerMotion`,
+    // so recomputing a zero displacement here would drop a walking technician
+    // into the idle clip on a frame that simulated nothing.
+    if time.delta().is_zero() {
+        return;
+    }
     let Ok(mut transform) = technicians.single_mut() else {
         return;
     };

@@ -55,5 +55,5 @@ fn main() -> ExitCode {
         eprintln!("could not clear stale verification artifacts: {error}");
         return ExitCode::from(2);
     }
-    midcreek_cs_1::run_verification(output, request.fault)
+    midcreek_cs_1::run_verification(output, request.fault, request.capture_delay.unwrap_or(0))
 }

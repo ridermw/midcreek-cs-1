@@ -253,9 +253,15 @@ impl RackOperations {
     /// completed, in order.
     ///
     /// A hitch longer than one dwell walks the documented states one at a time
-    /// and carries its remainder, so no state is ever skipped.
+    /// and carries its remainder, so no state is ever skipped. A zero delta is
+    /// no step at all: it returns before touching the accumulator, so a frame
+    /// that advanced no simulated time can never complete a dwell that the
+    /// previous frame had already brought to its edge.
     pub fn advance(&mut self, delta: Duration) -> Vec<RackTransition> {
         let mut transitions = Vec::new();
+        if delta.is_zero() {
+            return transitions;
+        }
         let Some(mut dwell) = self.state.dwell() else {
             return transitions;
         };
@@ -659,6 +665,12 @@ impl FaultScheduler {
     /// is full, and a drawn candidate whose rack is unavailable is held rather
     /// than discarded, so the seeded sequence is the same whatever the player
     /// does.
+    ///
+    /// A zero delta returns before anything: not the accumulator, not the
+    /// block reason, and above all not the seeded stream. An *armed* scheduler
+    /// is the case that matters — its interval has already matured, so without
+    /// this guard a frame that advanced no simulated time could draw a
+    /// candidate, pause on a rack, or emit a whole ticket out of nothing.
     pub fn step(
         &mut self,
         delta: Duration,
@@ -666,6 +678,9 @@ impl FaultScheduler {
         active: usize,
         racks: &[RackSnapshot],
     ) -> Option<Ticket> {
+        if delta.is_zero() {
+            return None;
+        }
         if !self.armed {
             self.elapsed += delta;
             if self.elapsed < FAULT_INTERVAL {
@@ -1049,6 +1064,12 @@ fn attach_rack_operations(
 
 /// Advances every timed rack state, removes resolved tickets from the queue,
 /// and releases the movement lock the moment a repair completes.
+///
+/// The tick is the simulation's own clock: it counts frames that advanced
+/// simulated time, never frames that merely rendered. A zero-delta frame is
+/// therefore not a tick, which is what lets the verification harness pump the
+/// renderer for an outstanding screenshot readback without the number of pumps
+/// one machine needs reaching the ticks tickets are stamped with.
 fn advance_racks(
     time: Res<Time>,
     roster: Res<RackRoster>,
@@ -1057,8 +1078,11 @@ fn advance_racks(
     mut lock: ResMut<MovementLock>,
     mut clock: ResMut<OperationsClock>,
 ) {
-    clock.tick += 1;
     let delta = time.delta();
+    if delta.is_zero() {
+        return;
+    }
+    clock.tick += 1;
     for entry in roster.all() {
         let Ok(mut rack) = racks.get_mut(entry.entity) else {
             error!("rack {} lost its operational state", entry.id);
@@ -1083,6 +1107,13 @@ fn advance_racks(
 /// Handles the real Space key. Every rejection is recorded as a rejection and
 /// never as a start, so an out-of-range press is observable without being
 /// mistaken for a repair.
+///
+/// This is deliberately *not* gated on a positive `Time::delta`. `just_pressed`
+/// is true for exactly one frame, so dropping it on a frame that advanced no
+/// simulated time would lose the press outright. Running it is safe instead:
+/// nothing simulated changes between a zero-delta frame and the next simulated
+/// one, so the press resolves against the same state and records the same tick
+/// either way.
 #[allow(clippy::too_many_arguments)]
 fn handle_repair_input(
     keys: Res<ButtonInput<KeyCode>>,

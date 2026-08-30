@@ -32,18 +32,18 @@ use midcreek_cs_1::{
     },
     player::required_player_parts,
     verification::{
-        APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CLIP_DIFFERENCE_RANGE,
-        CameraRenderFacts, EQUIPMENT_REGION_MIN_PIXELS, EQUIPMENT_ROLE_MIN, EquipmentCategory,
-        EquipmentFacts, FrameFacts, FrameMetrics, FrameName, GameplayFacts, HudRowFacts,
-        OUTSIDE_CROP_MAX, PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, SENTINEL_MAX,
-        StageError, StageMachine, VERIFICATION_MSAA, VerificationFault, VerificationReport,
-        VerificationRequest, VerificationStage, VerifyOutput, VerifyOutputError, WORKER_REGION,
-        axis_aligned_fixture, badge_region, black_fixture, blank_hud_fixture, canonical_f64,
-        canonical_float, canonical_json, clip_difference, equipment_region, evaluate_frame,
-        flood_bytes, frame_regions, gradient_noise_fixture, hud_region, magenta_border_fixture,
-        missing_badge_fixture, missing_worker_fixture, outside_crop_change,
-        parse_verification_args, reference_metrics, semantic_hash, synthetic_badges,
-        synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
+        APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CAPTURE_DELAY_LIMIT,
+        CLIP_DIFFERENCE_RANGE, CameraRenderFacts, EQUIPMENT_REGION_MIN_PIXELS, EQUIPMENT_ROLE_MIN,
+        EquipmentCategory, EquipmentFacts, FrameFacts, FrameMetrics, FrameName, GameplayFacts,
+        HudRowFacts, OUTSIDE_CROP_MAX, PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR,
+        SENTINEL_MAX, StageError, StageMachine, VERIFICATION_MSAA, VerificationFault,
+        VerificationReport, VerificationRequest, VerificationStage, VerifyOutput,
+        VerifyOutputError, WORKER_REGION, axis_aligned_fixture, badge_region, black_fixture,
+        blank_hud_fixture, canonical_f64, canonical_float, canonical_json, clip_difference,
+        equipment_region, evaluate_frame, flood_bytes, frame_regions, gradient_noise_fixture,
+        hud_region, magenta_border_fixture, missing_badge_fixture, missing_worker_fixture,
+        outside_crop_change, parse_verification_args, reference_metrics, semantic_hash,
+        synthetic_badges, synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
     },
 };
 use sha2::{Digest, Sha256};
@@ -981,6 +981,7 @@ fn command_line_accepts_the_documented_shapes() {
         Ok(VerificationRequest {
             output: Some(PathBuf::from("frames")),
             fault: None,
+            capture_delay: None,
             flood: None,
         })
     );
@@ -989,6 +990,25 @@ fn command_line_accepts_the_documented_shapes() {
         Ok(VerificationRequest {
             output: Some(PathBuf::from("frames")),
             fault: Some(VerificationFault::Stall),
+            capture_delay: None,
+            flood: None,
+        })
+    );
+    assert_eq!(
+        parse(&["--verify-output=frames", "--verify-capture-delay=30"]),
+        Ok(VerificationRequest {
+            output: Some(PathBuf::from("frames")),
+            fault: None,
+            capture_delay: Some(30),
+            flood: None,
+        })
+    );
+    assert_eq!(
+        parse(&["--verify-output", "frames", "--verify-capture-delay", "0"]),
+        Ok(VerificationRequest {
+            output: Some(PathBuf::from("frames")),
+            fault: None,
+            capture_delay: Some(0),
             flood: None,
         })
     );
@@ -997,6 +1017,7 @@ fn command_line_accepts_the_documented_shapes() {
         Ok(VerificationRequest {
             output: None,
             fault: None,
+            capture_delay: None,
             flood: Some(4096),
         })
     );
@@ -1010,6 +1031,20 @@ fn command_line_rejects_every_other_shape() {
         vec!["--verify-fault", "stall"],
         vec!["--verify-output", "a", "--verify-fault"],
         vec!["--verify-output", "a", "--verify-fault", "explode"],
+        vec!["--verify-capture-delay", "4"],
+        vec!["--verify-output", "a", "--verify-capture-delay"],
+        vec!["--verify-output", "a", "--verify-capture-delay", "soon"],
+        vec!["--verify-output", "a", "--verify-capture-delay", "-1"],
+        vec!["--verify-output", "a", "--verify-capture-delay", "601"],
+        vec![
+            "--verify-output",
+            "a",
+            "--verify-capture-delay",
+            "4",
+            "--verify-capture-delay",
+            "5",
+        ],
+        vec!["--verify-flood", "16", "--verify-capture-delay", "4"],
         vec!["--verify-flood"],
         vec!["--verify-flood", "0"],
         vec!["--verify-flood", "lots"],
@@ -1023,6 +1058,10 @@ fn command_line_rejects_every_other_shape() {
             "{arguments:?} must be a usage error"
         );
     }
+    assert_eq!(
+        CAPTURE_DELAY_LIMIT, 600,
+        "the rejected 601 above is one past the documented limit"
+    );
 }
 
 #[test]
@@ -1185,6 +1224,18 @@ fn launch_arguments(arguments: &[String], watchdog: Duration) -> Launch {
 }
 
 fn launch(output: &Path, fault: Option<VerificationFault>, watchdog: Duration) -> Launch {
+    launch_delayed(output, fault, 0, watchdog)
+}
+
+/// Runs the game once, holding every screenshot readback open for
+/// `capture_delay` further zero-time render pumps after the observer already
+/// recorded it.
+fn launch_delayed(
+    output: &Path,
+    fault: Option<VerificationFault>,
+    capture_delay: u64,
+    watchdog: Duration,
+) -> Launch {
     let mut arguments = vec![
         "--verify-output".to_owned(),
         output.to_string_lossy().into_owned(),
@@ -1192,6 +1243,10 @@ fn launch(output: &Path, fault: Option<VerificationFault>, watchdog: Duration) -
     if let Some(fault) = fault {
         arguments.push("--verify-fault".to_owned());
         arguments.push(fault.name().to_owned());
+    }
+    if capture_delay > 0 {
+        arguments.push("--verify-capture-delay".to_owned());
+        arguments.push(capture_delay.to_string());
     }
     launch_arguments(&arguments, watchdog)
 }
@@ -1245,9 +1300,15 @@ fn rendered_run() -> &'static RenderedRun {
 }
 
 fn render_into(root: &Path, label: &str) -> RenderedRun {
+    render_delayed(root, label, 0)
+}
+
+/// One complete run whose every readback is held open for `capture_delay`
+/// further zero-time render pumps.
+fn render_delayed(root: &Path, label: &str, capture_delay: u64) -> RenderedRun {
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).expect("the render contract owns target/render-contract");
-    let launched = launch(root, None, PARENT_WATCHDOG);
+    let launched = launch_delayed(root, None, capture_delay, PARENT_WATCHDOG);
     let diagnostics = root.join("stdout.log");
     let _ = fs::write(&diagnostics, &launched.stdout);
     let _ = fs::write(root.join("stderr.log"), &launched.stderr);
@@ -2100,6 +2161,60 @@ fn semantic_report_reproduces_in_a_different_output_directory() {
         }
     }
     let _ = fs::remove_dir_all(&second.root);
+}
+
+/// How many further render pumps the slow reproduction holds each readback for.
+///
+/// It is deliberately past the twenty-four frame budget captures used to be
+/// waited out with, so this run is one the retired fixed-frame rule would have
+/// failed outright. Because a pending capture advances no simulated time, the
+/// only thing it costs is pumps, and those are exactly what the evidence must
+/// be independent of.
+const SLOW_READBACK_PUMPS: u64 = 30;
+
+/// The number of render pumps a readback takes is a property of the machine,
+/// never of the game. Two runs of the same journey that differ only in how
+/// long every callback takes must produce the same evidence, byte for byte.
+#[test]
+fn the_readback_pump_count_never_reaches_the_evidence() {
+    let quick = render_delayed(
+        &repository().join("target/render-contract/prompt-readback"),
+        "prompt-readback",
+        0,
+    );
+    let slow = render_delayed(
+        &repository().join("target/render-contract/slow-readback"),
+        "slow-readback",
+        SLOW_READBACK_PUMPS,
+    );
+
+    assert_eq!(quick.report.result, "success");
+    assert_eq!(slow.report.result, "success");
+    assert_eq!(
+        quick.canonical, slow.canonical,
+        "a slow readback must not change one byte of the canonical report"
+    );
+    assert_eq!(
+        semantic_hash(&quick.canonical),
+        semantic_hash(&slow.canonical),
+        "the semantic hash must not depend on readback latency"
+    );
+
+    for frame in FrameName::ALL {
+        let left = fs::read(quick.root.join(frame.file_name()))
+            .unwrap_or_else(|error| panic!("{} is readable: {error}", frame.file_name()));
+        let right = fs::read(slow.root.join(frame.file_name()))
+            .unwrap_or_else(|error| panic!("{} is readable: {error}", frame.file_name()));
+        assert_eq!(
+            left,
+            right,
+            "{} must be the same pixels whatever the readback cost",
+            frame.file_name()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&quick.root);
+    let _ = fs::remove_dir_all(&slow.root);
 }
 
 /// Fails when a canonical document carries any of `banned`.
