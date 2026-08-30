@@ -20,11 +20,19 @@
 //!        ^                        v                  |
 //!        |                verify parts every frame --+
 //!        +---- stale handle ------+
+//!                                 |
+//!                                 +-- root or nodes unavailable -->
+//!                                     PlayerRigState::Pending, typed
+//!                                     rebinding condition, movement stops,
+//!                                     rescan recovers a complete instance
 //!
 //! ButtonInput<KeyCode> arrows
 //!        |
 //!        v
 //! normalized screen request -> ViewBasis -> world direction
+//!        |
+//!        v
+//! frame delta clamped to PLAYER_MAX_MOVE_DELTA (no destination-only tunnel)
 //!        |
 //!        v
 //! resolve X, then Z, against HallColliders + radius-aware room bounds
@@ -51,6 +59,30 @@ pub const PLAYER_SPEED: f32 = 3.0;
 
 /// Accepted displacement below this length is treated as standing still.
 pub const PLAYER_MOVE_EPSILON: f32 = 1.0e-5;
+
+/// Longest frame delta movement will ever integrate, in seconds.
+///
+/// Collision is resolved at the destination only, so it cannot see an obstacle
+/// a single step jumped over. The integration step is therefore the whole
+/// anti-tunneling invariant, and it is owned here rather than borrowed from
+/// Bevy's virtual clock: this value matches
+/// [`Time<Virtual>`](bevy::prelude::Virtual)'s default maximum delta and holds
+/// even if that default is raised or movement is ever driven from another
+/// clock. `player_maximum_step_never_spans_a_radius_inflated_obstacle` proves
+/// `PLAYER_SPEED * PLAYER_MAX_MOVE_DELTA` is strictly shorter than every
+/// radius-inflated authored obstacle on both world axes.
+pub const PLAYER_MAX_MOVE_DELTA: f32 = 0.25;
+
+/// Clamps a raw frame delta to [`PLAYER_MAX_MOVE_DELTA`], so a hitch, a
+/// breakpoint, or a non-finite delta shortens the step instead of teleporting
+/// the technician through the narrowest hose drop.
+pub fn movement_delta_secs(raw_secs: f32) -> f32 {
+    if raw_secs.is_nan() {
+        // A poisoned clock must stall the technician, not teleport it.
+        return 0.0;
+    }
+    raw_secs.clamp(0.0, PLAYER_MAX_MOVE_DELTA)
+}
 
 /// Asset file stem holding the technician module.
 pub const TECHNICIAN_ASSET: &str = "technician";
@@ -279,6 +311,16 @@ pub enum PlayerRigError {
         /// Required node name.
         name: String,
     },
+    /// The spawned technician instance is not resolvable this frame: either no
+    /// materialised instance root exists, or more than one claims to be the
+    /// technician. Every bound handle is untrustworthy until it resolves.
+    TechnicianInstanceUnavailable {
+        /// How many materialised technician instances were found.
+        found: usize,
+    },
+    /// The technician instance exists but exposes no named nodes at all, which
+    /// is what a mid-respawn instance looks like from the binder.
+    TechnicianRigNodesUnavailable,
     /// The generated technician document is missing or unloaded.
     MissingTechnicianDocument,
     /// The spawned technician exposes no `AnimationPlayer`.
@@ -566,13 +608,38 @@ fn spawn_technician(
     ));
 }
 
+/// Publishes a transient rebinding condition, so [`player_rig_is_ready`] is
+/// false in the same frame the instance stops resolving.
+///
+/// The rig stays `Pending` rather than `Failed`: a whole-instance respawn is a
+/// legal engine behaviour, and an unhealthy report forces the next frame to
+/// rescan, so a complete rig recovers on its own. An existing failure is never
+/// overwritten — it already stops every consumer and names its cause precisely.
+fn report_rig_unavailable(
+    report: &mut PlayerRigReport,
+    next: &mut NextState<PlayerRigState>,
+    error: PlayerRigError,
+) {
+    if !report.is_healthy() {
+        return;
+    }
+    warn!("technician rig is rebinding: {error:?}");
+    report.errors = vec![error];
+    next.set(PlayerRigState::Pending);
+}
+
 /// Binds, verifies, and rebinds the explicit rig handles.
 ///
 /// Every frame the bound handles are checked against the names they claim. A
 /// healthy rig costs twelve name lookups and stops there. Otherwise the system
 /// rescans the spawned instance: Bevy despawns and respawns a world instance
 /// whenever a glTF sub-asset event arrives, so a complete rescan is a legal
-/// rebind, while an incomplete one keeps the stale handles and fails loudly.
+/// rebind, while an incomplete one fails loudly.
+///
+/// No path returns while the report still claims health. An unresolvable
+/// instance root and an instance with no named nodes each publish their own
+/// typed condition first, because the bound handles are dead in exactly those
+/// frames and movement would otherwise run against them.
 #[allow(clippy::too_many_arguments)]
 fn bind_technician_rig(
     mut commands: Commands,
@@ -588,9 +655,17 @@ fn bind_technician_rig(
     mut next: ResMut<NextState<PlayerRigState>>,
 ) {
     let Ok(root) = technicians.single() else {
+        report_rig_unavailable(
+            &mut report,
+            &mut next,
+            PlayerRigError::TechnicianInstanceUnavailable {
+                found: technicians.iter().count(),
+            },
+        );
         return;
     };
 
+    let bound_before = parts.as_deref().map_or(0, |parts| parts.all().len());
     let stale = parts
         .as_deref()
         .map(|parts| {
@@ -624,8 +699,13 @@ fn bind_technician_rig(
     }
 
     if discovered.is_empty() {
-        // The instance is mid-respawn; the bound handles stay untouched and
-        // movement stays stopped until the rescan sees the rig again.
+        // The instance is mid-respawn. The bound handles stay for the next
+        // rescan, but nothing may consume them until the whole rig is back.
+        report_rig_unavailable(
+            &mut report,
+            &mut next,
+            PlayerRigError::TechnicianRigNodesUnavailable,
+        );
         return;
     }
 
@@ -677,9 +757,16 @@ fn bind_technician_rig(
     };
 
     if !errors.is_empty() {
-        // Previously bound handles that no longer resolve name the loss more
-        // precisely than a fresh rescan does, so they win the report.
-        let errors = if stale.is_empty() { errors } else { stale };
+        // A previously bound handle that no longer resolves names a lost node
+        // more precisely than a rescan does, but only while the rest of the rig
+        // survives it. When every bound handle died the instance itself was
+        // replaced, so the rescan's own findings are the specific truth and a
+        // wall of StalePart would bury them.
+        let errors = if stale.is_empty() || stale.len() == bound_before {
+            errors
+        } else {
+            stale
+        };
         for error in &errors {
             error!("technician rig failure: {error:?}");
         }
@@ -730,7 +817,7 @@ fn move_player(
     let from = Vec2::new(transform.translation.x, transform.translation.z);
     let resolution = resolve_move(
         from,
-        requested_world * PLAYER_SPEED * time.delta_secs(),
+        requested_world * PLAYER_SPEED * movement_delta_secs(time.delta_secs()),
         &colliders,
         ROOM_SIZE,
         PLAYER_RADIUS,
@@ -1156,6 +1243,101 @@ mod tests {
             .is_healthy()
         );
         assert!(PlayerRigReport::default().is_healthy());
+    }
+
+    #[test]
+    fn player_movement_delta_clamps_a_hitch_to_the_anti_tunneling_maximum() {
+        assert_eq!(movement_delta_secs(1.0 / 60.0), 1.0 / 60.0);
+        assert_eq!(movement_delta_secs(0.0), 0.0);
+        assert_eq!(
+            movement_delta_secs(PLAYER_MAX_MOVE_DELTA),
+            PLAYER_MAX_MOVE_DELTA
+        );
+        assert_eq!(
+            movement_delta_secs(PLAYER_MAX_MOVE_DELTA + 1.0e-3),
+            PLAYER_MAX_MOVE_DELTA
+        );
+        assert_eq!(movement_delta_secs(1.0), PLAYER_MAX_MOVE_DELTA);
+        assert_eq!(movement_delta_secs(600.0), PLAYER_MAX_MOVE_DELTA);
+        assert_eq!(movement_delta_secs(f32::INFINITY), PLAYER_MAX_MOVE_DELTA);
+        assert_eq!(movement_delta_secs(-1.0), 0.0);
+        assert_eq!(movement_delta_secs(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn player_maximum_step_never_spans_a_radius_inflated_obstacle() {
+        let step = PLAYER_SPEED * PLAYER_MAX_MOVE_DELTA;
+        assert!(
+            PLAYER_MAX_MOVE_DELTA <= Time::<Virtual>::default().max_delta().as_secs_f32(),
+            "the movement clamp must match or be stricter than the virtual clock"
+        );
+
+        let colliders = crate::design::SceneBlueprint::v0().colliders;
+        assert!(!colliders.is_empty());
+        let mut narrowest = f32::MAX;
+        for collider in &colliders {
+            for (axis, thickness) in [
+                ("x", 2.0 * (collider.half_extents.x + PLAYER_RADIUS)),
+                ("z", 2.0 * (collider.half_extents.y + PLAYER_RADIUS)),
+            ] {
+                assert!(
+                    step < thickness,
+                    "one step of {step} spans {} on {axis} ({thickness})",
+                    collider.id
+                );
+                narrowest = narrowest.min(thickness);
+            }
+        }
+        assert_eq!(
+            narrowest,
+            2.0 * (0.2 + PLAYER_RADIUS),
+            "the hose drop is the narrowest authored obstacle"
+        );
+    }
+
+    #[test]
+    fn player_clamped_step_cannot_tunnel_through_the_narrowest_hose_drop() {
+        let colliders = colliders();
+        let hose = colliders
+            .get(&PropId::new("hose-drop-01"))
+            .expect("the authored hose drop")
+            .clone();
+        let blocked_half = hose.half_extents.y + PLAYER_RADIUS;
+        let from = Vec2::new(hose.center.x, hose.center.y - blocked_half - 0.25);
+        let north = Vec2::new(0.0, 1.0);
+        let hitch = 1.0;
+        assert!(!colliders.overlaps(from, PLAYER_RADIUS));
+
+        // Integrated raw, a hitch frame steps straight over the obstacle: this
+        // is the tunnel the clamp exists to close.
+        let raw = resolve_move(
+            from,
+            north * PLAYER_SPEED * hitch,
+            &colliders,
+            ROOM_SIZE,
+            PLAYER_RADIUS,
+        );
+        assert_eq!(raw.blocked_z, None);
+        assert!(
+            raw.position.y > hose.center.y + blocked_half,
+            "an unclamped hitch lands past the hose at {:?}",
+            raw.position
+        );
+
+        // Clamped, the same hitch is stopped by the hose it would have crossed.
+        let clamped = resolve_move(
+            from,
+            north * PLAYER_SPEED * movement_delta_secs(hitch),
+            &colliders,
+            ROOM_SIZE,
+            PLAYER_RADIUS,
+        );
+        assert_eq!(
+            clamped.blocked_z.as_ref().map(PropId::as_str),
+            Some("hose-drop-01")
+        );
+        assert_eq!(clamped.position, from);
+        assert_eq!(clamped.accepted, Vec2::ZERO);
     }
 
     #[test]

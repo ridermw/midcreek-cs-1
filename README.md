@@ -114,6 +114,14 @@ both ready, binds its rig explicitly, and moves it from the real
   `HallColliders` vector and radius-aware room bounds, which is what lets the
   technician slide along a rack face instead of sticking to it. Every rejection
   names the offending `PropId` in `PlayerMotion`.
+- Collision is resolved at the destination, so the integration step is the whole
+  anti-tunneling invariant and movement owns it rather than borrowing it from
+  the engine. `movement_delta_secs` clamps every frame delta to
+  `PLAYER_MAX_MOVE_DELTA` (0.25 s, matching `Time<Virtual>`'s default maximum
+  delta), and a test proves `PLAYER_SPEED * PLAYER_MAX_MOVE_DELTA` is strictly
+  shorter than every radius-inflated authored obstacle on both world axes -- the
+  narrowest being the 1.10 m inflated hose drop. A hitch frame therefore
+  shortens the step instead of stepping over a hose.
 - Facing and the animation state come from the accepted displacement, never the
   requested direction. Walking into a rack diagonally therefore turns the
   technician along the slide.
@@ -121,9 +129,17 @@ both ready, binds its rig explicitly, and moves it from the real
   bones, together with the rest transform captured before any clip played.
   Missing, duplicated, and stale nodes are typed `PlayerRigError` values that
   move the app into `PlayerRigState::Failed` and stop movement; nothing is ever
-  silently skipped. Bevy despawns and respawns a glTF world instance when a
-  sub-asset event arrives, so the binder rescans and rebinds on any complete
-  instance and keeps the stale handles otherwise.
+  silently skipped.
+- Bevy despawns and respawns a glTF world instance when a sub-asset event
+  arrives, so the binder rescans every frame the bound handles stop resolving.
+  No path leaves the report claiming health: an unresolvable instance root
+  publishes `TechnicianInstanceUnavailable` and an instance with no named nodes
+  publishes `TechnicianRigNodesUnavailable`, both of which make
+  `player_rig_is_ready` false in that same frame and leave the rig `Pending` so
+  a complete instance recovers on its own. `StalePart` stays the verdict while
+  the rest of the rig survives the loss; when every bound handle died the
+  instance itself was replaced, so an incomplete replacement reports its own
+  `MissingPart` and `DuplicatePart` findings instead of a wall of stale handles.
 - The generated `Idle` and `Walk` clips are driven through one
   `AnimationGraph`. The idle transition stops `Walk`, explicitly restores every
   `PlayerParts` rest transform, and only then plays `Idle`, so a stopped
@@ -135,6 +151,7 @@ Movement gates:
 ```bash
 cargo test player
 cargo test --test app_contract keyboard_movement
+cargo test --test app_contract technician_rig
 cargo test --test app_contract aisle_waypoint_journey
 ```
 
@@ -143,7 +160,10 @@ empty press, both opposing pairs, all cardinals, and the diagonals. The waypoint
 journey walks the technician end to end through all three aisles using only
 accepted arrow input, and each aisle's authored hose drop -- which closes the
 centre line to a 0.50 m centre-space run -- is crossed off centre rather than
-teleported past.
+teleported past. The rig tests despawn and rebuild the whole instance in the
+running app to prove movement stops while it is unavailable, recovers on its
+own when a complete rig returns, and names the specific missing or duplicated
+node when the replacement is incomplete.
 
 ## Foundation gates
 

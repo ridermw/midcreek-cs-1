@@ -39,9 +39,10 @@ use midcreek_cs_1::{
         WORKER_SLATE, WORKER_TROUSERS,
     },
     player::{
-        PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip, PlayerMotion,
-        PlayerParts, PlayerRigError, PlayerRigReport, PlayerRigState, TECHNICIAN_MODEL_FORWARD,
-        Technician, ViewBasis, arrow_input, required_player_parts, update_player_animation,
+        PLAYER_MAX_MOVE_DELTA, PLAYER_SPEED, PlayerAnimationState, PlayerAnimations, PlayerClip,
+        PlayerMotion, PlayerParts, PlayerRigError, PlayerRigReport, PlayerRigState,
+        TECHNICIAN_MODEL_FORWARD, Technician, ViewBasis, arrow_input, required_player_parts,
+        update_player_animation,
     },
     world::{
         HallBlueprint, HallColliders, HallErrors, HallProp, HallRoot, HallState, PlayerSpawnPoint,
@@ -1774,6 +1775,56 @@ fn set_heading(app: &mut App, degrees: f32) {
         .set_yaw_degrees(degrees);
 }
 
+/// Despawns everything under the technician root, which is what Bevy's world
+/// instance spawner does to the whole instance before it rebuilds it.
+fn despawn_rig_instance(app: &mut App) {
+    let root = technician_entity(app);
+    let children = app
+        .world()
+        .get::<Children>(root)
+        .map(|children| children.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        !children.is_empty(),
+        "the technician instance must exist before it can be respawned"
+    );
+    for child in children {
+        app.world_mut().entity_mut(child).despawn();
+    }
+    app.world_mut().flush();
+}
+
+/// Rebuilds a technician instance by hand from a list of node names. Rig
+/// discovery joins on names, so this is exactly what the binder sees when the
+/// engine hands it a replacement instance.
+fn respawn_rig_instance(app: &mut App, names: &[&str]) {
+    let root = technician_entity(app);
+    let holder = app
+        .world_mut()
+        .spawn((
+            AnimationPlayer::default(),
+            Transform::IDENTITY,
+            ChildOf(root),
+        ))
+        .id();
+    for name in names {
+        app.world_mut().spawn((
+            Name::new((*name).to_owned()),
+            Transform::IDENTITY,
+            ChildOf(holder),
+        ));
+    }
+    app.world_mut().flush();
+}
+
+fn rig_report(app: &App) -> PlayerRigReport {
+    app.world().resource::<PlayerRigReport>().clone()
+}
+
+fn rig_state(app: &App) -> PlayerRigState {
+    *app.world().resource::<State<PlayerRigState>>().get()
+}
+
 fn view_basis(app: &App) -> ViewBasis {
     *app.world().resource::<ViewBasis>()
 }
@@ -2144,6 +2195,153 @@ fn keyboard_movement_drives_the_generated_walk_and_idle_clips() {
 }
 
 #[test]
+fn keyboard_movement_stops_while_the_technician_instance_is_unavailable() {
+    let mut app = walking_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 5);
+    let before = player_position(&mut app);
+    assert_ne!(before, Vec2::new(AISLE_CENTER_X[1], 0.0));
+
+    despawn_rig_instance(&mut app);
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 30);
+
+    assert_eq!(
+        rig_report(&app).errors(),
+        [PlayerRigError::TechnicianInstanceUnavailable { found: 0 }],
+        "an unresolvable instance root must be reported, not passed over"
+    );
+    assert!(!rig_report(&app).is_healthy());
+    assert_eq!(rig_state(&app), PlayerRigState::Pending);
+    assert_eq!(
+        player_position(&mut app),
+        before,
+        "movement must stop while the technician instance is unavailable"
+    );
+}
+
+#[test]
+fn keyboard_movement_stops_while_the_technician_rig_nodes_are_unavailable() {
+    let mut app = walking_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 5);
+    let before = player_position(&mut app);
+    assert_ne!(before, Vec2::new(AISLE_CENTER_X[1], 0.0));
+
+    // A respawning instance can have its root back before its named rig nodes.
+    despawn_rig_instance(&mut app);
+    let root = technician_entity(&mut app);
+    app.world_mut().spawn((Transform::IDENTITY, ChildOf(root)));
+    app.world_mut().flush();
+
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 30);
+
+    assert_eq!(
+        rig_report(&app).errors(),
+        [PlayerRigError::TechnicianRigNodesUnavailable],
+        "an instance with no named nodes must be reported, not passed over"
+    );
+    assert_eq!(rig_state(&app), PlayerRigState::Pending);
+    assert_eq!(
+        player_position(&mut app),
+        before,
+        "movement must stop while the rig nodes are unavailable"
+    );
+}
+
+#[test]
+fn technician_rig_rebinds_automatically_after_a_whole_instance_respawn() {
+    let mut app = walking_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    let original = app.world().resource::<PlayerParts>().clone();
+
+    despawn_rig_instance(&mut app);
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 5);
+    let stopped = player_position(&mut app);
+    assert!(
+        !rig_report(&app).is_healthy(),
+        "a vanished instance may not leave the report healthy"
+    );
+
+    respawn_rig_instance(&mut app, &required_player_parts());
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 20);
+
+    let report = rig_report(&app);
+    assert!(
+        report.is_healthy(),
+        "a complete respawn must recover on its own, got {:?}",
+        report.errors()
+    );
+    assert_eq!(rig_state(&app), PlayerRigState::Ready);
+
+    let rebound = app.world().resource::<PlayerParts>().clone();
+    assert_eq!(
+        rebound
+            .all()
+            .iter()
+            .map(|part| part.name.as_str())
+            .collect::<Vec<_>>(),
+        required_player_parts()
+    );
+    for part in rebound.all() {
+        assert_eq!(
+            app.world().get::<Name>(part.entity).map(Name::as_str),
+            Some(part.name.as_str())
+        );
+        assert_ne!(
+            original.entity(&part.name),
+            Some(part.entity),
+            "{} must rebind onto the replacement instance",
+            part.name
+        );
+    }
+    assert_ne!(
+        player_position(&mut app),
+        stopped,
+        "movement must resume once the complete rig returns"
+    );
+}
+
+#[test]
+fn technician_rig_reports_specific_errors_when_an_incomplete_instance_respawns() {
+    let mut app = walking_hall(&repo_assets());
+    place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 5);
+    let before = player_position(&mut app);
+
+    let mut names = required_player_parts();
+    names.retain(|name| *name != "bone-tool");
+    names.push("bone-head");
+
+    despawn_rig_instance(&mut app);
+    respawn_rig_instance(&mut app, &names);
+    drive(&mut app, &[KeyCode::ArrowUp, KeyCode::ArrowRight], 20);
+
+    let report = rig_report(&app);
+    assert_eq!(
+        report.errors(),
+        [
+            PlayerRigError::DuplicatePart {
+                name: "bone-head".to_owned(),
+                found: 2,
+            },
+            PlayerRigError::MissingPart {
+                name: "bone-tool".to_owned(),
+            },
+        ],
+        "an incomplete replacement instance must name exactly what it lost"
+    );
+    assert!(
+        !report
+            .errors()
+            .iter()
+            .any(|error| matches!(error, PlayerRigError::StalePart { .. })),
+        "specific rescan errors must survive, not be buried under stale handles"
+    );
+    assert_eq!(rig_state(&app), PlayerRigState::Failed);
+    assert_eq!(player_position(&mut app), before);
+}
+
+#[test]
 fn keyboard_movement_stops_when_a_rig_part_goes_stale() {
     let mut app = walking_hall(&repo_assets());
     place_player(&mut app, Vec2::new(AISLE_CENTER_X[1], 0.0));
@@ -2174,6 +2372,82 @@ fn keyboard_movement_stops_when_a_rig_part_goes_stale() {
         player_position(&mut app),
         before_injection,
         "a stale rig handle must stop movement instead of silently skipping"
+    );
+}
+
+#[test]
+fn keyboard_movement_clamps_a_hitch_delta_instead_of_tunnelling_the_hose_drop() {
+    let mut app = walking_hall(&repo_assets());
+    let colliders = app.world().resource::<HallColliders>().clone();
+    let hose = colliders
+        .get(&prop("hose-drop-01"))
+        .expect("the authored hose drop")
+        .clone();
+    let blocked_half = hose.half_extents.y + PLAYER_RADIUS;
+    let face = hose.center.y - blocked_half;
+
+    // The movement clamp must match or beat the engine clock it shadows.
+    assert!(
+        PLAYER_MAX_MOVE_DELTA
+            <= app
+                .world()
+                .resource::<Time<Virtual>>()
+                .max_delta()
+                .as_secs_f32(),
+        "the movement clamp must be at least as strict as Bevy's virtual clock"
+    );
+
+    // Widen the engine's own clamp, so what this regression proves is the
+    // movement clamp rather than Bevy's default maximum delta.
+    app.world_mut()
+        .resource_mut::<Time<Virtual>>()
+        .set_max_delta(Duration::from_secs(4));
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)));
+
+    // One unclamped hitch frame would carry the technician PLAYER_SPEED metres:
+    // straight over the narrowest radius-inflated obstacle in the hall.
+    let start = Vec2::new(hose.center.x, face - 0.25);
+    assert!(PLAYER_SPEED * 1.0 > 2.0 * blocked_half);
+    assert!(!colliders.overlaps(start, PLAYER_RADIUS));
+    place_player(&mut app, start);
+
+    drive(&mut app, &[KeyCode::ArrowDown, KeyCode::ArrowLeft], 1);
+    let after_hitch = player_position(&mut app);
+    assert!(
+        after_hitch.y <= face,
+        "one hitch frame tunnelled past the hose drop to {after_hitch:?}"
+    );
+    assert_eq!(after_hitch, start, "the hose drop rejects the whole step");
+    assert_eq!(
+        app.world()
+            .resource::<PlayerMotion>()
+            .resolution
+            .blocked_z
+            .as_ref()
+            .map(PropId::as_str),
+        Some("hose-drop-01")
+    );
+
+    // Holding through a run of hitch frames never crosses it either.
+    for _ in 0..30 {
+        app.update();
+        let position = player_position(&mut app);
+        assert!(
+            position.y <= face,
+            "a hitch frame tunnelled past the hose drop to {position:?}"
+        );
+        assert!(!colliders.overlaps(position, PLAYER_RADIUS));
+    }
+
+    // A clamped step still walks: the same hitch frames move the technician the
+    // clamped distance when nothing is in the way.
+    let clear = Vec2::new(hose.center.x, AISLE_Z_MIN);
+    place_player(&mut app, clear);
+    drive(&mut app, &[KeyCode::ArrowDown, KeyCode::ArrowLeft], 1);
+    let stepped = player_position(&mut app);
+    assert!(
+        (stepped.y - (clear.y + PLAYER_SPEED * PLAYER_MAX_MOVE_DELTA)).abs() < 1.0e-4,
+        "a hitch frame must advance exactly one clamped step, got {stepped:?}"
     );
 }
 
