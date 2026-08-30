@@ -2048,6 +2048,50 @@ fn capture_rest_probe(
         .collect();
 }
 
+/// One captured rig part: its declared name, its live transform, and its rest.
+type PartSample = (String, Transform, Transform);
+
+/// Every clip change observed, with the part transforms as they stood *after*
+/// the transition ran and *before* the animation player posed the new clip.
+#[derive(Resource, Default)]
+struct TransitionProbe(Vec<(PlayerClip, Vec<PartSample>)>);
+
+fn capture_transition_probe(
+    state: Res<PlayerAnimationState>,
+    parts: Res<PlayerParts>,
+    transforms: Query<&Transform>,
+    mut probe: ResMut<TransitionProbe>,
+) {
+    if !state.is_changed() {
+        return;
+    }
+    let captured = parts
+        .all()
+        .iter()
+        .map(|part| {
+            (
+                part.name.clone(),
+                *transforms
+                    .get(part.entity)
+                    .expect("every discovered part exists"),
+                part.rest,
+            )
+        })
+        .collect();
+    probe.0.push((state.current(), captured));
+}
+
+/// Installs [`capture_transition_probe`] immediately after the animation
+/// transition system, inside the same set.
+fn watch_clip_transitions(app: &mut App) {
+    app.init_resource::<TransitionProbe>().add_systems(
+        Update,
+        capture_transition_probe
+            .in_set(CellShiftSet::UpdateAnimation)
+            .after(update_player_animation),
+    );
+}
+
 #[test]
 fn player_spawns_the_rigged_technician_only_after_the_hall_is_ready() {
     let mut app = hall_app(&repo_assets());
@@ -4676,6 +4720,256 @@ fn operations_repair_resolves_removes_the_ticket_and_cools_the_rack_down() {
     assert_eq!(scheduler(&app).rng().draws(), 8, "waiting never rerolls");
 }
 
+/// The bone names one authored technician clip actually animates.
+fn animated_bones(clip_name: &str) -> BTreeSet<String> {
+    let source = load_source(&repo_root(), "technician").expect("the technician source parses");
+    let rig = source
+        .modules
+        .iter()
+        .find(|module| module.name == "technician")
+        .expect("the technician module exists")
+        .rig
+        .as_ref()
+        .expect("the technician is rigged");
+    rig.clips
+        .iter()
+        .find(|clip| clip.name == clip_name)
+        .unwrap_or_else(|| panic!("the technician declares a {clip_name} clip"))
+        .tracks
+        .iter()
+        .map(|track| track.bone.clone())
+        .collect()
+}
+
+#[test]
+fn operations_leaving_the_repair_clip_restores_every_rest_transform_first() {
+    // Repair poses `bone-head`, `bone-arm-lower-right`, and `bone-tool`, none
+    // of which Walk animates. If the Repair -> Walk transition skips the rest
+    // restore, those bones keep the repair pose forever.
+    let repair_bones = animated_bones("Repair");
+    let walk_bones = animated_bones("Walk");
+    let repair_only = repair_bones
+        .difference(&walk_bones)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        repair_only.contains("bone-head")
+            && repair_only.contains("bone-arm-lower-right")
+            && repair_only.contains("bone-tool"),
+        "the head, right forearm, and tool are posed by Repair alone, got {repair_only:?}"
+    );
+
+    let mut app = operations_hall(&repo_assets());
+    watch_clip_transitions(&mut app);
+    pump(&mut app, FAULT_FRAMES * 3);
+    let target = ticket_queue(&app).ordered()[0].clone();
+    let spot = repair_spot(&app, target.rack);
+    place_player(&mut app, spot);
+    hold(&mut app, &[]);
+    app.update();
+
+    press_space(&mut app);
+    assert_eq!(rack_ops(&app, target.rack).state(), RackState::Repairing);
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Repair
+    );
+
+    // Sample the repair at a genuinely non-rest pose: run the clip until every
+    // repair-only bone has been moved off its rest transform.
+    let mut sampled = 0usize;
+    let repair_pose = loop {
+        let posed = part_transforms(&mut app)
+            .into_iter()
+            .filter(|(name, current, rest)| repair_only.contains(name) && current != rest)
+            .count();
+        if posed == repair_only.len() {
+            break part_transforms(&mut app);
+        }
+        app.update();
+        sampled += 1;
+        assert!(
+            sampled < REPAIR_FRAMES - 30,
+            "the Repair clip never posed every repair-only bone"
+        );
+    };
+    for (name, current, rest) in &repair_pose {
+        if repair_only.contains(name) {
+            assert_ne!(current, rest, "{name} must be off its rest pose to matter");
+        }
+    }
+
+    // Hold the arrows down for the rest of the repair, so the frame the lock
+    // releases is a direct Repair -> Walk transition with no Idle in between.
+    let approach = keys_towards(&view_basis(&app), Vec2::new(0.0, 1.0));
+    hold(&mut app, approach);
+    app.world_mut().resource_mut::<TransitionProbe>().0.clear();
+    let mut waited = 0usize;
+    while movement_lock(&app).is_locked() {
+        app.update();
+        waited += 1;
+        assert!(
+            waited <= REPAIR_FRAMES,
+            "the repair never released the lock"
+        );
+    }
+
+    let before = player_position(&mut app);
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Walk,
+        "released with the arrows still held, the technician walks straight off"
+    );
+    let transitions = app.world().resource::<TransitionProbe>().0.clone();
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|(clip, _)| *clip)
+            .collect::<Vec<_>>(),
+        vec![PlayerClip::Walk],
+        "exactly one transition ran, and it went straight from Repair to Walk"
+    );
+    let (_, captured) = &transitions[0];
+    assert_eq!(
+        captured.len(),
+        required_player_parts().len(),
+        "the transition must visit every discovered part"
+    );
+    for (name, restored, rest) in captured {
+        assert_eq!(
+            restored, rest,
+            "{name} must be restored to its rest pose before Walk plays"
+        );
+    }
+
+    // And the pose really is gone from the running world: Walk never writes
+    // these bones, so anything stale would persist.
+    for (name, current, rest) in part_transforms(&mut app) {
+        if repair_only.contains(&name) {
+            assert_eq!(current, rest, "{name} still holds the repair pose");
+        }
+    }
+    pump(&mut app, 60);
+    assert_ne!(player_position(&mut app), before, "the technician walked");
+    assert_eq!(
+        app.world().resource::<PlayerAnimationState>().current(),
+        PlayerClip::Walk
+    );
+    for (name, current, rest) in part_transforms(&mut app) {
+        if repair_only.contains(&name) {
+            assert_eq!(
+                current, rest,
+                "{name} regained the repair pose while walking"
+            );
+        }
+    }
+
+    // Walking really does pose the rig, so the assertions above are not vacuous.
+    assert!(
+        part_transforms(&mut app)
+            .into_iter()
+            .any(|(name, current, rest)| walk_bones.contains(&name) && current != rest),
+        "the Walk clip must actually pose the bones it owns"
+    );
+}
+
+#[test]
+fn operations_space_counts_one_edge_per_press_not_a_held_key() {
+    let mut app = operations_hall(&repo_assets());
+    pump(&mut app, FAULT_FRAMES * 3);
+    assert_eq!(ticket_queue(&app).len(), 3);
+
+    // Out of range in the centre aisle, so every counted press is a rejection
+    // and 60 Hz spam would be unmissable.
+    place_player(&mut app, Vec2::ZERO);
+    hold(&mut app, &[]);
+    app.update();
+
+    key_message(&mut app, REPAIR_KEY, ButtonState::Pressed);
+    pump(&mut app, 150);
+    assert!(
+        app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(REPAIR_KEY),
+        "the key really was held down for every one of those frames"
+    );
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .just_pressed(REPAIR_KEY),
+        "only the first frame of a hold is an edge"
+    );
+    let held = last_interaction(&app);
+    assert_eq!(held.presses, 1, "holding Space is one press, not 150");
+    assert_eq!(held.rejected, 1, "a held key must not spam rejections");
+    assert_eq!(held.started, 0);
+    assert!(matches!(
+        held.outcome,
+        InteractionOutcome::OutOfRange { .. }
+    ));
+    let rejected_tick = held.tick;
+
+    // Releasing is not itself an interaction.
+    key_message(&mut app, REPAIR_KEY, ButtonState::Released);
+    pump(&mut app, 30);
+    assert_eq!(last_interaction(&app).presses, 1);
+    assert_eq!(last_interaction(&app).rejected, 1);
+    assert_eq!(last_interaction(&app).tick, rejected_tick);
+
+    // A second real press is a second edge, so the key is not latched either.
+    key_message(&mut app, REPAIR_KEY, ButtonState::Pressed);
+    pump(&mut app, 60);
+    let again = last_interaction(&app);
+    assert_eq!(again.presses, 2, "a fresh press is a fresh edge");
+    assert_eq!(again.rejected, 2);
+    assert!(again.tick > rejected_tick);
+    key_message(&mut app, REPAIR_KEY, ButtonState::Released);
+    app.update();
+
+    // In range, a key held across the whole repair and its tail starts exactly
+    // one repair and never reports a single `AlreadyRepairing`.
+    let target = ticket_queue(&app).ordered()[0].clone();
+    let spot = repair_spot(&app, target.rack);
+    place_player(&mut app, spot);
+    hold(&mut app, &[]);
+    app.update();
+    let before = last_interaction(&app);
+
+    key_message(&mut app, REPAIR_KEY, ButtonState::Pressed);
+    app.update();
+    assert_eq!(
+        last_interaction(&app).outcome,
+        InteractionOutcome::Started {
+            ticket: target.id,
+            rack: target.rack
+        }
+    );
+    pump(&mut app, REPAIR_FRAMES + RESOLVED_FRAMES);
+    assert!(
+        app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(REPAIR_KEY),
+        "the key was still held all the way through the tail"
+    );
+    let after = last_interaction(&app);
+    assert_eq!(after.presses, before.presses + 1, "one edge, one press");
+    assert_eq!(after.started, 1);
+    assert_eq!(
+        after.rejected, before.rejected,
+        "a held key must never re-enter the interaction while repairing"
+    );
+    assert_eq!(
+        after.outcome,
+        InteractionOutcome::Started {
+            ticket: target.id,
+            rack: target.rack
+        },
+        "no later frame overwrote the one real outcome"
+    );
+    assert_eq!(ticket_queue(&app).get(target.id), None);
+    assert!(!movement_lock(&app).is_locked());
+}
+
 /// One thing the seeded journey observed happening.
 #[derive(Clone, Debug, PartialEq)]
 enum JourneyEvent {
@@ -4752,8 +5046,10 @@ fn recurring_ticket_journey() {
             continue;
         };
 
-        // Only travel when the rack is genuinely out of reach, and always press
-        // the real Space key.
+        // This journey is about recurrence over thousands of frames, so it
+        // places the technician at the repair spot rather than walking there.
+        // The real arrow-key approach and the out-of-range rejection each have
+        // their own dedicated contract; only the `Space` press is real here.
         let spot = repair_spot(&app, target.rack);
         place_player(&mut app, spot);
         hold(&mut app, &[]);

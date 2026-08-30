@@ -852,7 +852,11 @@ fn move_player(
 /// while it holds. Otherwise accepted displacement chooses Walk or Idle. Every
 /// transition stops the clips it is leaving and explicitly restores every
 /// discovered rest transform first, so no stale mid-stride or mid-repair pose
-/// survives a change of clip.
+/// survives a change of clip. That includes transitions *into* Walk: Repair
+/// poses `bone-head`, `bone-arm-lower-right`, and `bone-tool`, which Walk never
+/// writes, so without the restore those bones would keep the repair pose for
+/// the rest of the session. A clip that is already playing takes the early
+/// return and is never re-posed, so the steady state costs nothing.
 pub fn update_player_animation(
     motion: Res<PlayerMotion>,
     lock: Option<Res<MovementLock>>,
@@ -882,11 +886,9 @@ pub fn update_player_animation(
             player.stop(animations.node(clip));
         }
     }
-    if desired != PlayerClip::Walk {
-        for part in parts.all() {
-            if let Ok(mut transform) = transforms.get_mut(part.entity) {
-                *transform = part.rest;
-            }
+    for part in parts.all() {
+        if let Ok(mut transform) = transforms.get_mut(part.entity) {
+            *transform = part.rest;
         }
     }
     player.play(animations.node(desired)).repeat();

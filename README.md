@@ -143,11 +143,15 @@ both ready, binds its rig explicitly, and moves it from the real
   the rest of the rig survives the loss; when every bound handle died the
   instance itself was replaced, so an incomplete replacement reports its own
   `MissingPart` and `DuplicatePart` findings instead of a wall of stale handles.
-- The generated `Idle` and `Walk` clips are driven through one
-  `AnimationGraph`. The idle transition stops `Walk`, explicitly restores every
-  `PlayerParts` rest transform, and only then plays `Idle`, so a stopped
-  technician never keeps a mid-stride pose. The `Repair` clip is bound in
-  `PlayerAnimations` for the operations task and nothing plays it yet.
+- The generated `Idle`, `Walk`, and `Repair` clips are driven through one
+  `AnimationGraph`. Every transition stops the clips it is leaving, explicitly
+  restores every `PlayerParts` rest transform, and only then plays the
+  destination clip, so no stale mid-stride or mid-repair pose survives a change
+  of clip. That restore runs for *every* destination, including `Walk`:
+  `Repair` poses `bone-head`, `bone-arm-lower-right`, and `bone-tool`, none of
+  which `Walk` animates, so skipping it would leave those bones stuck in the
+  repair pose. A clip that is already playing takes an early return and is
+  never re-posed.
 
 Movement gates:
 
@@ -320,16 +324,43 @@ Operations gates:
 
 ```bash
 cargo test operations
+cargo test --test app_contract operations
 cargo test --test app_contract recurring_ticket_journey
 ```
 
-`recurring_ticket_journey` runs 2106 fixed frames of the real app: it fills the
-queue to three simultaneous tickets on ticks 240, 480, and 720, rejects an
-out-of-range `Space` from the middle of the centre aisle, walks to a rack with
-the real arrow keys, completes four real `Space` repairs, and watches two racks
-fault again after their cooldowns -- one of them on the exact tick its eight
-second cooldown ended -- while the opened sequence still matches the pinned
-seed prefix.
+The real-app operations contracts each cover the interaction from one angle,
+and none of them stands in for another:
+
+- `operations_out_of_range_space_is_rejected_and_stays_observable` is the
+  dedicated out-of-range test. It presses the real `Space` key from the middle
+  of the centre aisle, 2.2 m from both faulted inner rack faces, and proves the
+  named `OutOfRange` rejection changes no position, lock, queue, rack state, or
+  clip, and is never counted as a start. A second app proves an empty queue is
+  its own explicit `NoOpenTickets` rejection.
+- `operations_in_range_space_starts_the_repair_and_locks_movement_in_one_frame`
+  is the dedicated approach-and-lock test, and the only operations test that
+  really walks: over two hundred frames of real arrow input with no transform
+  writes, then a real `Space` press with the arrows still held, and the lock,
+  the `Repair` clip, and the zero accepted motion all landing on that one frame.
+- `operations_space_counts_one_edge_per_press_not_a_held_key` holds `Space`
+  down for hundreds of frames and proves one press is counted exactly once,
+  that a held key neither spams a rejection at 60 Hz nor re-enters a running
+  repair, and that releasing and pressing again is a second recognised edge.
+- `operations_leaving_the_repair_clip_restores_every_rest_transform_first`
+  releases the lock with the arrows still held and proves the direct
+  `Repair` -> `Walk` transition restores every rest transform before `Walk`
+  plays, so the head, right forearm, and tool cannot keep the repair pose.
+
+`recurring_ticket_journey` is the long recurrence contract rather than a second
+interaction test. Over roughly two thousand fixed frames of the real app it
+fills the queue to three simultaneous tickets on ticks 240, 480, and 720, then
+repeatedly *teleports* the technician to the repair spot of the highest-priority
+ticket -- deliberately, because the real approach and the out-of-range rejection
+are each proved by their own contract above -- presses the real `Space` key, and
+rides the whole documented tail out. It completes at least three repairs and
+watches two separate racks fault again after their cooldowns, one of them on the
+exact tick its eight-second cooldown ended, while the opened sequence still
+matches the pinned seed prefix.
 
 ## Foundation gates
 
