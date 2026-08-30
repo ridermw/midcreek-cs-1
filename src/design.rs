@@ -39,6 +39,13 @@ pub const AISLE_Z_MAX: f32 = 12.0;
 pub const AISLE_CHECKPOINT_SPACING: f32 = 2.0;
 /// Cell size of the walkability grid used by the reachability flood fill.
 pub const WALKABLE_CELL_SIZE: f32 = 0.25;
+/// Minimum walkable width every aisle must keep at every grid cross-section.
+///
+/// This is measured in *centre space*: the walkability grid is already inflated
+/// by [`PLAYER_RADIUS`], so an open node is a legal standing position and the
+/// value is the span of standing positions, not the physical gap between props.
+/// The player diameter is therefore never counted twice.
+pub const MIN_AISLE_CLEARANCE: f32 = 0.5;
 /// Z position of the hose drops that hang from the overhead trays.
 pub const HOSE_DROP_Z: f32 = 7.0;
 /// Length of the painted cross-hall walkway markings.
@@ -361,6 +368,7 @@ pub enum SceneValidationError {
     RackRowCount { expected: usize, actual: usize },
     AisleCount { expected: usize, actual: usize },
     BlockedAisle { index: usize },
+    InsufficientAisleClearance { index: usize },
     EmptyCameraTargetInterval { yaw_degrees: u16 },
 }
 
@@ -387,9 +395,13 @@ pub struct WalkableReport {
     pub total_cells: usize,
     /// Aisle checkpoints that do not share the spawn's walkable component.
     pub unreachable: Vec<AisleCheckpoint>,
-    /// Narrowest walkable width measured across any aisle checkpoint, sampled
-    /// on the same grid. Connectivity alone would accept a hairline gap between
-    /// two colliders, so this records how much room the technician really has.
+    /// Narrowest walkable width of each aisle, in [`SceneBlueprint::aisles`]
+    /// order. Each entry is the minimum, over every grid cross-section of that
+    /// aisle, of the widest contiguous run of open nodes in centre space.
+    pub aisle_clearances: Vec<f32>,
+    /// Narrowest entry of [`WalkableReport::aisle_clearances`]. Connectivity
+    /// alone would accept a hairline gap between two colliders, so this records
+    /// how much room the technician really has.
     pub narrowest_aisle_clearance: f32,
 }
 
@@ -618,10 +630,16 @@ impl SceneBlueprint {
         checkpoints
     }
 
+    /// The walkability grid this blueprint's colliders carve out of the room.
+    pub fn walkable_grid(&self) -> WalkableGrid {
+        WalkableGrid::new(self.room, &self.colliders)
+    }
+
     /// Floods the walkable grid from the player spawn and reports which aisle
-    /// checkpoints fail to share that component.
+    /// checkpoints fail to share that component, together with the narrowest
+    /// walkable run of every aisle.
     pub fn walkable_report(&self) -> WalkableReport {
-        let grid = WalkableGrid::new(self.room, &self.colliders);
+        let grid = self.walkable_grid();
         let reachable = grid.flood_from(self.player_spawn);
         let unreachable = self
             .aisle_checkpoints()
@@ -633,13 +651,14 @@ impl SceneBlueprint {
             })
             .collect();
 
-        let narrowest_aisle_clearance = self
-            .aisle_checkpoints()
-            .into_iter()
-            .map(|checkpoint| {
-                let aisle = self.aisles[checkpoint.aisle];
-                grid.clear_width(checkpoint.point.y, aisle.center_x, aisle.half_width)
-            })
+        let aisle_clearances = self
+            .aisles
+            .iter()
+            .map(|aisle| grid.aisle_clearance(aisle))
+            .collect::<Vec<_>>();
+        let narrowest_aisle_clearance = aisle_clearances
+            .iter()
+            .copied()
             .fold(f32::INFINITY, f32::min);
 
         WalkableReport {
@@ -647,6 +666,7 @@ impl SceneBlueprint {
             reachable_cells: reachable.iter().filter(|open| **open).count(),
             total_cells: grid.columns * grid.rows,
             unreachable,
+            aisle_clearances,
             narrowest_aisle_clearance: if narrowest_aisle_clearance.is_finite() {
                 narrowest_aisle_clearance
             } else {
@@ -740,14 +760,23 @@ impl SceneBlueprint {
 
         // Reachability is only meaningful from a walkable spawn; an invalid
         // spawn is already reported above and would blame every aisle.
+        let report = self.walkable_report();
         if spawn_is_walkable {
             let mut blocked = BTreeSet::new();
-            for checkpoint in self.walkable_report().unreachable {
+            for checkpoint in &report.unreachable {
                 if blocked.insert(checkpoint.aisle) {
                     errors.push(SceneValidationError::BlockedAisle {
                         index: checkpoint.aisle,
                     });
                 }
+            }
+        }
+
+        // Connectivity accepts a hairline corridor, so every aisle must also
+        // keep a usable run of standing positions at every cross-section.
+        for (index, clearance) in report.aisle_clearances.iter().enumerate() {
+            if *clearance < MIN_AISLE_CLEARANCE {
+                errors.push(SceneValidationError::InsufficientAisleClearance { index });
             }
         }
 
@@ -801,7 +830,7 @@ fn point_inside_collider(point: Vec2, collider: &ColliderSpec, padding: f32) -> 
 /// open when the player's disc fits there without leaving the room or entering
 /// any collider, so a flood fill over the grid answers "can the technician walk
 /// from here to there" for the single authored hall.
-struct WalkableGrid {
+pub struct WalkableGrid {
     origin: Vec2,
     columns: usize,
     rows: usize,
@@ -809,7 +838,8 @@ struct WalkableGrid {
 }
 
 impl WalkableGrid {
-    fn new(room: RoomSpec, colliders: &[ColliderSpec]) -> Self {
+    /// Builds the grid a room and its colliders define.
+    pub fn new(room: RoomSpec, colliders: &[ColliderSpec]) -> Self {
         let half_size = room.size * 0.5;
         let origin = -half_size;
         let columns = (room.size.x / WALKABLE_CELL_SIZE).round().max(1.0) as usize + 1;
@@ -835,6 +865,11 @@ impl WalkableGrid {
         }
     }
 
+    /// Whether the grid node nearest `point` is a legal standing position.
+    pub fn is_open(&self, point: Vec2) -> bool {
+        self.node(point).is_some()
+    }
+
     /// Index of the grid node nearest `point`, when that node is open.
     fn node(&self, point: Vec2) -> Option<usize> {
         let offset = (point - self.origin) / WALKABLE_CELL_SIZE;
@@ -851,32 +886,63 @@ impl WalkableGrid {
         self.open[index].then_some(index)
     }
 
-    /// Longest contiguous run of open nodes across one aisle corridor at `z`,
-    /// expressed as a width in metres.
-    fn clear_width(&self, z: f32, center_x: f32, half_width: f32) -> f32 {
+    /// Index of the grid row nearest `z`, when it lies inside the room.
+    fn row(&self, z: f32) -> Option<usize> {
         let row = ((z - self.origin.y) / WALKABLE_CELL_SIZE).round();
-        if row < 0.0 || row as usize >= self.rows {
+        (row >= 0.0 && (row as usize) < self.rows).then_some(row as usize)
+    }
+
+    /// Width of the widest contiguous run of open nodes across one corridor at
+    /// `z`, measured in centre space.
+    ///
+    /// A column belongs to the corridor when its node centre `x` satisfies
+    /// `|x - center_x| <= half_width`, resolved with a cell-relative tolerance
+    /// so an endpoint authored exactly on the corridor edge is included. The
+    /// grid is already inflated by [`PLAYER_RADIUS`], so every open node is a
+    /// standing position and a run of `n` adjacent nodes spans `(n - 1)` cells;
+    /// a lone open node has zero width. The player diameter is not added again.
+    pub fn widest_open_run(&self, z: f32, center_x: f32, half_width: f32) -> f32 {
+        let Some(row) = self.row(z) else {
             return 0.0;
-        }
-        let row = row as usize;
+        };
+        let tolerance = WALKABLE_CELL_SIZE * 1.0e-3;
 
         let mut longest = 0usize;
         let mut run = 0usize;
-        let mut column = 0usize;
-        while column < self.columns {
+        for column in 0..self.columns {
             let x = self.origin.x + column as f32 * WALKABLE_CELL_SIZE;
-            if (x - center_x).abs() <= half_width + f32::EPSILON * 16.0 {
-                if self.open[row * self.columns + column] {
-                    run += 1;
-                    longest = longest.max(run);
-                } else {
-                    run = 0;
-                }
+            if (x - center_x).abs() > half_width + tolerance {
+                continue;
             }
-            column += 1;
+            if self.open[row * self.columns + column] {
+                run += 1;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
         }
 
         longest.saturating_sub(1) as f32 * WALKABLE_CELL_SIZE
+    }
+
+    /// Narrowest [`WalkableGrid::widest_open_run`] over every grid
+    /// cross-section of one aisle, from `z_min` to `z_max` inclusive.
+    pub fn aisle_clearance(&self, aisle: &AisleSpec) -> f32 {
+        let tolerance = WALKABLE_CELL_SIZE * 1.0e-3;
+        let mut narrowest = f32::INFINITY;
+        for row in 0..self.rows {
+            let z = self.origin.y + row as f32 * WALKABLE_CELL_SIZE;
+            if z < aisle.z_min - tolerance || z > aisle.z_max + tolerance {
+                continue;
+            }
+            narrowest = narrowest.min(self.widest_open_run(z, aisle.center_x, aisle.half_width));
+        }
+
+        if narrowest.is_finite() {
+            narrowest
+        } else {
+            0.0
+        }
     }
 
     fn flood_from(&self, start: Vec2) -> Vec<bool> {

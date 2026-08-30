@@ -10,15 +10,19 @@
 //!    | every handle loaded with dependencies                 |
 //!    v                                                       |
 //! declared module scene names present? --- no ---------------+
+//!    |                                                       |
+//!   yes                                                      |
+//!    v                                                       |
+//! named scene == the indexed handle we spawn? --- no --------+
 //!    |
 //!   yes
 //!    v
 //! AssetLoadState::Ready
 //! ```
 //!
-//! There is no procedural fallback. A missing, corrupt, or mislabelled asset
-//! moves the app into [`AssetLoadState::Failed`] and records the offending file
-//! in [`AssetLoadReport`].
+//! There is no procedural fallback. A missing, corrupt, mislabelled, or
+//! misbound asset moves the app into [`AssetLoadState::Failed`] and records the
+//! offending file in [`AssetLoadReport`].
 
 use bevy::{
     asset::{RecursiveDependencyLoadState, UntypedAssetId},
@@ -315,11 +319,39 @@ fn resolve_asset_load_state(
                 failures.push(format!("{} loaded without a glTF document", module.path()));
                 continue;
             };
-            if !document.named_scenes.contains_key(module.module) {
+            let Some(spawned) = generated.scene(module.asset, module.module) else {
+                failures.push(format!(
+                    "{} is not tracked for spawning",
+                    module.scene_path()
+                ));
+                continue;
+            };
+            let Some(named) = document.named_scenes.get(module.module) else {
                 failures.push(format!(
                     "{} does not expose the declared module scene {}",
                     module.path(),
                     module.module
+                ));
+                continue;
+            };
+            // Presence of the name is not enough: the hall spawns the indexed
+            // sub-asset, so that exact handle must be the one the document
+            // binds to the declared module name.
+            if document.scenes.get(module.scene_index).map(Handle::id) != Some(named.id()) {
+                failures.push(format!(
+                    "{} binds {} to a different scene than {}",
+                    module.path(),
+                    module.module,
+                    module.scene_path()
+                ));
+                continue;
+            }
+            if spawned.id() != named.id() {
+                failures.push(format!(
+                    "{} does not resolve to the {} scene of {}",
+                    module.scene_path(),
+                    module.module,
+                    module.path()
                 ));
             }
         }

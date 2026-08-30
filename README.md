@@ -54,10 +54,13 @@ handles; `src/world.rs` spawns the hall from the validated blueprint in
 `src/design.rs`.
 
 - `AssetLoadState` is explicitly `Loading`, `Ready`, or `Failed`. A missing,
-  corrupt, or mislabelled asset records the offending path in `AssetLoadReport`
-  and stops there. There is no procedural fallback.
+  corrupt, mislabelled, or misbound asset records the offending path in
+  `AssetLoadReport` and stops there. There is no procedural fallback.
 - Readiness requires more than a successful read: every loaded glTF document
-  must also expose the module scene name the pipeline declares.
+  must expose the module scene name the pipeline declares, and that named scene
+  must be the very same sub-asset handle the hall spawns by scene index. A
+  multi-scene file whose scene order and name binding are swapped therefore
+  fails readiness instead of silently spawning the wrong module.
 - `RenderAssets` creates exactly one unit mesh per primitive shape and one
   unlit material per `PaletteRole`. Spawning the hall creates no new mesh or
   material assets.
@@ -83,9 +86,15 @@ Visual and collider lists stay separate and are joined only by their stable
 aggregate pass before anything spawns. Colliders are extracted once into
 `HallColliders` and scanned linearly, and a room-wide flood fill over a 0.25 m
 walkability grid proves that every aisle centreline checkpoint shares one
-walkable component with the player spawn. The same report measures the
-narrowest walkable width across those checkpoints, so a hairline gap between
-two colliders cannot pass as a usable aisle.
+walkable component with the player spawn. Connectivity alone would accept a
+hairline corridor, so `validate()` also measures clearance: every grid
+cross-section of every aisle must keep a contiguous run of open nodes at least
+0.50 m wide, or the blueprint is rejected with
+`SceneValidationError::InsufficientAisleClearance`. The grid is already inflated
+by `PLAYER_RADIUS`, so that run is measured in centre space -- a run of `n`
+adjacent open nodes spans `(n - 1)` cells -- and the player diameter is never
+counted twice. The authored hose drops at z = 7 are the narrowest point in the
+hall at exactly 0.50 m, one grid cell above the gate.
 
 ## Foundation gates
 

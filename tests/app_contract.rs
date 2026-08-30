@@ -16,7 +16,7 @@ use bevy::{
 };
 use midcreek_cs_1::{
     CellShiftPlugin, CellShiftSet,
-    assetgen::{ASSET_MODULES, ASSET_NAMES},
+    assetgen::{ASSET_MODULES, ASSET_NAMES, generate_glb, load_source},
     assets::{
         AssetLoadReport, AssetLoadState, GENERATED_ASSET_DIRECTORY, GeneratedAssets, RenderAssets,
         generated_modules, module_for,
@@ -27,10 +27,10 @@ use midcreek_cs_1::{
         CAMERA_ORBIT_DURATION_SECONDS, CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256,
         ColliderSpec, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, FAULT_INTERVAL_SECONDS,
         FAULT_RED, FLOOR_LIGHT, FLOOR_MARKING_HEIGHT, FLOOR_MARKING_WIDTH, FLOOR_SHADOW,
-        HEALTHY_GREEN, HOSE_CHARCOAL, HOSE_DROP_HEIGHT, INITIAL_CAMERA_YAW_DEGREES, INK,
-        KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, MAX_ACTIVE_TICKETS, ORTHOGRAPHIC_HEIGHT,
-        ORTHOGRAPHIC_WIDTH, OVERHEAD_TRAY_HEIGHT, PLAYER_RADIUS, PaletteRole, PrimitiveShape,
-        PropId, RACK_COOLDOWN_SECONDS, RACK_ROW_X, RACK_SHADOW, RACK_WHITE,
+        HEALTHY_GREEN, HOSE_CHARCOAL, HOSE_DROP_HEIGHT, HOSE_DROP_Z, INITIAL_CAMERA_YAW_DEGREES,
+        INK, KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, MAX_ACTIVE_TICKETS, MIN_AISLE_CLEARANCE,
+        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, OVERHEAD_TRAY_HEIGHT, PLAYER_RADIUS, PaletteRole,
+        PrimitiveShape, PropId, RACK_COOLDOWN_SECONDS, RACK_ROW_X, RACK_SHADOW, RACK_WHITE,
         REPAIR_DURATION_SECONDS, REPAIR_INTERACTION_RANGE, RESOLVED_DISPLAY_SECONDS, ROOM_SIZE,
         SIGNATURE_YELLOW, SKY_BOUNCE_BLUE, SceneBlueprint, SceneValidationError, TEAL_ACCENT,
         VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH, VisualSpec, WALKABLE_CELL_SIZE,
@@ -515,35 +515,114 @@ fn design_flood_fill_joins_every_aisle_checkpoint_to_the_player_spawn() {
         report.total_cells
     );
     assert_eq!(
-        report.narrowest_aisle_clearance,
-        AISLE_HALF_WIDTH * 2.0,
-        "every aisle checkpoint must keep the full authored corridor walkable"
+        report.narrowest_aisle_clearance, MIN_AISLE_CLEARANCE,
+        "the authored hose pinch is the narrowest point of any aisle"
     );
-    assert!(report.narrowest_aisle_clearance >= PLAYER_RADIUS * 2.0);
+    assert_eq!(report.aisle_clearances, vec![MIN_AISLE_CLEARANCE; 3]);
+    assert!(report.narrowest_aisle_clearance >= MIN_AISLE_CLEARANCE);
+}
+
+#[test]
+fn design_clearance_scans_every_aisle_row_and_measures_the_authored_hose_pinch() {
+    let scene = SceneBlueprint::v0();
+    let grid = scene.walkable_grid();
+
+    // The authored pinch sits between two checkpoints, so a checkpoint-only
+    // sample can never see it.
+    assert_ne!(HOSE_DROP_Z % AISLE_CHECKPOINT_SPACING, 0.0);
+    assert!(
+        scene
+            .aisle_checkpoints()
+            .iter()
+            .all(|checkpoint| checkpoint.point.y != HOSE_DROP_Z)
+    );
+
+    for aisle in &scene.aisles {
+        assert_eq!(
+            grid.widest_open_run(0.0, aisle.center_x, aisle.half_width),
+            AISLE_HALF_WIDTH * 2.0,
+            "an unobstructed aisle row spans the full authored corridor"
+        );
+        assert_eq!(
+            grid.widest_open_run(HOSE_DROP_Z, aisle.center_x, aisle.half_width),
+            MIN_AISLE_CLEARANCE,
+            "the hose drop pinches its aisle to the minimum walkable run"
+        );
+
+        let rows = ((aisle.z_max - aisle.z_min) / WALKABLE_CELL_SIZE).round() as i32;
+        let scanned = (0..=rows)
+            .map(|row| {
+                grid.widest_open_run(
+                    aisle.z_min + row as f32 * WALKABLE_CELL_SIZE,
+                    aisle.center_x,
+                    aisle.half_width,
+                )
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert_eq!(rows, 96);
+        assert_eq!(
+            grid.aisle_clearance(aisle),
+            scanned,
+            "aisle clearance must be the minimum over every grid row of the aisle"
+        );
+        assert_eq!(grid.aisle_clearance(aisle), MIN_AISLE_CLEARANCE);
+    }
+}
+
+#[test]
+fn design_clearance_measures_center_space_runs_without_double_counting_the_player() {
+    // The grid is already inflated by PLAYER_RADIUS, so an open node is a
+    // standing position and a run of N adjacent nodes spans (N - 1) cells.
+    let mut scene = SceneBlueprint::v0();
+    scene.colliders.clear();
+    scene.visuals.retain(|visual| !visual.collision_required);
+
+    let grid = scene.walkable_grid();
+    for cells in 0..=5u32 {
+        let half_width = cells as f32 * WALKABLE_CELL_SIZE;
+        let nodes = 2 * cells + 1;
+        assert_eq!(
+            grid.widest_open_run(0.0, 0.0, half_width),
+            (nodes as f32 - 1.0) * WALKABLE_CELL_SIZE,
+            "a run of {nodes} open nodes spans (n - 1) cells of centre space"
+        );
+    }
+    assert_eq!(grid.widest_open_run(0.0, 0.0, 0.0), 0.0);
 }
 
 #[test]
 fn design_flood_fill_reports_checkpoints_cut_off_from_the_player_spawn() {
+    // A thin cross-hall barrier at an odd z, between two checkpoint rows. Every
+    // checkpoint node stays open, so only real traversal can tell the two sides
+    // of the hall apart.
     let mut scene = SceneBlueprint::v0();
     scene.visuals.push(VisualSpec::new(
-        "aisle-wall",
+        "cross-aisle-barrier",
         AssetKind::UtilityCart,
-        Vec3::new(AISLE_CENTER_X[1], 0.0, 0.0),
+        Vec3::new(0.0, 0.0, -9.0),
         true,
     ));
     scene.colliders.push(ColliderSpec {
-        id: prop("aisle-wall"),
-        center: Vec2::new(AISLE_CENTER_X[1], 0.0),
-        half_extents: Vec2::new(AISLE_HALF_WIDTH, 0.5),
+        id: prop("cross-aisle-barrier"),
+        center: Vec2::new(0.0, -9.0),
+        half_extents: Vec2::new(ROOM_SIZE.x * 0.5, 0.3),
     });
 
+    let grid = scene.walkable_grid();
     let report = scene.walkable_report();
     assert!(!report.is_connected());
+
+    for checkpoint in &report.unreachable {
+        assert!(
+            grid.is_open(checkpoint.point),
+            "{checkpoint:?} must stay an open standing position, only disconnected"
+        );
+    }
     assert!(
         report
             .unreachable
             .iter()
-            .all(|checkpoint| checkpoint.aisle == 1),
+            .all(|checkpoint| checkpoint.point.y > -9.0),
         "{:?}",
         report.unreachable
     );
@@ -551,13 +630,87 @@ fn design_flood_fill_reports_checkpoints_cut_off_from_the_player_spawn() {
         report
             .unreachable
             .iter()
-            .map(|checkpoint| checkpoint.point)
+            .filter(|checkpoint| checkpoint.aisle == 0)
+            .map(|checkpoint| checkpoint.point.y)
             .collect::<Vec<_>>(),
-        [Vec2::new(AISLE_CENTER_X[1], 0.0)]
+        [-8.0, -6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
     );
+    assert_eq!(report.unreachable.len(), 33);
+    for checkpoint in scene.aisle_checkpoints() {
+        assert!(
+            grid.is_open(checkpoint.point),
+            "{checkpoint:?} must stay open on both sides of the barrier"
+        );
+    }
+
     assert_eq!(
         scene.validate(),
-        [SceneValidationError::BlockedAisle { index: 1 }]
+        [
+            SceneValidationError::BlockedAisle { index: 0 },
+            SceneValidationError::BlockedAisle { index: 1 },
+            SceneValidationError::BlockedAisle { index: 2 },
+            SceneValidationError::InsufficientAisleClearance { index: 0 },
+            SceneValidationError::InsufficientAisleClearance { index: 1 },
+            SceneValidationError::InsufficientAisleClearance { index: 2 },
+        ]
+    );
+}
+
+#[test]
+fn design_validator_reports_insufficient_aisle_clearance() {
+    // A pinch at an odd z, off every checkpoint row, that narrows aisle 1 to a
+    // single cell without ever disconnecting it.
+    let mut scene = SceneBlueprint::v0();
+    scene.visuals.push(VisualSpec::new(
+        "aisle-pinch",
+        AssetKind::UtilityCart,
+        Vec3::new(AISLE_CENTER_X[1] + 0.35, 0.0, 3.0),
+        true,
+    ));
+    scene.colliders.push(ColliderSpec {
+        id: prop("aisle-pinch"),
+        center: Vec2::new(AISLE_CENTER_X[1] + 0.35, 3.0),
+        half_extents: Vec2::new(0.9, 0.2),
+    });
+
+    let report = scene.walkable_report();
+    assert!(
+        report.is_connected(),
+        "the pinch must narrow the aisle, not block it: {:?}",
+        report.unreachable
+    );
+    assert_eq!(report.aisle_clearances[1], WALKABLE_CELL_SIZE);
+    assert_eq!(report.narrowest_aisle_clearance, WALKABLE_CELL_SIZE);
+    assert_eq!(
+        scene.validate(),
+        [SceneValidationError::InsufficientAisleClearance { index: 1 }]
+    );
+}
+
+#[test]
+fn design_validator_accepts_the_authored_pinch_and_rejects_one_cell_more() {
+    assert_eq!(
+        SceneBlueprint::v0().validate(),
+        Vec::<SceneValidationError>::new()
+    );
+    assert_eq!(MIN_AISLE_CLEARANCE, 0.5);
+
+    // Growing every hose drop by one grid cell in x takes the authored pinch
+    // below the threshold, so the gate is one cell away from biting.
+    let errors = validation_errors(|scene| {
+        for collider in &mut scene.colliders {
+            if collider.id.as_str().starts_with("hose-drop") {
+                collider.half_extents.x += WALKABLE_CELL_SIZE;
+            }
+        }
+    });
+    assert_eq!(
+        errors,
+        [
+            SceneValidationError::InsufficientAisleClearance { index: 0 },
+            SceneValidationError::InsufficientAisleClearance { index: 1 },
+            SceneValidationError::InsufficientAisleClearance { index: 2 },
+        ]
     );
 }
 
@@ -817,7 +970,13 @@ fn design_validator_reports_blocked_aisle_topology() {
         });
     });
 
-    assert_eq!(errors, [SceneValidationError::BlockedAisle { index: 0 }]);
+    assert_eq!(
+        errors,
+        [
+            SceneValidationError::BlockedAisle { index: 0 },
+            SceneValidationError::InsufficientAisleClearance { index: 0 },
+        ]
+    );
 }
 
 #[test]
@@ -1001,10 +1160,24 @@ fn hall_asset_plugin_becomes_ready_only_after_every_generated_module_loads() {
             .document(asset)
             .and_then(|handle| gltfs.get(handle))
             .unwrap_or_else(|| panic!("{asset} document should be loaded"));
-        for module in modules {
-            assert!(
-                document.named_scenes.contains_key(*module),
-                "{asset} must expose the {module} scene"
+        assert_eq!(document.scenes.len(), modules.len());
+        for (scene_index, module) in modules.iter().enumerate() {
+            let named = document
+                .named_scenes
+                .get(*module)
+                .unwrap_or_else(|| panic!("{asset} must expose the {module} scene"));
+            assert_eq!(
+                named.id(),
+                document.scenes[scene_index].id(),
+                "{asset} must bind {module} to scene {scene_index}"
+            );
+            assert_eq!(
+                generated
+                    .scene(asset, module)
+                    .unwrap_or_else(|| panic!("{asset} must track the {module} scene"))
+                    .id(),
+                named.id(),
+                "the handle the hall spawns must be the named module scene"
             );
         }
     }
@@ -1091,6 +1264,50 @@ fn hall_asset_plugin_fails_loudly_when_a_module_scene_name_is_wrong() {
         "failure report must name the missing module scene, got {failures:?}"
     );
     assert!(props(&mut app).is_empty());
+}
+
+#[test]
+fn hall_asset_plugin_fails_loudly_when_a_module_scene_binding_is_swapped() {
+    // A private multi-scene fixture whose two scene names are swapped: both
+    // declared module names are still present, but scene 0 is now named
+    // `hose-drop` and scene 1 `overhead-tray`, so the indexed handle the hall
+    // spawns is no longer the module it claims to be.
+    let assets = temp_assets("swapped", |generated| {
+        let mut source = load_source(&repo_root(), "infrastructure").expect("fixture source");
+        assert_eq!(source.modules.len(), 2);
+        let first = source.modules[0].name.clone();
+        source.modules[0].name = source.modules[1].name.clone();
+        source.modules[1].name = first;
+        assert_eq!(source.modules[0].name, "hose-drop");
+        assert_eq!(source.modules[1].name, "overhead-tray");
+
+        let bytes = generate_glb(&source, "swapped-infrastructure").expect("fixture glb");
+        fs::write(generated.join("infrastructure.glb"), bytes).expect("fixture writable");
+    });
+    let mut app = hall_app(assets.path());
+
+    assert_eq!(settle_assets(&mut app), AssetLoadState::Failed);
+    let failures = app
+        .world()
+        .resource::<AssetLoadReport>()
+        .failures()
+        .to_vec();
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("infrastructure.glb") && failure.contains("Scene0")),
+        "failure report must name the mismatched scene binding, got {failures:?}"
+    );
+
+    pump(&mut app, 4);
+    assert!(
+        props(&mut app).is_empty(),
+        "a mismatched scene binding must never spawn hall props"
+    );
+    assert_eq!(
+        *app.world().resource::<State<HallState>>().get(),
+        HallState::Unbuilt
+    );
 }
 
 #[test]
