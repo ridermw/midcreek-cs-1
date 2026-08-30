@@ -446,6 +446,68 @@ fn crossing_play_and_mode_markers_are_refused_without_partial_reconciliation() {
     );
 }
 
+/// A `{{PLAY}}` section with two opening markers before its single closing
+/// marker. `marked_span`'s naive first-open/first-close search locates the
+/// span from the *first* open to the *first* close, so a replacement would
+/// consume only `<!--play-->PLAY_ONE<!--play-->PLAY_TWO<!--/play-->` and
+/// leave the literal `TAIL` text stranded in the assembled page. The `mode`
+/// marker pair is well-formed and disjoint from that (wrongly) located play
+/// span, so this defect is isolated from the already-covered play/mode
+/// crossing case above: it is a defect entirely within one marker name.
+const DUPLICATE_OPENING_PLAY_MARKERS: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->PLAY_ONE<!--play-->PLAY_TWO<!--/play-->TAIL
+<!--mode-->MODE_BODY<!--/mode-->
+</main></body></html>"#;
+
+/// A `{{PLAY}}` section with two closing markers after its single opening
+/// marker. The naive search locates `<!--play-->PLAY_ONE<!--/play-->` as the
+/// span, stranding the literal `TAIL<!--/play-->` text after it.
+const DUPLICATE_CLOSING_PLAY_MARKERS: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->PLAY_ONE<!--/play-->TAIL<!--/play-->
+<!--mode-->MODE_BODY<!--/mode-->
+</main></body></html>"#;
+
+/// A `{{PLAY}}` section nested inside another same-named section:
+/// `<!--play-->A<!--play-->B<!--/play-->C<!--/play-->`. The naive search
+/// locates only the inner `<!--play-->B<!--/play-->` pair, stranding both the
+/// leading duplicate opening marker and the trailing `C<!--/play-->` text.
+const SAME_NAME_NESTED_PLAY_MARKERS: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->A<!--play-->B<!--/play-->C<!--/play-->
+<!--mode-->MODE_BODY<!--/mode-->
+</main></body></html>"#;
+
+#[test]
+fn duplicate_or_nested_same_name_play_markers_are_refused_without_partial_reconciliation() {
+    for malformed_page in [
+        DUPLICATE_OPENING_PLAY_MARKERS,
+        DUPLICATE_CLOSING_PLAY_MARKERS,
+        SAME_NAME_NESTED_PLAY_MARKERS,
+    ] {
+        let previous = previous_retained_playable("previous-retained-playable-duplicate-markers");
+        let current = fixture_site(
+            "current-failed-duplicate-markers",
+            &[("index.html", malformed_page)],
+        );
+        let output = TempDirectory::new("duplicate-markers-output");
+
+        assemble_site(
+            Some(previous.path()),
+            current.path(),
+            &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+            output.path(),
+        )
+        .unwrap();
+
+        let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert_eq!(
+            index, *malformed_page,
+            "a play marker with more than one opening or closing tag for the \
+             same name must be refused verbatim, never partially \
+             reconciled: {index}"
+        );
+    }
+}
+
 /// Two chained `assemble_site` runs, the second treating the first's output
 /// as its own `previous`, so a test can prove whether an inconsistency this
 /// round is still caught the *next* round rather than being silently

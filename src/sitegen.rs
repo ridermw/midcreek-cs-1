@@ -3317,9 +3317,24 @@ fn mark_reconcilable(name: &str, html: &str) -> String {
 
 /// The exact byte range of one `mark_reconcilable` section, including its
 /// delimiting comments.
+///
+/// A well-formed section has exactly one opening marker and exactly one
+/// closing marker for `name` in the whole document. Locating only the first
+/// open and the first close after it — without checking for extras — lets a
+/// duplicate opening marker, a duplicate closing marker, or a same-name
+/// nested section (e.g. `<!--play-->A<!--play-->B<!--/play-->C<!--/play-->`)
+/// silently produce a span that covers only *part* of the malformed markup.
+/// A caller that then replaces that span leaves the rest — a stray opening
+/// marker, or trailing content after the "real" close — dangling verbatim in
+/// the output instead of ever being refused. Requiring exactly one of each
+/// marker rejects all such malformed structures up front, before any span is
+/// ever returned.
 fn marked_span(html: &str, name: &str) -> Option<(usize, usize)> {
     let open = format!("<!--{name}-->");
     let close = format!("<!--/{name}-->");
+    if html.matches(&open).count() != 1 || html.matches(&close).count() != 1 {
+        return None;
+    }
     let start = html.find(&open)?;
     let content_start = start + open.len();
     let close_start = html[content_start..].find(&close)? + content_start;
