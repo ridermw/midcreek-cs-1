@@ -33,11 +33,12 @@ use midcreek_cs_1::{
     player::required_player_parts,
     verification::{
         APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CAPTURE_DELAY_LIMIT,
-        CAPTURE_TIMEOUT, CLIP_DIFFERENCE_RANGE, CameraRenderFacts, EQUIPMENT_REGION_MIN_PIXELS,
-        EQUIPMENT_ROLE_MIN, EquipmentCategory, EquipmentFacts, FrameFacts, FrameMetrics, FrameName,
-        GameplayFacts, HudRowFacts, LAUNCH_MARGIN, OUTSIDE_CROP_MAX, PARENT_WATCHDOG, PixelRect,
-        REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, SENTINEL_MAX, STALL_WATCHDOG, StageError,
-        StageMachine, VERIFICATION_MSAA, VerificationFault, VerificationReport,
+        CAPTURE_TIMEOUT, CLIP_DIFFERENCE_RANGE, CameraRenderFacts, DROP_CAPTURE_TIMEOUT,
+        EQUIPMENT_REGION_MIN_PIXELS, EQUIPMENT_ROLE_MIN, EquipmentCategory, EquipmentFacts,
+        FrameFacts, FrameMetrics, FrameName, GameplayFacts, HudRowFacts, LAUNCH_MARGIN,
+        OUTSIDE_CROP_MAX, OWNED_NAMES, PALETTE_TOLERANCE, PARENT_WATCHDOG, PROBE_FILE_NAME,
+        PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, SENTINEL_MAX, STALL_WATCHDOG,
+        StageError, StageMachine, VERIFICATION_MSAA, VerificationFault, VerificationReport,
         VerificationRequest, VerificationStage, VerifyOutput, VerifyOutputError, WORKER_REGION,
         axis_aligned_fixture, badge_region, black_fixture, blank_hud_fixture, canonical_f64,
         canonical_float, canonical_json, clip_difference, equipment_region, evaluate_frame,
@@ -254,6 +255,53 @@ fn verify_output_names_exactly_the_fifteen_owned_artifacts() {
         sorted.len(),
         ARTIFACT_NAMES.len(),
         "artifact names must be unique"
+    );
+}
+
+/// Preparing a directory writes and removes a probe, and that probe is a name
+/// this module has published rather than an ad-hoc temporary.
+///
+/// The whole safety story of `VerifyOutput` is "it touches only names it has
+/// declared", so a writability probe under an undeclared name was the one file
+/// the type wrote that its own contract did not cover.
+#[test]
+fn the_writable_probe_is_a_declared_owned_name_and_never_survives() {
+    assert!(
+        OWNED_NAMES.contains(&PROBE_FILE_NAME),
+        "the probe must be declared alongside the artifacts it proves are writable"
+    );
+    assert!(
+        !ARTIFACT_NAMES.contains(&PROBE_FILE_NAME),
+        "the probe is not published evidence, so it must not be an artifact"
+    );
+    assert_eq!(
+        OWNED_NAMES.len(),
+        ARTIFACT_NAMES.len() + 1,
+        "the owned set is exactly the artifacts plus the probe"
+    );
+    for name in ARTIFACT_NAMES {
+        assert!(OWNED_NAMES.contains(&name), "{name} must be owned");
+    }
+
+    let temp = TempDir::new("probe");
+    let keeper = temp.join("someone-elses-notes.txt");
+    fs::write(&keeper, b"keep me").expect("the test owns this file");
+    let output = VerifyOutput::prepare(temp.path()).expect("the directory is legal");
+    output.clear().expect("clearing named artifacts succeeds");
+
+    let left = fs::read_dir(temp.path())
+        .expect("the prepared directory is readable")
+        .map(|entry| entry.expect("a readable entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !left.contains(PROBE_FILE_NAME),
+        "the probe must never outlive `prepare`, the directory held {left:?}"
+    );
+    assert_eq!(
+        left,
+        BTreeSet::from(["someone-elses-notes.txt".to_owned()]),
+        "preparing and clearing must leave exactly what was already there"
     );
 }
 
@@ -966,6 +1014,85 @@ fn outside_crop_change_ignores_the_excluded_rectangles() {
     );
 }
 
+/// Every ordered pair of palette roles whose authored colours sit inside
+/// [`PALETTE_TOLERANCE`] of one another, and therefore cannot be told apart by
+/// a `near` measurement.
+///
+/// `near` asks "is this pixel within tolerance of that role", not "which role
+/// is it nearest", so two roles this close both claim the same pixels. That is
+/// deliberate — the tolerance exists so a shaded or dithered fill still reads
+/// as its role — but it means the collisions have to be *known*, because a
+/// contract that spends one role's evidence on another's pixels is not
+/// measuring what it says. The two here are both benign:
+///
+/// * `HoseCharcoal` and `Ink` are the hose and the cel outline; the one group
+///   that names either names both, `[HoseCharcoal, Ink]` for overhead routing,
+///   so no contract distinguishes them in the first place;
+/// * `HoseCharcoal` and `WorkerTrousers` are 8.7 apart, so a technician
+///   standing under a hose drop contributes to that region. Every equipment
+///   region is a projection of authored *static* geometry, and the technician
+///   is a single 1.5 m figure in a 40 m hall, so no equipment contract can be
+///   carried by trousers alone — but the pairing is pinned here so a palette
+///   edit that makes it worse fails loudly.
+///
+/// A new collision appearing is a real change to what every `near`-based
+/// contract measures, and this test is what refuses to let it appear quietly.
+const KNOWN_PALETTE_COLLISIONS: [(PaletteRole, PaletteRole); 2] = [
+    (PaletteRole::HoseCharcoal, PaletteRole::Ink),
+    (PaletteRole::HoseCharcoal, PaletteRole::WorkerTrousers),
+];
+
+#[test]
+fn only_the_known_palette_roles_are_indistinguishable_within_tolerance() {
+    fn distance(left: PaletteRole, right: PaletteRole) -> f64 {
+        let left = left.color().to_u8_array_no_alpha();
+        let right = right.color().to_u8_array_no_alpha();
+        (0..3)
+            .map(|channel| (f64::from(left[channel]) - f64::from(right[channel])).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    let mut found = Vec::new();
+    for (index, left) in PaletteRole::ALL.into_iter().enumerate() {
+        for right in PaletteRole::ALL.into_iter().skip(index + 1) {
+            if distance(left, right) < PALETTE_TOLERANCE {
+                found.push((left, right));
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        KNOWN_PALETTE_COLLISIONS.to_vec(),
+        "the set of palette roles a `near` measurement cannot separate has changed; each one \
+         has to be reasoned about before it is accepted"
+    );
+
+    // The pin is load-bearing rather than a restatement of the palette: every
+    // pinned pair really is inside the tolerance, and the roles the equipment
+    // contracts lean on hardest really are outside it.
+    for (left, right) in KNOWN_PALETTE_COLLISIONS {
+        assert!(
+            distance(left, right) < PALETTE_TOLERANCE,
+            "{left:?} {right:?}"
+        );
+    }
+    for (left, right) in [
+        (PaletteRole::SignatureYellow, PaletteRole::FloorLight),
+        (PaletteRole::SignatureYellow, PaletteRole::FloorShadow),
+        (PaletteRole::FaultRed, PaletteRole::FloorLight),
+        (PaletteRole::RackWhite, PaletteRole::FloorLight),
+        (PaletteRole::Ink, PaletteRole::WorkerTrousers),
+    ] {
+        assert!(
+            distance(left, right) >= PALETTE_TOLERANCE,
+            "{left:?} and {right:?} are {} apart, so an equipment contract resting on {left:?} \
+             could be paid for out of {right:?}",
+            distance(left, right)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
@@ -1063,6 +1190,43 @@ fn command_line_rejects_every_other_shape() {
         CAPTURE_DELAY_LIMIT, 600,
         "the rejected 601 above is one past the documented limit"
     );
+}
+
+/// A readback delay holds a capture open for further pumps *after the observer
+/// recorded it*, and `drop-capture` is defined as never recording one. Asking
+/// for both is asking for a delay that can never be applied, and would quietly
+/// produce an ordinary lost-callback run under a name suggesting otherwise.
+#[test]
+fn command_line_rejects_a_readback_delay_no_readback_can_ever_serve() {
+    let reason = parse(&[
+        "--verify-output",
+        "a",
+        "--verify-fault",
+        "drop-capture",
+        "--verify-capture-delay",
+        "4",
+    ])
+    .expect_err("a delay on a run that records nothing is a usage error");
+    assert!(
+        reason.contains("--verify-capture-delay") && reason.contains("drop-capture"),
+        "the usage error must name both flags: {reason}"
+    );
+
+    // The other faults do record their readbacks, so the combination is legal
+    // and this rejection is specific rather than a blanket ban.
+    for fault in [VerificationFault::Stall, VerificationFault::Hang] {
+        let request = parse(&[
+            "--verify-output",
+            "a",
+            "--verify-fault",
+            fault.name(),
+            "--verify-capture-delay",
+            "4",
+        ])
+        .unwrap_or_else(|error| panic!("{} may carry a delay: {error}", fault.name()));
+        assert_eq!(request.capture_delay, Some(4));
+        assert_eq!(request.fault, Some(fault));
+    }
 }
 
 #[test]
@@ -1787,6 +1951,27 @@ fn category_regions(facts: &FrameFacts, category: EquipmentCategory) -> Vec<Rect
         .collect()
 }
 
+/// Whether any rectangle of `left` shares a pixel with any rectangle of
+/// `right`, once both are snapped to the frame the way the analyzers snap them.
+///
+/// Masking paints real pixels out, so a prop whose own measured rectangle
+/// overlaps the rectangles being masked genuinely loses evidence. Deciding
+/// that from the reported geometry is what lets the mutation tests allow
+/// exactly the collateral the hall's authored layout forces and no more —
+/// rather than exempting a named pair of families outright, which would also
+/// hide a tray and a rack that had stopped being drawn at all.
+fn regions_overlap(facts: &FrameFacts, left: &[RectFacts], right: &[RectFacts]) -> bool {
+    let snap = |rect: &RectFacts| PixelRect::snap(*rect, facts.width, facts.height);
+    left.iter().map(snap).any(|a| {
+        right.iter().map(snap).any(|b| {
+            a.x < b.x + b.width
+                && b.x < a.x + a.width
+                && a.y < b.y + b.height
+                && b.y < a.y + a.height
+        })
+    })
+}
+
 /// Every mandatory contract one image fails, by metric name.
 fn failed_metric_names(run: &RenderedRun, frame: FrameName, image: &RgbImage) -> Vec<String> {
     let facts = run.facts(frame);
@@ -1960,10 +2145,52 @@ fn rendered_run_projects_every_required_equipment_family_from_real_bounds() {
 /// can never appear quietly.
 const EXPECTED_OFF_SCREEN: [(&str, &str); 1] = [("07-settled-sw.png", "utility-cart")];
 
+/// The individual rack rows that leave the viewport at a centre heading, by
+/// frame and prop identifier.
+///
+/// The rack rows are the one family every prop of which has to carry its own
+/// evidence, so "three of the four were measurable" is not a statement the
+/// contract may accept on its own: it would pass just as happily if a
+/// *different* row vanished, or if a row stopped spawning altogether. The
+/// rows are at x = -12, -4, 4 and 12 spanning z = -8..8, and at the NorthEast
+/// heading the camera's rectangle is centred on the technician at the spawn
+/// point, which puts `rack-row-04` past the right edge. Every other centre
+/// heading sees all four. This list is exhaustive and exact: a row that
+/// disappears anywhere else, or a row that reappears here, fails.
+const EXPECTED_OFF_SCREEN_ROWS: [(&str, &str); 1] = [("01-healthy-center-ne.png", "rack-row-04")];
+
+/// The measured share, for one category on one frame, of the weakest role
+/// group in whichever of that category's regions carries the most evidence.
+///
+/// This is exactly the quantity `evaluate_frame` gates on, recomputed here so
+/// the margin over the acceptance floor is visible and assertable.
+fn category_best_share(
+    facts: &FrameFacts,
+    metrics: &FrameMetrics,
+    category: EquipmentCategory,
+) -> f64 {
+    category_props(facts, category)
+        .iter()
+        .flat_map(|prop| {
+            prop.regions.iter().enumerate().filter_map(|(segment, _)| {
+                let region = metrics.region(&equipment_region(&prop.id, segment))?;
+                category
+                    .role_groups()
+                    .iter()
+                    .map(|group| group.iter().map(|role| region.near(*role)).sum::<f64>())
+                    .fold(None::<f64>, |low, share| {
+                        Some(low.map_or(share, |value| value.min(share)))
+                    })
+            })
+        })
+        .fold(0.0f64, f64::max)
+}
+
 #[test]
 fn every_center_frame_carries_real_equipment_pixels_with_margin() {
     let run = rendered_run();
     let mut report = Vec::new();
+    let mut weakest: Option<(String, f64)> = None;
     for frame in CENTER_FRAMES {
         let facts = run.facts(frame);
         let metrics = run.metrics(frame);
@@ -1971,35 +2198,52 @@ fn every_center_frame_carries_real_equipment_pixels_with_margin() {
             if EXPECTED_OFF_SCREEN.contains(&(frame.file_name(), category.name())) {
                 continue;
             }
-            let best = category_props(facts, category)
-                .iter()
-                .flat_map(|prop| {
-                    prop.regions.iter().enumerate().filter_map(|(segment, _)| {
-                        let region = metrics.region(&equipment_region(&prop.id, segment))?;
-                        category
-                            .role_groups()
-                            .iter()
-                            .map(|group| group.iter().map(|role| region.near(*role)).sum::<f64>())
-                            .fold(None::<f64>, |low, share| {
-                                Some(low.map_or(share, |value| value.min(share)))
-                            })
-                    })
-                })
-                .fold(0.0f64, f64::max);
-            report.push(format!(
-                "{} {} {best:.4}",
-                frame.file_name(),
-                category.name()
-            ));
+            let best = category_best_share(facts, metrics, category);
+            let label = format!("{} {}", frame.file_name(), category.name());
+            report.push(format!("{label} {best:.4}"));
+            if weakest.as_ref().is_none_or(|(_, low)| best < *low) {
+                weakest = Some((label.clone(), best));
+            }
             assert!(
                 best >= EQUIPMENT_ROLE_MIN * 2.0,
-                "{} {} measured {best:.4}, which leaves no margin over the {EQUIPMENT_ROLE_MIN} floor",
+                "{label} measured {best:.4}, which leaves no margin over the {EQUIPMENT_ROLE_MIN} \
+                 floor"
+            );
+        }
+    }
+    println!("equipment margins:\n{}", report.join("\n"));
+
+    // The thinnest margin in the table belongs to the painted floor markings,
+    // and that is geometry rather than luck: a marking is a flat strip, so the
+    // tightest rectangle its bounds project into is mostly the floor it is
+    // painted on. What matters is not that the number is large but that all of
+    // it is the equipment's own — so the same measurement is repeated with the
+    // category painted out, and has to collapse under the acceptance floor. A
+    // share partly supplied by the surrounding room would survive that.
+    let (label, low) = weakest.expect("the centre frames measure at least one category");
+    println!("weakest equipment margin: {label} {low:.4}");
+    for frame in CENTER_FRAMES {
+        let facts = run.facts(frame);
+        for category in EquipmentCategory::ALL {
+            if EXPECTED_OFF_SCREEN.contains(&(frame.file_name(), category.name())) {
+                continue;
+            }
+            let regions = category_regions(facts, category);
+            let masked = mask_regions(run.frame(frame), facts, &regions);
+            let residue = category_best_share(
+                facts,
+                &FrameMetrics::compute(&masked, &frame_regions(facts)),
+                category,
+            );
+            assert!(
+                residue < EQUIPMENT_ROLE_MIN,
+                "{} {} keeps {residue:.4} of its evidence with every one of its own pixels \
+                 painted out, so that share is not equipment-specific",
                 frame.file_name(),
                 category.name()
             );
         }
     }
-    println!("equipment margins:\n{}", report.join("\n"));
 }
 
 #[test]
@@ -2047,30 +2291,32 @@ fn masking_one_equipment_category_fails_that_category_alone() {
                     other.name()
                 );
 
-                // Per-prop collateral is only ever allowed between the one
-                // pair the hall is authored to overlap: `OVERHEAD_TRAY_HEIGHT`
-                // is chosen so a tray hung over an aisle projects onto a rack
-                // row, so masking either family does cover part of the other.
-                let coupled = matches!(
-                    (category, other),
-                    (
-                        EquipmentCategory::OverheadRouting,
-                        EquipmentCategory::RackRows
-                    ) | (
-                        EquipmentCategory::RackRows,
-                        EquipmentCategory::OverheadRouting
-                    )
-                );
-                if coupled {
-                    continue;
-                }
+                // Per-prop collateral is allowed only where the report's own
+                // geometry says the masked rectangles really do cover part of
+                // that prop's measured rectangle. The hall is authored so that
+                // this happens: `OVERHEAD_TRAY_HEIGHT` hangs the trays over
+                // the aisles, and at every centre heading a tray projects onto
+                // the rack row behind it, so masking either family paints over
+                // some of the other's pixels. Deciding it from the measured
+                // rectangles rather than exempting the pair by name means a
+                // tray that had stopped being drawn — and so overlapped
+                // nothing — could not use the exemption.
                 let props = equipment
                     .iter()
                     .filter(|metric| is_prop_metric(metric, facts, other))
+                    .filter(|metric| {
+                        let id = metric.trim_start_matches("equipment-");
+                        !facts
+                            .equipment
+                            .iter()
+                            .find(|prop| prop.id == id)
+                            .is_some_and(|prop| regions_overlap(facts, &regions, &prop.regions))
+                    })
                     .collect::<Vec<_>>();
                 assert!(
                     props.is_empty(),
-                    "{frame:?}: masking {} must leave every {} prop green, got {props:?}",
+                    "{frame:?}: masking {} must leave every {} prop it does not physically \
+                     overlap green, got {props:?}",
                     category.name(),
                     other.name()
                 );
@@ -2089,6 +2335,23 @@ fn masking_one_rack_row_fails_only_that_rack_row() {
             .filter(|prop| !prop.regions.is_empty())
             .map(|prop| (prop.id.clone(), prop.regions.clone()))
             .collect::<Vec<_>>();
+
+        // Which rows are measurable is pinned by name, not counted. A bare
+        // "at least three of four" would pass just as happily if a different
+        // row vanished, or if the hall stopped spawning one entirely.
+        let measured = rows
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>();
+        let expected = (1..=4)
+            .map(|rack| format!("rack-row-{rack:02}"))
+            .filter(|id| !EXPECTED_OFF_SCREEN_ROWS.contains(&(frame.file_name(), id.as_str())))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            measured, expected,
+            "{frame:?} must measure exactly the rack rows that are in shot; the only rows allowed \
+             out of shot anywhere are {EXPECTED_OFF_SCREEN_ROWS:?}"
+        );
         assert!(
             rows.len() >= 3,
             "{frame:?} must measure at least three of the four rack rows, got {}",
@@ -2102,8 +2365,8 @@ fn masking_one_rack_row_fails_only_that_rack_row() {
                 failures.contains(&format!("equipment-{id}")),
                 "{frame:?}: masking {id} must fail its own contract, got {failures:?}"
             );
-            for (other, _) in &rows {
-                if other == id {
+            for (other, other_regions) in &rows {
+                if other == id || regions_overlap(facts, regions, other_regions) {
                     continue;
                 }
                 assert!(
@@ -2112,6 +2375,38 @@ fn masking_one_rack_row_fails_only_that_rack_row() {
                 );
             }
         }
+    }
+}
+
+/// Every rack row is out of shot on at most the frames pinned above, so no row
+/// can quietly stop being evidence on every frame at once.
+#[test]
+fn every_rack_row_is_measured_on_at_least_three_centre_frames() {
+    let run = rendered_run();
+    for rack in 1..=4 {
+        let id = format!("rack-row-{rack:02}");
+        let measured = CENTER_FRAMES
+            .into_iter()
+            .filter(|frame| {
+                run.facts(*frame)
+                    .equipment
+                    .iter()
+                    .any(|prop| prop.id == id && !prop.regions.is_empty())
+            })
+            .count();
+        let allowed = CENTER_FRAMES
+            .into_iter()
+            .filter(|frame| EXPECTED_OFF_SCREEN_ROWS.contains(&(frame.file_name(), id.as_str())))
+            .count();
+        assert_eq!(
+            measured,
+            CENTER_FRAMES.len() - allowed,
+            "{id} must be measurable on every centre frame it is not pinned as out of shot on"
+        );
+        assert!(
+            measured >= 3,
+            "{id} must carry evidence on at least three centre frames, it carried {measured}"
+        );
     }
 }
 
@@ -2171,7 +2466,10 @@ fn semantic_report_reproduces_in_a_different_output_directory() {
         for other in [&primary.root, &second.root] {
             assert_scan_is_clean(
                 &run.canonical,
-                &[other.to_string_lossy().into_owned()],
+                &Banned {
+                    keys: Vec::new(),
+                    substrings: vec![other.to_string_lossy().into_owned()],
+                },
                 label,
             );
         }
@@ -2191,13 +2489,14 @@ const SLOW_READBACK_PUMPS: u64 = 30;
 /// The number of render pumps a readback takes is a property of the machine,
 /// never of the game. Two runs of the same journey that differ only in how
 /// long every callback takes must produce the same evidence, byte for byte.
+///
+/// The prompt half of that comparison is the primary run itself. It is already
+/// a full journey taken with no injected delay, so launching a second identical
+/// child to be the control would spend a whole cold software-rendered run —
+/// tens of seconds on llvmpipe — re-establishing something already on disk.
 #[test]
 fn the_readback_pump_count_never_reaches_the_evidence() {
-    let quick = render_delayed(
-        &repository().join("target/render-contract/prompt-readback"),
-        "prompt-readback",
-        0,
-    );
+    let quick = rendered_run();
     let slow = render_delayed(
         &repository().join("target/render-contract/slow-readback"),
         "slow-readback",
@@ -2206,6 +2505,10 @@ fn the_readback_pump_count_never_reaches_the_evidence() {
 
     assert_eq!(quick.report.result, "success");
     assert_eq!(slow.report.result, "success");
+    assert_ne!(
+        quick.root, slow.root,
+        "the two runs must use different directories"
+    );
     assert_eq!(
         quick.canonical, slow.canonical,
         "a slow readback must not change one byte of the canonical report"
@@ -2229,12 +2532,11 @@ fn the_readback_pump_count_never_reaches_the_evidence() {
         );
     }
 
-    let _ = fs::remove_dir_all(&quick.root);
     let _ = fs::remove_dir_all(&slow.root);
 }
 
-/// Fails when a canonical document carries any of `banned`.
-fn assert_scan_is_clean(canonical: &str, banned: &[String], label: &str) {
+/// Fails when a canonical document carries any banned key or substring.
+fn assert_scan_is_clean(canonical: &str, banned: &Banned, label: &str) {
     let found = scan_violations(canonical, banned);
     assert!(
         found.is_empty(),
@@ -2242,42 +2544,101 @@ fn assert_scan_is_clean(canonical: &str, banned: &[String], label: &str) {
     );
 }
 
-/// Every banned substring one canonical document actually carries.
-fn scan_violations(canonical: &str, banned: &[String]) -> Vec<String> {
+/// Everything a canonical report may never carry.
+///
+/// The two halves are matched differently on purpose. A *key* is banned as a
+/// whole JSON key — `"user":` and never a bare `user` — because the words are
+/// short and generic, and a schema that one day gains `user_presses` or
+/// `elapsed_ticks` would otherwise start failing a privacy scan for a name
+/// that leaks nothing. A *substring* is banned anywhere it appears, because
+/// what those entries name is an absolute path or a host root, which has no
+/// legitimate place in the document at any depth.
+struct Banned {
+    keys: Vec<String>,
+    substrings: Vec<String>,
+}
+
+/// Every banned key or substring one canonical document actually carries.
+fn scan_violations(canonical: &str, banned: &Banned) -> Vec<String> {
     banned
+        .keys
         .iter()
+        .map(|key| format!("\"{key}\":"))
         .filter(|needle| canonical.contains(needle.as_str()))
-        .cloned()
+        .chain(
+            banned
+                .substrings
+                .iter()
+                .filter(|needle| canonical.contains(needle.as_str()))
+                .cloned(),
+        )
         .collect()
 }
 
 /// Everything a canonical report may never carry, whoever produced it.
-fn banned_report_substrings() -> Vec<String> {
-    let mut banned = [
-        "timestamp",
-        "generated_at",
-        "elapsed",
-        "duration_ms",
-        "hostname",
-        "user",
+fn banned_report_substrings() -> Banned {
+    let mut substrings = [
         "/Users/",
         "/home/",
         "/tmp/",
         "/var/folders/",
         "C:\\",
         "BEVY_ASSET_ROOT",
-        "CARGO",
-        "RUST_LOG",
-        "HOME",
-        "PATH",
     ]
     .map(str::to_owned)
     .to_vec();
-    banned.push(repository().to_string_lossy().into_owned());
+    substrings.push(repository().to_string_lossy().into_owned());
     if let Some(home) = std::env::var_os("HOME") {
-        banned.push(home.to_string_lossy().into_owned());
+        substrings.push(home.to_string_lossy().into_owned());
     }
-    banned
+    Banned {
+        keys: [
+            "timestamp",
+            "generated_at",
+            "elapsed",
+            "duration_ms",
+            "hostname",
+            "user",
+            "CARGO",
+            "RUST_LOG",
+            "HOME",
+            "PATH",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        substrings,
+    }
+}
+
+/// The scan has to catch what it exists to catch and nothing else: a key that
+/// merely *contains* a banned word is a legitimate schema name.
+#[test]
+fn the_privacy_scan_matches_whole_keys_rather_than_bare_words() {
+    let banned = banned_report_substrings();
+    for leak in [
+        "{\"user\": \"mattheww\"}",
+        "{\"timestamp\": 1}",
+        "{\"elapsed\": 1}",
+        "{\"HOME\": \"/x\"}",
+        "{\"PATH\": \"/x\"}",
+        "{\"frames\": \"/var/folders/mh/x\"}",
+    ] {
+        assert!(
+            !scan_violations(leak, &banned).is_empty(),
+            "the scan must catch {leak}"
+        );
+    }
+    for innocent in [
+        "{\"user_presses\": 2}",
+        "{\"elapsed_ticks\": 2}",
+        "{\"pathological\": 2}",
+        "{\"repaired_rack\": 1}",
+    ] {
+        assert!(
+            scan_violations(innocent, &banned).is_empty(),
+            "the scan must not fail a legitimate schema key: {innocent}"
+        );
+    }
 }
 
 #[test]
@@ -2409,6 +2770,16 @@ fn a_lost_screenshot_callback_fails_the_run_and_names_its_stage() {
     let root = repository().join("target/render-contract/drop-capture");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("the render contract owns target/render-contract");
+    // The child's readback budget here is a fast test override, not the
+    // production one. The fixture never records a callback, so the only way it
+    // can end is by waiting the budget out — and what it proves, a lost
+    // callback failing the run with its frame, stage, and artifact state, is
+    // the same proof at two seconds as at ten. The override lives on the
+    // injected fault, which nothing but `--verify-fault drop-capture` reaches.
+    assert!(
+        DROP_CAPTURE_TIMEOUT < CAPTURE_TIMEOUT,
+        "the override exists to be faster than production, not to weaken it"
+    );
     let launched = launch(&root, Some(VerificationFault::DropCapture), PARENT_WATCHDOG);
 
     assert!(!launched.killed, "the app must fail on its own");
@@ -2425,6 +2796,13 @@ fn a_lost_screenshot_callback_fails_the_run_and_names_its_stage() {
             .is_some_and(|reason| reason.contains("screenshot callback")),
         "got {:?}",
         report.failure_reason
+    );
+    // A frame whose callback never landed is not evidence, and the failure
+    // report may not describe it as though it were.
+    assert!(
+        report.frames.is_empty(),
+        "a run that got no frame back must report no frame facts, it reported {:?}",
+        report.frames.keys().collect::<Vec<_>>()
     );
     let _ = fs::remove_dir_all(&root);
 }
