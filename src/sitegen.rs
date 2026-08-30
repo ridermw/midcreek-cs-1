@@ -141,7 +141,22 @@ pub struct SiteInputs {
     pub verification: Option<VerificationSummary>,
     pub workflow: WorkflowSummary,
     pub repo: RepoFacts,
+    pub playable: Option<PlayableBuild>,
 }
+
+/// A packaged, browser-verified WASM build waiting to be published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayableBuild {
+    /// Directory holding the packaged browser game.
+    pub directory: PathBuf,
+    /// The source commit the package was built from.
+    pub source_commit: String,
+    /// The workflow run that proved it in a browser.
+    pub run_url: String,
+}
+
+/// Every file the packaged browser game must contain before it is published.
+pub const REQUIRED_PLAYABLE_FILES: [&str; 4] = ["index.html", "play.js", "game.js", "game_bg.wasm"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildDisposition {
@@ -192,7 +207,7 @@ pub struct GalleryManifest {
 #[serde(deny_unknown_fields)]
 pub struct LastGreenManifest {
     pub source_commit: String,
-    pub semantic_visual_hash: String,
+    pub semantic_visual_hash: Option<String>,
     pub game_files: Vec<PathBuf>,
     pub screenshot_files: Vec<PathBuf>,
 }
@@ -778,6 +793,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         .or_else(|| inputs.repo.commits.first())
         .map_or("Unknown", |commit| commit.committed_at.as_str());
     let reference_paths = copy_reference_assets(&inputs.reference_manifest, output)?;
+    let playable_files = copy_playable_build(inputs.playable.as_ref(), inputs, output)?;
 
     let replacements = [
         ("{{PROJECT}}", escape_html(&inputs.progress.project)),
@@ -785,7 +801,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
             "{{STATUS}}",
             render_status(inputs, current_task, &source_commit, updated_at),
         ),
-        ("{{PLAY}}", render_play()),
+        ("{{PLAY}}", render_play(inputs.playable.as_ref())),
         (
             "{{COMPARISON}}",
             render_comparison(&inputs.reference_manifest, &reference_paths),
@@ -825,11 +841,18 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         PathBuf::from("site.js"),
     ];
     generated_files.extend(reference_paths.values().cloned());
+    generated_files.extend(playable_files.iter().cloned());
+    if inputs.playable.is_some() {
+        generated_files.push(PathBuf::from("last-green.json"));
+    }
     generated_files.sort();
 
     Ok(SiteManifest {
         source_commit,
-        playable_commit: None,
+        playable_commit: inputs
+            .playable
+            .as_ref()
+            .map(|playable| playable.source_commit.clone()),
         current_task: current_task.map(|task| task.id.clone()),
         generated_files,
         semantic_visual_hash: inputs
@@ -1255,7 +1278,109 @@ fn render_status(
     )
 }
 
-fn render_play() -> String {
+/// Copies a verified browser package into `play/`, records `last-green.json`,
+/// and returns the published relative paths in stable order.
+fn copy_playable_build(
+    playable: Option<&PlayableBuild>,
+    inputs: &SiteInputs,
+    output: &Path,
+) -> Result<Vec<PathBuf>, SitegenError> {
+    let Some(playable) = playable else {
+        return Ok(Vec::new());
+    };
+    require_directory(&playable.directory)?;
+    for required in REQUIRED_PLAYABLE_FILES {
+        let path = playable.directory.join(required);
+        if !path.is_file() {
+            return Err(SitegenError::MissingInput { path });
+        }
+    }
+
+    let destination = output.join("play");
+    fs::create_dir_all(&destination).map_err(|error| SitegenError::Io {
+        path: destination.clone(),
+        message: error.to_string(),
+    })?;
+    copy_site_tree(
+        &playable.directory,
+        &playable.directory,
+        &destination,
+        false,
+    )?;
+
+    let mut game_files = collect_files(&destination, output)?;
+    game_files.sort();
+    let manifest = LastGreenManifest {
+        source_commit: playable.source_commit.clone(),
+        semantic_visual_hash: inputs
+            .verification
+            .as_ref()
+            .map(|report| report.semantic_visual_hash.clone()),
+        game_files: game_files.clone(),
+        screenshot_files: Vec::new(),
+    };
+    let json = serde_json::to_string_pretty(&manifest).map_err(|error| SitegenError::Json {
+        path: PathBuf::from("last-green.json"),
+        message: error.to_string(),
+    })?;
+    write_file(&output.join("last-green.json"), json.as_bytes())?;
+
+    Ok(game_files)
+}
+
+/// Every regular file below `root`, relative to `base`, in directory order.
+fn collect_files(root: &Path, base: &Path) -> Result<Vec<PathBuf>, SitegenError> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| SitegenError::Io {
+            path: directory.clone(),
+            message: error.to_string(),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| SitegenError::Io {
+                path: directory.clone(),
+                message: error.to_string(),
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(
+                    path.strip_prefix(base)
+                        .expect("collected files remain below the site output")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn render_play(playable: Option<&PlayableBuild>) -> String {
+    let Some(playable) = playable else {
+        return render_pending_play();
+    };
+    format!(
+        r#"<div class="play-frame play-frame-live">
+          <iframe class="play-embed" src="play/index.html" title="Playable Cell Shift data centre build" loading="lazy"></iframe>
+        </div>
+        <div class="control-strip" aria-label="Game controls">
+          <span><kbd>Arrow keys</kbd> Move</span>
+          <span><kbd>Q</kbd>/<kbd>E</kbd> Orbit</span>
+          <span><kbd>Space</kbd> Repair</span>
+        </div>
+        <dl class="provenance">
+          <div><dt>Playable build</dt><dd><code>{}</code></dd></div>
+          <div><dt>Proof</dt><dd><a href="{}">Browser gate run</a></dd></div>
+          <div><dt>Direct link</dt><dd><a href="play/index.html">Open the playable build</a></dd></div>
+        </dl>"#,
+        escape_html(&short_sha(&playable.source_commit)),
+        escape_html(&playable.run_url),
+    )
+}
+
+fn render_pending_play() -> String {
     r#"<div class="play-frame" role="img" aria-label="Playable Cell Shift game area awaiting its first verified build">
           <div class="empty-state play-empty">
             <span class="eyebrow">Status-only launch</span>

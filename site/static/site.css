@@ -306,6 +306,17 @@ main {
   box-shadow: var(--shadow);
 }
 
+.play-frame-live {
+  place-items: stretch;
+}
+
+.play-embed {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
 .play-empty h2 {
   margin: 0.25rem 0 0.7rem;
   font-size: clamp(1.8rem, 4vw, 3.4rem);

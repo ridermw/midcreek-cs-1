@@ -458,7 +458,7 @@ mod progress_contract {
             assert_eq!(output.status.code(), Some(0));
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                "pages-playable\n"
+                "autonomous-verification\n"
             );
             assert!(output.stderr.is_empty());
         }
@@ -532,14 +532,14 @@ mod progress_contract {
                 ),
                 (
                     "pages-playable",
-                    ProgressStatus::InProgress,
+                    ProgressStatus::Done,
                     &["operations-hud"][..],
-                    "Publish the playable WASM game.",
-                    None,
+                    "Packaged the production game for wasm32-unknown-unknown with a pinned wasm-bindgen, added a wasm-only WebReadyPlugin handshake, published it under play/ with last-green metadata, and proved it in headless Chromium.",
+                    Some("HEAD"),
                 ),
                 (
                     "autonomous-verification",
-                    ProgressStatus::Future,
+                    ProgressStatus::InProgress,
                     &["operations-hud"][..],
                     "Build deterministic gameplay and render verification.",
                     None,
@@ -594,6 +594,8 @@ mod progress_contract {
                     "clamped-orbit-cannot-frame-a-room-corner",
                     "seeded-faults-that-player-timing-cannot-perturb",
                     "screen-space-badges-that-survive-orbit-and-resize",
+                    "a-browser-gate-that-cannot-pass-on-a-blank-page",
+                    "a-hundred-megabyte-wasm-game-cannot-be-published",
                 ]
             );
             for challenge in &document.challenges {
@@ -911,5 +913,300 @@ mod progress_contract {
                 },
             ]
         );
+    }
+}
+
+mod playable_publication_contract {
+    use super::*;
+    use midcreek_cs_1::sitegen::PlayableBuild;
+    use std::path::PathBuf;
+
+    const GREEN_COMMIT: &str = "1111111111111111111111111111111111111111";
+
+    #[test]
+    fn a_green_playable_build_is_copied_under_play_and_embedded_in_the_hub() {
+        let package = package("complete", PACKAGE_FILES);
+        let mut inputs = site_inputs("green");
+        inputs.playable = Some(playable(package.path()));
+
+        let site = build_site_from_inputs("playable-green", &inputs).unwrap();
+        let html = site.index_html();
+
+        assert!(site.root().join("play/index.html").is_file());
+        assert!(site.root().join("play/game_bg.wasm").is_file());
+        assert!(site.root().join("play/assets/generated/rack.glb").is_file());
+        assert!(html.contains("play/index.html"), "{html}");
+        assert!(!html.contains("No verified playable build yet"));
+        assert_eq!(
+            site.manifest().playable_commit.as_deref(),
+            Some(GREEN_COMMIT)
+        );
+    }
+
+    #[test]
+    fn a_green_playable_build_records_last_green_metadata() {
+        let package = package("metadata", PACKAGE_FILES);
+        let mut inputs = site_inputs("green");
+        inputs.playable = Some(playable(package.path()));
+
+        let site = build_site_from_inputs("playable-metadata", &inputs).unwrap();
+        let metadata: midcreek_cs_1::sitegen::LastGreenManifest =
+            serde_json::from_str(&read(site.root().join("last-green.json"))).unwrap();
+
+        assert_eq!(metadata.source_commit, GREEN_COMMIT);
+        assert_eq!(metadata.semantic_visual_hash, None);
+        assert_eq!(
+            metadata.game_files,
+            [
+                "play/assets/generated/rack.glb",
+                "play/game.js",
+                "play/game_bg.wasm",
+                "play/index.html",
+                "play/play.js",
+            ]
+            .map(PathBuf::from)
+        );
+        assert!(metadata.screenshot_files.is_empty());
+    }
+
+    #[test]
+    fn a_package_without_the_wasm_payload_is_refused_instead_of_published() {
+        let package = package(
+            "no-wasm",
+            &[
+                ("index.html", "<!doctype html>"),
+                ("play.js", "// bootstrap"),
+                ("game.js", ""),
+            ],
+        );
+        let mut inputs = site_inputs("green");
+        inputs.playable = Some(playable(package.path()));
+
+        let result = build_site_from_inputs("playable-broken", &inputs);
+
+        assert!(
+            matches!(
+                &result,
+                Err(SitegenError::MissingInput { path })
+                    if path.file_name().is_some_and(|name| name == "game_bg.wasm")
+            ),
+            "{:?}",
+            result.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn a_package_that_escapes_its_directory_is_refused() {
+        let package = package("escaping", PACKAGE_FILES);
+        let mut inputs = site_inputs("green");
+        let mut build = playable(package.path());
+        build.directory = package.path().join("../..");
+        inputs.playable = Some(build);
+
+        let result = build_site_from_inputs("playable-escaping", &inputs);
+
+        assert!(
+            result.is_err(),
+            "{:?}",
+            result.map(|site| site.index_html())
+        );
+    }
+
+    const PACKAGE_FILES: &[(&str, &str)] = &[
+        ("index.html", "<!doctype html><html><body></body></html>"),
+        ("game.js", "export default function init() {}"),
+        ("game_bg.wasm", "\0asm"),
+        ("play.js", "// bootstrap"),
+        ("assets/generated/rack.glb", "glTF"),
+    ];
+
+    fn playable(directory: &Path) -> PlayableBuild {
+        PlayableBuild {
+            directory: directory.to_path_buf(),
+            source_commit: GREEN_COMMIT.to_owned(),
+            run_url: "https://example.invalid/run/1".to_owned(),
+        }
+    }
+
+    struct Package(PathBuf);
+
+    impl Package {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Package {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn package(name: &str, files: &[(&str, &str)]) -> Package {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "midcreek-web-package-{}-{unique}-{name}",
+            std::process::id()
+        ));
+        for (relative, contents) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        Package(root)
+    }
+}
+
+mod web_source_contract {
+    use super::*;
+
+    fn repository() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn source(relative: &str) -> String {
+        read(repository().join(relative))
+    }
+
+    #[test]
+    fn the_play_template_declares_explicit_browser_states() {
+        let html = source("site/templates/play.html");
+
+        assert!(html.contains(r#"data-game-state="loading""#), "{html}");
+        assert!(html.contains(r#"id="browser-errors""#), "{html}");
+        assert!(html.contains(r#"id="game-canvas""#), "{html}");
+    }
+
+    #[test]
+    fn the_bootstrap_captures_errors_and_unhandled_rejections() {
+        let js = source("site/static/play.js");
+
+        assert!(js.contains(r#"window.addEventListener("error""#), "{js}");
+        assert!(
+            js.contains(r#"window.addEventListener("unhandledrejection""#),
+            "{js}"
+        );
+        assert!(js.contains("browser-errors"), "{js}");
+    }
+
+    #[test]
+    fn the_bootstrap_prevents_scrolling_only_for_the_reviewed_keys_while_focused() {
+        let js = source("site/static/play.js");
+
+        for key in [
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "KeyQ",
+            "KeyE",
+            "Space",
+        ] {
+            assert!(js.contains(key), "the bootstrap must scope {key}");
+        }
+        assert!(js.contains("preventDefault"), "{js}");
+        assert!(js.contains("document.activeElement"), "{js}");
+    }
+
+    #[test]
+    fn the_browser_shell_only_uses_relative_urls() {
+        for relative in ["site/templates/play.html", "site/static/play.js"] {
+            let text = source(relative);
+            for absolute in [r#"src="/"#, r#"href="/"#, r#"from "/"#, r#"import("/"#] {
+                assert!(
+                    !text.contains(absolute),
+                    "{relative} must work below a project path prefix, found {absolute}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_game_wires_the_browser_handshake_only_for_wasm() {
+        let lib = source("src/lib.rs");
+
+        assert!(lib.contains(r#"#[cfg(target_arch = "wasm32")]"#), "{lib}");
+        assert!(lib.contains("web::WebReadyPlugin"), "{lib}");
+    }
+
+    #[test]
+    fn the_web_build_pins_the_locked_wasm_bindgen_version() {
+        let locked = locked_version("wasm-bindgen");
+        let manifest = source("Cargo.toml");
+        let script = source("scripts/build-web.sh");
+
+        assert!(
+            manifest.contains(&format!(r#"wasm-bindgen = "={locked}""#)),
+            "Cargo.toml must pin wasm-bindgen to the locked {locked}"
+        );
+        assert!(script.contains("Cargo.lock"), "{script}");
+        assert!(script.contains("wasm-bindgen --version"), "{script}");
+    }
+
+    #[test]
+    fn the_web_build_runs_the_reviewed_packaging_pipeline() {
+        let script = source("scripts/build-web.sh");
+
+        for fragment in [
+            "set -euo pipefail",
+            "--release",
+            "wasm32-unknown-unknown",
+            "--target web",
+            "--no-typescript",
+            "assets/generated",
+            "site/templates/play.html",
+            "site/static/play.js",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "build-web.sh must contain {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_browser_gate_enforces_the_reviewed_checks() {
+        let script = source("scripts/web-smoke.sh");
+        let driver = source("scripts/browser_gate.py");
+
+        assert!(script.contains("set -euo pipefail"), "{script}");
+        assert!(script.contains("trap "), "cleanup must be trapped");
+        assert!(script.contains("--remote-debugging-port"), "{script}");
+        for fragment in [
+            "READY_TIMEOUT_SECONDS = 30",
+            "data-game-state",
+            "browser-errors",
+            "Input.dispatchKeyEvent",
+            "Page.captureScreenshot",
+            "scrollY",
+        ] {
+            assert!(
+                driver.contains(fragment),
+                "browser_gate.py must contain {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_web_scripts_are_executable() {
+        for relative in ["scripts/build-web.sh", "scripts/web-smoke.sh"] {
+            let metadata = fs::metadata(repository().join(relative)).unwrap();
+            let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+            assert_eq!(mode & 0o111, 0o111, "{relative} must be executable");
+        }
+    }
+
+    fn locked_version(package: &str) -> String {
+        let lock = source("Cargo.lock");
+        let marker = format!("name = \"{package}\"\nversion = \"");
+        let start = lock.find(&marker).expect("package should be locked") + marker.len();
+        lock[start..]
+            .split('"')
+            .next()
+            .expect("locked version should terminate")
+            .to_owned()
     }
 }

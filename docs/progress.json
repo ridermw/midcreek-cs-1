@@ -85,17 +85,17 @@
     {
       "id": "pages-playable",
       "title": "Publish the playable WASM game",
-      "status": "in_progress",
+      "status": "done",
       "depends_on": [
         "operations-hud"
       ],
-      "summary": "Publish the playable WASM game.",
-      "completed_commit": null
+      "summary": "Packaged the production game for wasm32-unknown-unknown with a pinned wasm-bindgen, added a wasm-only WebReadyPlugin handshake, published it under play/ with last-green metadata, and proved it in headless Chromium.",
+      "completed_commit": "HEAD"
     },
     {
       "id": "autonomous-verification",
       "title": "Build autonomous verification and visual hill-climb gates",
-      "status": "future",
+      "status": "in_progress",
       "depends_on": [
         "operations-hud"
       ],
@@ -187,6 +187,24 @@
       "impact": "Task 7 asks for badges that float over the racks they belong to while the camera orbits through four headings and tweens between them, and for fixed panels that never cover the middle of the screen at either supported window size. A world-space badge satisfies the first requirement by rotating, shearing, and resizing with the isometric camera, which is exactly what a readable status marker must not do. Anchoring a fixed-size screen-space node instead moves the whole problem into projection, where three failures are silent by default: a rack behind the camera or outside the viewport projects to a meaningless point, a rack near an edge produces a badge that is half off screen, and a camera transform that is one frame stale makes every badge lag visibly through a 0.30 s orbit.",
       "approach": "Badges are Bevy UI nodes of fixed pixel size, anchored every frame from a stable authored world point 2.4 m above each rack collider centre through the real Camera::world_to_viewport. The pass reads the camera entity's own Transform rather than its propagated GlobalTransform, because propagation runs in PostUpdate and the HUD runs in Update after the camera follow; the camera has no parent, so its transform is its global transform and the badge is anchored against this frame's camera rather than last frame's. Off-screen and refused projections are distinct typed outcomes rather than a shared silent skip: an anchor outside the viewport hides as OffScreen, and a ViewportConversionError becomes a typed ProjectionFailure recorded in HudReport. A visible anchor always yields a fully visible badge because the badge box is clamped inside the viewport, and because clamping breaks the vertical relationship between badge and rack, the leader line is a rotated thin node whose local +Y axis is turned onto the direction of the anchor, so it still ends exactly on the rack it names. The fixed panels avoid the central play rectangle on one axis each: the queue stack is 216 px wide, narrower than a quarter of the 960 px verification viewport, and the control strip is 40 px tall, shorter than a quarter of its 540 px height.",
       "resolution": "operations_hud_badges_track_the_projected_rack_at_every_heading_and_mid_tween sweeps all four headings and one genuine mid-tween frame at each, and requires every badge's recorded anchor to equal the test's own independent projection of the same world point, its visibility to agree with whether that projection is on screen, its laid-out ComputedNode to stay exactly 34x22 px and fully inside the viewport, and its leader line to end within 1.5 px of the anchor. operations_hud_clamps_an_edge_badge_and_still_points_its_leader_at_the_rack walks the technician until a faulted rack is pushed against a side edge, the only case where the leader is not vertical, and proves the clamped badge stays on screen while the tilted leader still ends on the rack; flipping the sign of the leader rotation fails only this contract. operations_hud_panels_stay_on_screen_and_clear_of_the_play_rectangle resizes the real window to 1280x720 and 960x540 through a real WindowResized message and re-checks the 16 px margins, the row order, the panel containment, and the play rectangle at both sizes. operations_hud_hides_a_badge_whose_rack_leaves_the_viewport, operations_hud_reports_a_rack_that_lost_its_operational_state, and operations_hud_reports_a_missing_camera_instead_of_drawing_stale_badges cover the three hiding paths, two of them fault-injected into a running app and required to name a typed HudError.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "a-browser-gate-that-cannot-pass-on-a-blank-page",
+      "title": "Proving a real rendered browser frame without npm, Selenium, or a GPU",
+      "status": "resolved",
+      "impact": "The reviewed plan forbids npm and any browser automation package, so nothing off the shelf could drive Chrome. A gate that only waited for a load event, or only screenshotted a page, would pass on a blank canvas, on a game that threw during initialization, and on a build whose WebGL context never produced a frame. The two obvious readiness signals are also both unreliable on their own: a Bevy app reaches its first Update long before the hall, rig, roster, and HUD exist, and a canvas can carry the right CSS box while rendering nothing.",
+      "approach": "Readiness and rendering are proved independently. src/web.rs holds a pure, natively tested handshake model: every production subsystem is mapped onto Pending, Ready, or Failed, a missing camera or viewport stays Pending because it is an unfinished startup frame, and only two consecutive settled PostUpdate frames latch data-game-state=\"ready\". A failure latches data-game-state=\"error\" once and appends a sanitized detail, with absolute paths reduced to file names and the message bounded, so a browser never shows a build host path. scripts/browser_gate.py is a repository-owned Chrome DevTools Protocol client written against the Python standard library, including a hand-rolled RFC 6455 WebSocket frame codec and a minimal PNG decoder, so the gate injects trusted keyboard input and reads real pixels with no third-party package. Chromium runs headless on SwiftShader, so no GPU is required.",
+      "resolution": "scripts/web-smoke.sh serves the package below the /midcreek-cs-1/ project prefix on an available loopback port, requires HTTP 200 for every packaged URL, requires data-game-state=\"ready\" within 30 seconds, requires #browser-errors to be empty, requires the canvas to be visible and 16:9 within one pixel, and requires the canvas region of a real screenshot to carry at least three approved palette classes and real channel variance. The no-scroll assertion carries its own positive control: the same trusted Arrow, Q, E, and Space events must scroll the page while the canvas is blurred and must not scroll it while the canvas is focused, so a page that simply could not scroll fails instead of passing. Deleting one generated GLB from a packaged build drives the gate to exit 1 with the sanitized 'assets: generated/rack.glb failed to load' detail, and the healthy package reports ready in about five seconds with five approved palette classes over the full 1152x648 canvas.",
+      "resolved_commit": "HEAD"
+    },
+    {
+      "id": "a-hundred-megabyte-wasm-game-cannot-be-published",
+      "title": "Shipping the whole production game as one publishable WebAssembly file",
+      "status": "resolved",
+      "impact": "The Pages site is published by force-pushing a generated pages-live branch, so every published file must clear GitHub's hard 100 MB blob limit. A stock release build of the full Bevy game for wasm32-unknown-unknown produced a 117.7 MB module, which could never have been pushed, and no amount of retrying the deployment would have revealed the real cause.",
+      "approach": "The module was measured section by section rather than guessed at: the WebAssembly name section alone was 49.7 MB and the code section was 59.1 MB. wasm-bindgen now runs with --remove-name-section and --remove-producers-section, the release profile uses fat LTO with one codegen unit and panic=abort, and .cargo/config.toml applies -Copt-level=s only to wasm32-unknown-unknown so the native release build keeps its own optimization level. The same file also supplies the getrandom wasm_js backend the browser target requires.",
+      "resolution": "The published game_bg.wasm is 34.5 MB, comfortably inside the blob limit, and scripts/build-web.sh refuses to publish a package that is missing any of index.html, play.js, play.css, game.js, game_bg.wasm, or any of the five generated GLBs, that contains a root-absolute URL, or that leaks a build host path into the generated bindings.",
       "resolved_commit": "HEAD"
     }
   ]

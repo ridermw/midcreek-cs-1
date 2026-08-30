@@ -478,6 +478,61 @@ suite uses and query the real laid-out `ComputedNode` and `UiGlobalTransform`:
   named, repairs that rack, and requires the prompt to clear on every
   transition while other racks' tickets stay open.
 
+## Playable WebAssembly build
+
+The browser build is the same production game: `CellShiftPlugin` and every
+gameplay plugin are shared with the native binary, and only the browser
+handshake is target specific.
+
+```bash
+./scripts/build-web.sh target/web-preview
+./scripts/web-smoke.sh target/web-preview
+```
+
+`scripts/build-web.sh` reads the locked `wasm-bindgen` version out of
+`Cargo.lock`, refuses to run unless the installed CLI matches it exactly,
+builds `--release --target wasm32-unknown-unknown`, runs
+`wasm-bindgen --target web --no-typescript`, copies the browser shell and all
+five generated GLBs, and then refuses to publish a package that is missing a
+required file, carries a root-absolute URL, or leaks a build host path.
+
+`src/web.rs` holds the readiness model. It is pure and compiled on every
+target, so all seventeen of its contracts run natively:
+
+- every production subsystem maps onto `Pending`, `Ready`, or `Failed`;
+- a HUD with no camera or no viewport stays `Pending`, because that is an
+  unfinished startup frame rather than a failure;
+- `data-game-state="ready"` is published only after two consecutive settled
+  `PostUpdate` frames, and a single pending frame restarts the count;
+- `ready` and `error` each latch once, so a late frame can neither downgrade a
+  browser that already reported ready nor report the same failure twice;
+- failure details are sanitized: control characters collapse, absolute paths
+  reduce to file names, and the message is bounded at 200 bytes.
+
+`scripts/web-smoke.sh` and `scripts/browser_gate.py` are the browser gate. They
+use no npm, no Selenium, and no Playwright: the driver is a Chrome DevTools
+Protocol client built on the Python standard library, with a hand-rolled
+RFC 6455 WebSocket codec and a minimal PNG decoder. The gate serves the package
+below the `/midcreek-cs-1/` project prefix on an available loopback port and
+fails unless every packaged URL returns HTTP 200, the game reports
+`data-game-state="ready"` within 30 seconds, `#browser-errors` is empty, the
+canvas is visible and 16:9 within one pixel, the reviewed control keys do not
+scroll the focused page, and the canvas region of a real screenshot carries at
+least three approved palette classes with real channel variance.
+
+The no-scroll assertion carries its own positive control: the same trusted
+Arrow, Q, E, and Space events must scroll the page while the canvas is blurred,
+so a page that simply could not scroll fails instead of passing silently.
+
+Deleting one generated GLB from a package drives the gate to exit 1 with
+`assets: generated/rack.glb failed to load`, which is the sanitized handshake
+detail the game itself published. A healthy package reports ready in about five
+seconds and shows five approved palette classes across the full 1152x648 canvas.
+
+A green run publishes the package under `play/` together with `last-green.json`.
+Any failing run retains the previous verified game, because `assemble_site`
+treats `play/`, `screenshots/`, and `last-green.json` as retained artifacts.
+
 ## Foundation gates
 
 ```bash
@@ -498,3 +553,16 @@ cargo test --test app_contract hall
 The hall contracts drive a real Bevy app built from `DefaultPlugins` with
 `WinitPlugin` disabled and `RenderPlugin` created without a wgpu backend, so the
 committed GLBs are loaded by the real glTF loader on a machine with no GPU.
+
+Web gates:
+
+```bash
+cargo test --lib web
+cargo test --test sitegen_contract
+cargo test --test pages_assembly_contract
+./scripts/build-web.sh target/web-preview
+./scripts/web-smoke.sh target/web-preview
+```
+
+The browser gate needs a local Chrome or Chromium; set `CHROME` to point at one
+if it is not on the default macOS or Linux path.

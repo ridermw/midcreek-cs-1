@@ -306,6 +306,50 @@ mod workflow_contract {
         }
     }
 
+    #[test]
+    fn builds_the_web_game_only_after_verification_passes() {
+        let workflow = workflow_source();
+        let web = web_job(&workflow);
+
+        assert!(web.contains("needs: verify"), "{web}");
+        // A job-level condition sits at four spaces; step conditions are deeper.
+        assert!(!web.contains("\n    if:"), "{web}");
+        assert!(web.contains("permissions:\n      contents: read"), "{web}");
+        assert!(!web.contains("contents: write"), "{web}");
+    }
+
+    #[test]
+    fn the_web_job_installs_the_pinned_toolchain_and_runs_both_web_gates() {
+        let workflow = workflow_source();
+        let web = web_job(&workflow);
+
+        for fragment in [
+            "rustup target add wasm32-unknown-unknown",
+            "cargo install wasm-bindgen-cli --version",
+            "chromium-browser",
+            "./scripts/build-web.sh",
+            "./scripts/web-smoke.sh",
+            "actions/upload-artifact@",
+        ] {
+            assert!(
+                web.contains(fragment),
+                "Build web should contain {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_waits_for_both_gates_and_promotes_only_a_green_playable_build() {
+        let workflow = workflow_source();
+        let publish = publish_job(&workflow);
+
+        assert!(publish.contains("if: always()"), "{publish}");
+        assert!(publish.contains("needs: [verify, build-web]"), "{publish}");
+        assert!(publish.contains("needs.build-web.result"), "{publish}");
+        assert!(publish.contains("actions/download-artifact@"), "{publish}");
+        assert!(publish.contains("playable"), "{publish}");
+    }
+
     fn workflow_source() -> String {
         fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/pages.yml"),
@@ -314,18 +358,35 @@ mod workflow_contract {
     }
 
     fn verify_job(workflow: &str) -> &str {
-        workflow
-            .split_once("  verify:\n")
-            .and_then(|(_, jobs)| jobs.split_once("  publish:\n"))
-            .map(|(verify, _)| verify)
-            .expect("workflow should contain Verify before Publish")
+        job(workflow, "verify")
     }
 
     fn publish_job(workflow: &str) -> &str {
-        workflow
-            .split_once("  publish:\n")
-            .map(|(_, publish)| publish)
-            .expect("workflow should contain Publish")
+        job(workflow, "publish")
+    }
+
+    fn web_job(workflow: &str) -> &str {
+        job(workflow, "build-web")
+    }
+
+    /// One job body, from its declaration to the next job at the same indent.
+    fn job<'source>(workflow: &'source str, name: &str) -> &'source str {
+        let start = workflow
+            .find(&format!("\n  {name}:\n"))
+            .unwrap_or_else(|| panic!("workflow should declare the {name} job"))
+            + name.len()
+            + 5;
+        let body = &workflow[start..];
+        body.match_indices("\n  ")
+            .find(|(offset, _)| {
+                body[offset + 3..].split_once(':').is_some_and(|(head, _)| {
+                    !head.is_empty()
+                        && head
+                            .chars()
+                            .all(|value| value.is_ascii_lowercase() || value == '-')
+                })
+            })
+            .map_or(body, |(offset, _)| &body[..offset])
     }
 }
 
@@ -398,4 +459,51 @@ impl Drop for TempDirectory {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.path).unwrap();
     }
+}
+
+#[test]
+fn a_green_run_replaces_the_previous_playable_build_and_last_green_metadata() {
+    let previous = fixture_site(
+        "previous-green-game",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+            ("play/index.html", "old shell"),
+            ("screenshots/center.png", "last-known-good-frame"),
+            ("last-green.json", r#"{"source_commit":"old"}"#),
+        ],
+    );
+    let current = fixture_site(
+        "current-green-game",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("play/game_bg.wasm", "verified-new-game"),
+            ("play/index.html", "new shell"),
+            ("screenshots/center.png", "verified-new-frame"),
+            ("last-green.json", r#"{"source_commit":"new"}"#),
+        ],
+    );
+    let output = TempDirectory::new("green-replacement-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::GreenReplacement);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "verified-new-game"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("last-green.json")).unwrap(),
+        r#"{"source_commit":"new"}"#
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("screenshots/center.png")).unwrap(),
+        "verified-new-frame"
+    );
 }

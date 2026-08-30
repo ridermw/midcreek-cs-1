@@ -1,0 +1,122 @@
+:root {
+  --ink: #1f2a33;
+  --rack-white: #fbfcfd;
+  --floor-light: #dee6eb;
+  --sky: #9fd0f0;
+  --yellow: #ffc93c;
+  --teal: #2fb8a8;
+  --fault: #ff4b4b;
+  --outline: 3px solid var(--ink);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  background: var(--floor-light);
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.play-shell {
+  max-width: 72rem;
+  margin: 0 auto;
+  display: grid;
+  gap: 0;
+}
+
+.play-header {
+  padding: 1rem 1.25rem;
+  border: var(--outline);
+  border-bottom-width: 0;
+  background: var(--rack-white);
+}
+
+.play-header h1 {
+  margin: 0;
+  font-size: clamp(1.4rem, 3vw, 2.4rem);
+  letter-spacing: -0.03em;
+}
+
+.play-state {
+  margin: 0.4rem 0 0;
+  font-weight: 700;
+}
+
+.play-stage {
+  /* The 16:9 assertion measures the canvas, so this box must not carry a
+     border: a border box would shrink the canvas off the exact ratio. */
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  outline: 3px solid var(--ink);
+  outline-offset: -3px;
+  background: var(--sky);
+}
+
+#game-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+}
+
+#game-canvas:focus-visible {
+  outline: 4px solid var(--teal);
+  outline-offset: -4px;
+}
+
+.control-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 1.5rem;
+  padding: 1rem;
+  border: solid var(--ink);
+  border-width: 0 3px 3px;
+  background: var(--yellow);
+  font-weight: 800;
+}
+
+.play-notes {
+  padding: 1.25rem;
+  border: var(--outline);
+  border-top-width: 0;
+  background: var(--rack-white);
+  line-height: 1.6;
+}
+
+.play-notes h2 {
+  margin-top: 0;
+}
+
+kbd {
+  padding: 0.1rem 0.4rem;
+  border: 2px solid var(--ink);
+  border-radius: 4px;
+  background: var(--rack-white);
+  font: inherit;
+  font-size: 0.85em;
+}
+
+body[data-game-state="error"] .play-state {
+  color: var(--fault);
+}
+
+#browser-errors {
+  max-width: 72rem;
+  margin: 1rem auto 0;
+  padding: 0.75rem;
+  border: 3px solid var(--fault);
+  background: var(--rack-white);
+  white-space: pre-wrap;
+}
+
+#browser-errors[hidden] {
+  display: none;
+}

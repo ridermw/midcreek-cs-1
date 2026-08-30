@@ -6,7 +6,7 @@ use std::{
 };
 
 use midcreek_cs_1::sitegen::{
-    ProgressDocument, ProgressStatus, ReferenceManifest, RepoFacts, SiteInputs,
+    PlayableBuild, ProgressDocument, ProgressStatus, ReferenceManifest, RepoFacts, SiteInputs,
     VerificationSummary, WorkflowSummary, assemble_site, build_site, plan_task_ids_from_markdown,
     validate_progress, validate_reference_manifest,
 };
@@ -161,6 +161,15 @@ struct SiteInputPaths {
     workflow: PathBuf,
     repo: PathBuf,
     verification: Option<PathBuf>,
+    playable: Option<PlayableInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayableInput {
+    directory: PathBuf,
+    source_commit: String,
+    run_url: String,
 }
 
 fn build(inputs_path: &Path, output: &Path) -> ExitCode {
@@ -201,6 +210,11 @@ fn build(inputs_path: &Path, output: &Path) -> ExitCode {
         },
         None => None,
     };
+    let playable = paths.playable.map(|playable| PlayableBuild {
+        directory: root.join(playable.directory),
+        source_commit: playable.source_commit,
+        run_url: playable.run_url,
+    });
     let inputs = SiteInputs {
         progress,
         plan_markdown,
@@ -208,6 +222,7 @@ fn build(inputs_path: &Path, output: &Path) -> ExitCode {
         verification,
         workflow,
         repo,
+        playable,
     };
 
     match build_site(&inputs, output) {

@@ -6,6 +6,7 @@ pub mod hud;
 pub mod operations;
 pub mod player;
 pub mod sitegen;
+pub mod web;
 pub mod world;
 
 use bevy::prelude::*;
@@ -59,15 +60,38 @@ impl Plugin for CellShiftPlugin {
 }
 
 pub fn run() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Cell Shift Data Center POC".into(),
-                resolution: (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT).into(),
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(primary_window()),
+                ..default()
+            })
+            .set(bevy::asset::AssetPlugin {
+                meta_check: bevy::asset::AssetMetaCheck::Never,
                 ..default()
             }),
-            ..default()
-        }))
-        .add_plugins(CellShiftPlugin)
-        .run();
+    )
+    .add_plugins(CellShiftPlugin);
+
+    #[cfg(target_arch = "wasm32")]
+    app.add_plugins(web::WebReadyPlugin);
+
+    app.run();
 }
+
+fn primary_window() -> Window {
+    Window {
+        title: "Cell Shift Data Center POC".into(),
+        resolution: (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT).into(),
+        #[cfg(target_arch = "wasm32")]
+        canvas: Some(WEB_CANVAS_SELECTOR.to_owned()),
+        #[cfg(target_arch = "wasm32")]
+        fit_canvas_to_parent: true,
+        ..default()
+    }
+}
+
+/// The canvas the browser shell owns and the game renders into.
+#[cfg(target_arch = "wasm32")]
+pub const WEB_CANVAS_SELECTOR: &str = "#game-canvas";

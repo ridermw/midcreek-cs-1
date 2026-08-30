@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="The verified playable Cell Shift data centre build.">
+  <title>Cell Shift &mdash; Playable build</title>
+  <link rel="stylesheet" href="play.css">
+  <script type="module" src="play.js"></script>
+</head>
+<body data-game-state="loading">
+  <main class="play-shell">
+    <header class="play-header">
+      <h1>Cell Shift Data Center</h1>
+      <p class="play-state" data-state-label>Loading the verified browser build&hellip;</p>
+    </header>
+
+    <div class="play-stage" data-play-stage>
+      <canvas id="game-canvas" tabindex="0" aria-label="Cell Shift data centre gameplay"></canvas>
+    </div>
+
+    <div class="control-strip" aria-label="Game controls">
+      <span><kbd>Arrow keys</kbd> Move</span>
+      <span><kbd>Q</kbd>/<kbd>E</kbd> Orbit</span>
+      <span><kbd>Space</kbd> Repair</span>
+    </div>
+
+    <section class="play-notes">
+      <h2>How this build is proved</h2>
+      <p>This page only ships after a headless browser gate loads the same WebAssembly package, waits for the game to report <code>data-game-state="ready"</code>, proves the canvas renders approved palette colour, and confirms no error or unhandled rejection was captured.</p>
+      <p>Click the canvas to focus it. While it is focused the arrow keys, <kbd>Q</kbd>, <kbd>E</kbd>, and <kbd>Space</kbd> drive the game instead of scrolling this page.</p>
+      <p>Move the technician with the arrow keys, orbit the camera with <kbd>Q</kbd> and <kbd>E</kbd>, and repair the highest priority faulted rack with <kbd>Space</kbd> while standing next to it.</p>
+      <p>The build is generated from repository-owned sources only: the glTF assets are regenerated and byte-compared by the asset gate, and the browser shell has no package manager, bundler, or third-party script.</p>
+    </section>
+  </main>
+
+  <pre id="browser-errors" hidden aria-live="polite"></pre>
+</body>
+</html>

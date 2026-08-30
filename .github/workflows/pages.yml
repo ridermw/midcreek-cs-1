@@ -46,10 +46,71 @@ jobs:
             --plan docs/implementation-plan.md \
             --repository .
 
+  build-web:
+    name: Build web
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libudev-dev \
+            libx11-dev \
+            libxi-dev \
+            libxrandr-dev \
+            chromium-browser \
+            jq
+
+      - name: Install the pinned WebAssembly toolchain
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          locked="$(awk '
+            /^name = "wasm-bindgen"$/ { found = 1; next }
+            found && /^version = / { gsub(/["]/, "", $3); print $3; exit }
+          ' Cargo.lock)"
+          echo "locked wasm-bindgen: $locked"
+          cargo install wasm-bindgen-cli --version "$locked" --locked
+
+      - name: Package the browser game
+        run: ./scripts/build-web.sh "$RUNNER_TEMP/web"
+
+      - name: Prove the packaged game in a headless browser
+        env:
+          CHROME: /usr/bin/chromium-browser
+        run: ./scripts/web-smoke.sh "$RUNNER_TEMP/web" "$RUNNER_TEMP/web-smoke"
+
+      - name: Upload the verified web package
+        uses: actions/upload-artifact@v5
+        with:
+          name: web-package
+          path: ${{ runner.temp }}/web
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload browser gate diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: web-smoke-diagnostics
+          path: ${{ runner.temp }}/web-smoke
+          retention-days: 7
+          if-no-files-found: ignore
+
   publish:
     name: Publish
     if: always()
-    needs: verify
+    needs: [verify, build-web]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -86,9 +147,20 @@ jobs:
             libxi-dev \
             libxrandr-dev
 
+      - name: Download the verified web package
+        id: web
+        if: needs.verify.result == 'success' && needs.build-web.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: web-package
+          path: ${{ runner.temp }}/web
+
       - name: Build and assemble current status
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
+          WEB_RESULT: ${{ needs.build-web.result }}
+          WEB_DOWNLOAD: ${{ steps.web.outcome }}
         run: |
           set -euo pipefail
 
@@ -107,23 +179,49 @@ jobs:
             failed=1
           fi
 
+          case "$WEB_RESULT" in
+            success) web_status="passed" ;;
+            skipped) web_status="skipped_dependency" ;;
+            *) web_status="failed" ;;
+          esac
+
+          # A green playable build is promoted only when both gates passed and
+          # the package really arrived. Any other outcome keeps the previous
+          # verified game in place.
+          playable="false"
+          if [[ "$native_status" == "passed" && "$web_status" == "passed" \
+                && "$WEB_DOWNLOAD" == "success" \
+                && -f "$RUNNER_TEMP/web/game_bg.wasm" ]]; then
+            playable="true"
+          elif [[ "$web_status" == "passed" ]]; then
+            web_status="failed"
+          fi
+
           run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           jq -n \
             --arg source_commit "$GITHUB_SHA" \
             --arg run_url "$run_url" \
             --arg native "$native_status" \
+            --arg web "$web_status" \
             --argjson passed "$passed" \
             --argjson failed "$failed" \
             '{
               source_commit: $source_commit,
               run_url: $run_url,
               native: $native,
-              web: "skipped_dependency",
+              web: $web,
               gates: [{
                 name: "Progress and site tests",
                 status: $native,
                 passed: $passed,
                 failed: $failed,
+                duration_ms: 0,
+                artifact_url: null
+              }, {
+                name: "WASM package and browser gate",
+                status: $web,
+                passed: (if $web == "passed" then 1 else 0 end),
+                failed: (if $web == "failed" then 1 else 0 end),
                 duration_ms: 0,
                 artifact_url: null
               }]
@@ -156,19 +254,34 @@ jobs:
               commits: $commits
             }' > "$pages_root/repo.json"
 
+          playable_json='null'
+          if [[ "$playable" == "true" ]]; then
+            playable_json="$(jq -n \
+              --arg directory "$RUNNER_TEMP/web" \
+              --arg source_commit "$GITHUB_SHA" \
+              --arg run_url "$run_url" \
+              '{
+                directory: $directory,
+                source_commit: $source_commit,
+                run_url: $run_url
+              }')"
+          fi
+
           jq -n \
             --arg progress "$GITHUB_WORKSPACE/docs/progress.json" \
             --arg plan "$GITHUB_WORKSPACE/docs/implementation-plan.md" \
             --arg reference_manifest "$GITHUB_WORKSPACE/docs/reference/manifest.json" \
             --arg workflow "$pages_root/workflow.json" \
             --arg repo "$pages_root/repo.json" \
+            --argjson playable "$playable_json" \
             '{
               progress: $progress,
               plan: $plan,
               reference_manifest: $reference_manifest,
               workflow: $workflow,
               repo: $repo,
-              verification: null
+              verification: null,
+              playable: $playable
             }' > "$pages_root/inputs.json"
 
           cargo run --bin sitegen -- build \

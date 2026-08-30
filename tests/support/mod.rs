@@ -126,6 +126,7 @@ pub fn site_inputs(name: &str) -> SiteInputs {
         verification: None,
         workflow,
         repo,
+        playable: None,
     }
 }
 
