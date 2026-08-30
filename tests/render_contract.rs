@@ -33,17 +33,18 @@ use midcreek_cs_1::{
     player::required_player_parts,
     verification::{
         APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CAPTURE_DELAY_LIMIT,
-        CLIP_DIFFERENCE_RANGE, CameraRenderFacts, EQUIPMENT_REGION_MIN_PIXELS, EQUIPMENT_ROLE_MIN,
-        EquipmentCategory, EquipmentFacts, FrameFacts, FrameMetrics, FrameName, GameplayFacts,
-        HudRowFacts, OUTSIDE_CROP_MAX, PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR,
-        SENTINEL_MAX, StageError, StageMachine, VERIFICATION_MSAA, VerificationFault,
-        VerificationReport, VerificationRequest, VerificationStage, VerifyOutput,
-        VerifyOutputError, WORKER_REGION, axis_aligned_fixture, badge_region, black_fixture,
-        blank_hud_fixture, canonical_f64, canonical_float, canonical_json, clip_difference,
-        equipment_region, evaluate_frame, flood_bytes, frame_regions, gradient_noise_fixture,
-        hud_region, magenta_border_fixture, missing_badge_fixture, missing_worker_fixture,
-        outside_crop_change, parse_verification_args, reference_metrics, semantic_hash,
-        synthetic_badges, synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
+        CAPTURE_TIMEOUT, CLIP_DIFFERENCE_RANGE, CameraRenderFacts, EQUIPMENT_REGION_MIN_PIXELS,
+        EQUIPMENT_ROLE_MIN, EquipmentCategory, EquipmentFacts, FrameFacts, FrameMetrics, FrameName,
+        GameplayFacts, HudRowFacts, LAUNCH_MARGIN, OUTSIDE_CROP_MAX, PARENT_WATCHDOG, PixelRect,
+        REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, SENTINEL_MAX, STALL_WATCHDOG, StageError,
+        StageMachine, VERIFICATION_MSAA, VerificationFault, VerificationReport,
+        VerificationRequest, VerificationStage, VerifyOutput, VerifyOutputError, WORKER_REGION,
+        axis_aligned_fixture, badge_region, black_fixture, blank_hud_fixture, canonical_f64,
+        canonical_float, canonical_json, clip_difference, equipment_region, evaluate_frame,
+        flood_bytes, frame_regions, gradient_noise_fixture, hud_region, magenta_border_fixture,
+        missing_badge_fixture, missing_worker_fixture, outside_crop_change,
+        parse_verification_args, reference_metrics, semantic_hash, synthetic_badges,
+        synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
     },
 };
 use sha2::{Digest, Sha256};
@@ -1114,8 +1115,23 @@ fn cli_exits_with_code_two_for_every_unusable_output_path() {
 // The real rendered run
 // ---------------------------------------------------------------------------
 
-/// How long the parent gives the child before it kills that exact process.
-const PARENT_WATCHDOG: Duration = Duration::from_secs(50);
+/// The production parent cap is a sum of named child budgets, not a round
+/// number, and this is the launcher that really uses it.
+///
+/// The child polices its own active work with `APP_WATCHDOG` and each of its
+/// fourteen readbacks with `CAPTURE_TIMEOUT`. The parent's only job is to be
+/// the backstop for a child that has stopped honouring either, so its cap has
+/// to sit above the longest life a *correct* child can have.
+#[test]
+fn the_parent_cap_is_the_sum_of_the_named_child_budgets() {
+    assert_eq!(
+        PARENT_WATCHDOG,
+        APP_WATCHDOG + CAPTURE_TIMEOUT * FrameName::ALL.len() as u32 + LAUNCH_MARGIN,
+        "the parent cap is active work + every readback's own budget + startup and shutdown"
+    );
+    assert_eq!(PARENT_WATCHDOG, Duration::from_secs(210));
+    assert_eq!(ARTIFACT_NAMES.len(), FrameName::ALL.len() + 1);
+}
 
 /// Only one real game window at a time, whatever the test harness does.
 static APP_LOCK: Mutex<()> = Mutex::new(());
@@ -2413,12 +2429,26 @@ fn a_lost_screenshot_callback_fails_the_run_and_names_its_stage() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// How long the parent gives the stall fixture. It is a fast override, not the
+/// production cap: the child fails itself after `STALL_WATCHDOG` of inactivity,
+/// and this only has to be far enough above that to distinguish "the app
+/// watchdog fired" from "the parent gave up".
+const STALL_PARENT_CAP: Duration = Duration::from_secs(90);
+
 #[test]
 fn the_app_watchdog_fails_a_stalled_run_with_its_stage_name() {
     let root = repository().join("target/render-contract/stall");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("the render contract owns target/render-contract");
-    let launched = launch(&root, Some(VerificationFault::Stall), PARENT_WATCHDOG);
+    // Both budgets here are deliberately short. What the fixture proves is
+    // that an inactive state machine is failed *by the inactivity timeout*,
+    // naming the stage it is stuck in — and that proof is identical at twenty
+    // seconds and at forty-five, so the gate is not made to sit through the
+    // production budget to re-measure a constant. The override lives on the
+    // injected fault, which nothing but `--verify-fault stall` can reach, so
+    // the production constants are untouched.
+    assert!(STALL_WATCHDOG < APP_WATCHDOG && STALL_PARENT_CAP < PARENT_WATCHDOG);
+    let launched = launch(&root, Some(VerificationFault::Stall), STALL_PARENT_CAP);
     let elapsed = launched.elapsed;
 
     assert!(
@@ -2427,8 +2457,9 @@ fn the_app_watchdog_fails_a_stalled_run_with_its_stage_name() {
     );
     assert_eq!(launched.code, Some(1));
     assert!(
-        elapsed >= APP_WATCHDOG && elapsed < PARENT_WATCHDOG,
-        "the app watchdog must fire between {APP_WATCHDOG:?} and {PARENT_WATCHDOG:?}, took {elapsed:?}"
+        elapsed >= STALL_WATCHDOG && elapsed < STALL_PARENT_CAP,
+        "the app watchdog must fire between {STALL_WATCHDOG:?} and {STALL_PARENT_CAP:?}, \
+         took {elapsed:?}"
     );
     let report: VerificationReport =
         serde_json::from_str(&fs::read_to_string(root.join(REPORT_FILE_NAME)).expect("a report"))
@@ -2449,14 +2480,15 @@ fn the_parent_watchdog_kills_the_exact_child_and_keeps_its_artifacts() {
     let root = repository().join("target/render-contract/hang");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("the render contract owns target/render-contract");
-    // The production parent watchdog is 50 seconds; this proves the kill path
-    // itself against a child that has had its own watchdog disabled.
-    assert_eq!(PARENT_WATCHDOG, Duration::from_secs(50));
-    let launched = launch(
-        &root,
-        Some(VerificationFault::Hang),
-        Duration::from_secs(10),
-    );
+    // The cap here is a fast test override, not the production one. Production
+    // is `PARENT_WATCHDOG`, and waiting it out would add three and a half
+    // minutes to prove a kill that is provable in ten seconds: what is under
+    // test is that the parent kills *that exact child process* and keeps its
+    // artifacts, which is the same code path at any cap. The child has had its
+    // own watchdog disabled by the injected fault, so nothing else can stop it.
+    const HANG_PARENT_CAP: Duration = Duration::from_secs(10);
+    assert!(HANG_PARENT_CAP < PARENT_WATCHDOG);
+    let launched = launch(&root, Some(VerificationFault::Hang), HANG_PARENT_CAP);
 
     assert!(
         launched.killed,

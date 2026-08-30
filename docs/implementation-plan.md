@@ -545,7 +545,8 @@ No gate may require a person to play, resize, inspect, score, or approve anythin
 | Repair begins out of range | Interaction test | Input ignored and reason recorded in verification report | Observable |
 | Rig part handle stale | Fault-injection test | Animation system reports missing named part; verification fails | Explicit |
 | HUD layout not ready | Stage transition test | Capture waits; watchdog identifies stage | Explicit |
-| Screenshot callback lost | Fault-injection test | App and parent timeouts fail | Explicit |
+| Screenshot callback lost | Fault-injection test | `CAPTURE_TIMEOUT` fails the run naming the frame; the parent cap is the backstop | Explicit |
+| Slow renderer mistaken for a stuck run | Active-work watchdog unit regression | Readback waiting is excluded from `APP_WATCHDOG`; only active time expires it | Explicit |
 | Analyzer accidentally accepts bad frame | Generated negative fixtures | Unit test fails | Explicit |
 | Renderer unavailable | End-to-end child test | Capture stderr/nonzero; no skip | Explicit |
 | Output path unsafe/unwritable | CLI tests | Write only named files; never recursive-delete; nonzero error | Explicit |
@@ -790,7 +791,11 @@ artifact.
    - 960x540 three-ticket layout.
 6. Write canonical `report.json`: sorted maps, relative paths, no wall-clock/host fields, floats rounded to 1e-6, exact source/reference hashes, asset hashes, gameplay results, camera states, ticket histories, UI rectangles, and frame paths.
 7. Hash canonical JSON and prove equal output for semantically identical runs in different temp directories.
-8. Add app watchdog 45 seconds and parent watchdog 50 seconds; retain stdout, stderr, report, and frames on failure.
+8. Bound the run with three budgets that each measure a different thing, and derive the outermost one rather than choosing it:
+    - `CAPTURE_TIMEOUT` 10 seconds per screenshot readback, from request to landing;
+    - `APP_WATCHDOG` 45 seconds of *active, non-capture* wall time. The watchdog names a state machine that stopped moving; it is not a budget for the run as a whole. While a capture is outstanding its clock does not run, and when that capture resolves — landed, timed out, or refused — the whole wall duration of the wait is excluded for good, exactly once. A lost callback still fails, through `CAPTURE_TIMEOUT`, naming its frame;
+    - `PARENT_WATCHDOG` = `APP_WATCHDOG` + `FrameName::ALL.len()` x `CAPTURE_TIMEOUT` + `LAUNCH_MARGIN` = 45 + 14 x 10 + 25 = 210 seconds, the parent's absolute cap on one child process. `LAUNCH_MARGIN` is the 25 seconds that belong to neither child budget: process start, asset load, window creation, report write, and shutdown. The equation is asserted against `FrameName::ALL.len()`, so a fifteenth frame moves the cap on its own.
+    Retain stdout, stderr, report, and frames on failure.
 9. Implement single-pass `FrameMetrics` per image and one cached reference metric record.
 10. Enforce mandatory frame contracts:
     - exact dimensions and artifact names;

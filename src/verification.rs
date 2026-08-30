@@ -812,9 +812,11 @@ pub const SENTINEL_CLEAR: Srgba = Srgba::rgb(1.0, 0.0, 1.0);
 /// really is: a GPU handing a buffer back on its own schedule. A frame budget
 /// measures how fast the harness can spin, which on an unthrottled software
 /// renderer says nothing at all about whether the callback is late or lost.
-/// The budget is generous — a cold software rasterizer is slow — and sits well
-/// inside [`APP_WATCHDOG`], so a genuinely lost callback is named as a lost
-/// callback rather than swallowed by the global watchdog.
+/// The budget is generous — a cold software rasterizer is slow — and it is the
+/// *only* budget a readback is charged against: [`APP_WATCHDOG`] excludes
+/// capture waiting entirely, so a genuinely lost callback is always named as a
+/// lost callback naming its own frame rather than swallowed by a global
+/// watchdog that would only ever say "stuck in some stage".
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many frames a window resize is allowed, and always costs.
@@ -824,8 +826,57 @@ pub const RESIZE_FRAMES: u64 = 45;
 /// technician, and always costs.
 pub const PROBE_SETTLE_FRAMES: u64 = 6;
 
-/// How long the app gives itself before it fails with the stage it is stuck in.
+/// How much *active, non-capture* wall time the app gives itself before it
+/// fails with the stage it is stuck in.
+///
+/// The watchdog exists to name a state machine that stopped moving. It is not
+/// a budget for the run as a whole, and deliberately so: waiting on an
+/// asynchronous readback is not the state machine failing to move, it is the
+/// state machine doing exactly what it is supposed to do, and that wait is
+/// already governed second by second by [`CAPTURE_TIMEOUT`]. Charging it here
+/// as well made a merely slow renderer indistinguishable from a stuck one —
+/// which is precisely how a healthy CI run died in `keyboard-journey` with two
+/// frames already on disk. So while a capture is outstanding the watchdog
+/// clock is not running, and when that capture resolves its whole wall
+/// duration is excluded for good.
+///
+/// A lost callback still fails the run: it fails through [`CAPTURE_TIMEOUT`],
+/// naming the frame, the stage, and the artifact, which is strictly better
+/// evidence than a watchdog expiry could ever be.
 pub const APP_WATCHDOG: Duration = Duration::from_secs(45);
+
+/// What the parent allows the child on top of its own budgets: process start,
+/// asset load, window creation, report write, and shutdown.
+pub const LAUNCH_MARGIN: Duration = Duration::from_secs(25);
+
+/// The absolute wall clock a parent gives one child before it kills that exact
+/// process.
+///
+/// This is derived, not chosen. The child polices itself with two budgets that
+/// are deliberately independent — [`APP_WATCHDOG`] over active work and
+/// [`CAPTURE_TIMEOUT`] over each of the [`FrameName::ALL`] readbacks — so the
+/// longest a *correct* child can legitimately live is the sum of both plus
+/// [`LAUNCH_MARGIN`] for the work that belongs to neither. The parent cap has
+/// to sit above that sum or it would kill runs the child was entitled to
+/// finish; tying it to the equation rather than to a number means adding a
+/// fifteenth frame moves it automatically.
+///
+/// With today's budgets: 45 s + 14 x 10 s + 25 s = 210 s.
+pub const PARENT_WATCHDOG: Duration = Duration::from_secs(
+    APP_WATCHDOG.as_secs()
+        + CAPTURE_TIMEOUT.as_secs() * FrameName::ALL.len() as u64
+        + LAUNCH_MARGIN.as_secs(),
+);
+
+/// The short active-work watchdog [`VerificationFault::Stall`] runs with.
+///
+/// This is a test instrument and nothing else. The stall fixture proves the
+/// inactivity timeout *fires and names its stage*; that proof is identical at
+/// any budget, and running it at the production [`APP_WATCHDOG`] would add
+/// three quarters of a minute to every gate to re-measure a constant. It is
+/// generous enough that booting the real game, loading its assets, and taking
+/// the healthy capture can never be mistaken for the stall it is testing.
+pub const STALL_WATCHDOG: Duration = Duration::from_secs(20);
 
 /// How many frames one non-capture stage may take before it is declared stuck.
 pub const STAGE_FRAME_BUDGET: u64 = 4_000;
@@ -1363,6 +1414,15 @@ struct PendingCapture {
     /// The pump the observer's record was first seen on.
     landed_on: Option<u64>,
     completed: bool,
+    /// Whether this capture's wait has already been folded into
+    /// [`VerificationRun::capture_excluded`].
+    ///
+    /// A wait is excluded from the active-work watchdog twice over: while the
+    /// capture is outstanding the *current* wait is subtracted live, and the
+    /// moment the capture resolves — landed, timed out, or rejected — that
+    /// same wait is banked once and this flag stops it being counted both
+    /// ways or banked twice.
+    charged: bool,
 }
 
 /// The screenshot observers' mailbox. The observer runs
@@ -1393,6 +1453,11 @@ pub struct VerificationRun {
     output: VerifyOutput,
     started: Instant,
     watchdog: Duration,
+    /// Wall time already spent waiting on captures that have since resolved.
+    ///
+    /// This is what makes [`APP_WATCHDOG`] a measure of active work rather
+    /// than of the run's whole lifetime.
+    capture_excluded: Duration,
     capture_timeout: Duration,
     capture_delay: u64,
     frame: u64,
@@ -1410,7 +1475,8 @@ pub struct VerificationRun {
 }
 
 impl VerificationRun {
-    /// A run that writes into `output` and gives itself [`APP_WATCHDOG`].
+    /// A run that writes into `output` and gives itself [`APP_WATCHDOG`] of
+    /// active, non-capture work.
     pub fn new(output: VerifyOutput, fault: Option<VerificationFault>) -> Self {
         Self {
             machine: StageMachine::default(),
@@ -1418,6 +1484,7 @@ impl VerificationRun {
             fault,
             started: Instant::now(),
             watchdog: APP_WATCHDOG,
+            capture_excluded: Duration::ZERO,
             capture_timeout: CAPTURE_TIMEOUT,
             capture_delay: 0,
             frame: 0,
@@ -1450,6 +1517,37 @@ impl VerificationRun {
     /// The current stage.
     pub fn stage(&self) -> VerificationStage {
         self.machine.stage()
+    }
+
+    /// The same run with a different active-work watchdog.
+    ///
+    /// This is a test override and production never calls it: the only caller
+    /// is the injected [`VerificationFault::Stall`], which proves the
+    /// inactivity timeout in seconds instead of re-measuring
+    /// [`APP_WATCHDOG`] in full.
+    #[must_use]
+    pub const fn with_watchdog(mut self, watchdog: Duration) -> Self {
+        self.watchdog = watchdog;
+        self
+    }
+
+    /// Wall time this run has spent doing anything other than waiting for a
+    /// screenshot readback.
+    ///
+    /// This is the quantity [`APP_WATCHDOG`] is measured against. Resolved
+    /// captures have already been banked into `capture_excluded`; a capture
+    /// that is outstanding right now has its wait subtracted live, so a
+    /// readback in progress can never push the run over the line while it is
+    /// still inside its own [`CAPTURE_TIMEOUT`].
+    fn active_elapsed(&self) -> Duration {
+        let outstanding = self
+            .pending
+            .filter(|pending| !pending.charged)
+            .map_or(Duration::ZERO, |pending| pending.requested_at.elapsed());
+        self.started
+            .elapsed()
+            .saturating_sub(self.capture_excluded)
+            .saturating_sub(outstanding)
     }
 }
 
@@ -2039,9 +2137,13 @@ fn capture(
 
 /// Runs one zero-time render pump for the outstanding capture.
 ///
-/// This is the whole of a pumped frame: the global watchdog still applies, and
-/// the readback is polled. Nothing else the driver does happens here, which is
-/// what keeps an arbitrary number of pumps invisible to the report.
+/// This is the whole of a pumped frame: the readback is polled, and the
+/// watchdog is still consulted — it just has nothing to charge, because a pump
+/// only ever happens while a capture is outstanding and that whole wait is
+/// excluded. What the check really catches here is the run that was already
+/// over its active budget when it asked for the capture. Nothing else the
+/// driver does happens here, which is what keeps an arbitrary number of pumps
+/// invisible to the report.
 fn pump_pending_capture(world: &mut World, run: &mut VerificationRun) -> Result<(), String> {
     if watchdog_expired(run) {
         let stage = run.machine.stage().name();
@@ -2051,9 +2153,28 @@ fn pump_pending_capture(world: &mut World, run: &mut VerificationRun) -> Result<
     Ok(())
 }
 
-/// Whether the global app watchdog has expired.
+/// Whether the app's active-work watchdog has expired.
+///
+/// The comparison is against [`VerificationRun::active_elapsed`], not against
+/// the run's lifetime: readback waiting belongs to [`CAPTURE_TIMEOUT`], and
+/// charging it here as well is what turned a slow CI renderer into a false
+/// "stuck state machine".
 fn watchdog_expired(run: &VerificationRun) -> bool {
-    run.fault != Some(VerificationFault::Hang) && run.started.elapsed() > run.watchdog
+    run.fault != Some(VerificationFault::Hang) && run.active_elapsed() > run.watchdog
+}
+
+/// Banks an outstanding capture's wait into the excluded total, exactly once.
+///
+/// Every path that resolves a capture calls this, whether the readback landed,
+/// timed out, or came back as something the contract refuses. Together with
+/// the live subtraction in [`VerificationRun::active_elapsed`] it means a wait
+/// is excluded from the watchdog continuously from request to resolution and
+/// never counted twice.
+fn bank_capture_wait(run: &mut VerificationRun, pending: &mut PendingCapture) {
+    if !pending.charged {
+        pending.charged = true;
+        run.capture_excluded += pending.requested_at.elapsed();
+    }
 }
 
 /// Polls the outstanding readback once, returning whether it has landed.
@@ -2093,6 +2214,7 @@ fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, St
         match png_dimensions(&path) {
             Some(size) if size == expected => {}
             Some((width, height)) => {
+                bank_capture_wait(run, &mut pending);
                 run.pending = Some(pending);
                 set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
                 return Err(format!(
@@ -2103,6 +2225,7 @@ fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, St
                 ));
             }
             None => {
+                bank_capture_wait(run, &mut pending);
                 run.pending = Some(pending);
                 set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
                 return Err(format!(
@@ -2113,6 +2236,7 @@ fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, St
             }
         }
         pending.completed = true;
+        bank_capture_wait(run, &mut pending);
         run.pending = Some(pending);
         set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
         return Ok(true);
@@ -2130,6 +2254,7 @@ fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, St
             artifact_state(&path),
         );
         error!("{reason}; the artifact path was {}", path.display());
+        bank_capture_wait(run, &mut pending);
         run.pending = Some(pending);
         set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
         return Err(reason);
@@ -2200,6 +2325,7 @@ fn request_capture(world: &mut World, run: &mut VerificationRun, frame: FrameNam
         pumps: 0,
         landed_on: None,
         completed: false,
+        charged: false,
     });
 }
 
@@ -3319,6 +3445,22 @@ impl VerificationPlugin {
             capture_delay,
         }
     }
+
+    /// The live run this plugin drives.
+    ///
+    /// A production run — no fault on the command line — gets the derived
+    /// [`APP_WATCHDOG`]. An injected fault may name a shorter active-work
+    /// watchdog so its fixture can be waited out in seconds; that override is
+    /// the fault's own, and there is no way to reach it without asking for the
+    /// fault.
+    fn run(&self) -> VerificationRun {
+        let run = VerificationRun::new(self.output.clone(), self.fault)
+            .with_capture_delay(self.capture_delay);
+        match self.fault.and_then(VerificationFault::watchdog_override) {
+            Some(watchdog) => run.with_watchdog(watchdog),
+            None => run,
+        }
+    }
 }
 
 impl Plugin for VerificationPlugin {
@@ -3328,10 +3470,7 @@ impl Plugin for VerificationPlugin {
         )))
         .insert_resource(ClearColor(SENTINEL_CLEAR.into()))
         .init_resource::<CaptureInbox>()
-        .insert_resource(
-            VerificationRun::new(self.output.clone(), self.fault)
-                .with_capture_delay(self.capture_delay),
-        )
+        .insert_resource(self.run())
         .add_systems(
             Update,
             configure_verification_camera.in_set(CellShiftSet::AssetReady),
@@ -3398,6 +3537,22 @@ pub enum VerificationFault {
 impl VerificationFault {
     /// Every injectable fault, in declaration order.
     pub const ALL: [Self; 3] = [Self::DropCapture, Self::Stall, Self::Hang];
+
+    /// The active-work watchdog this fault runs with instead of the derived
+    /// [`APP_WATCHDOG`], when it needs a different one.
+    ///
+    /// Only [`Self::Stall`] does, and only because the thing it proves — that
+    /// an inactive state machine is failed with its stage name — is the same
+    /// proof at twenty seconds as at forty-five, and the fixture has to be
+    /// waited out in full every time the gate runs. Nothing selects a fault
+    /// unless it is asked for on the command line, so a production run always
+    /// gets [`APP_WATCHDOG`].
+    pub const fn watchdog_override(self) -> Option<Duration> {
+        match self {
+            Self::Stall => Some(STALL_WATCHDOG),
+            Self::DropCapture | Self::Hang => None,
+        }
+    }
 
     /// The stable command-line name.
     pub const fn name(self) -> &'static str {
@@ -5231,6 +5386,330 @@ mod tests {
             reason.contains(&format!("{}x{}", width / 2, height / 2))
                 && reason.contains(&format!("{width}x{height}")),
             "the failure must name what came back and what was needed: {reason}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The active-work watchdog
+    // -----------------------------------------------------------------------
+
+    /// Requests one capture, holds the readback open for `wait` of wall clock,
+    /// and lands it, exactly as a slow renderer does.
+    ///
+    /// The wait is applied by backdating rather than by sleeping: the quantity
+    /// under test is a wall-clock duration, and a test that really slept the
+    /// fourteen readbacks of a CI run would take minutes. Both clocks are
+    /// backdated together, because that is what a real wait does — the run
+    /// gets `wait` older, and every second of it belongs to this readback.
+    fn take_capture_lasting(
+        world: &mut World,
+        run: &mut VerificationRun,
+        state: &Snapshot,
+        wait: Duration,
+    ) {
+        request_capture_waiting(world, run, state, wait);
+        land_capture(world, run, CAPTURE_TEST_FRAME);
+        assert!(
+            capture(world, run, state, CAPTURE_TEST_FRAME).expect("the landed readback completes"),
+            "a landed readback inside the capture timeout completes the capture"
+        );
+    }
+
+    /// The first half of [`take_capture_lasting`]: a capture requested `wait`
+    /// ago and still outstanding.
+    fn request_capture_waiting(
+        world: &mut World,
+        run: &mut VerificationRun,
+        state: &Snapshot,
+        wait: Duration,
+    ) {
+        capture(world, run, state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        run.started -= wait;
+        run.pending
+            .as_mut()
+            .expect("the request left a capture outstanding")
+            .requested_at = Instant::now() - wait;
+    }
+
+    /// The regression this whole watchdog rework exists for.
+    ///
+    /// CI failed the real run in `keyboard-journey` with "the app watchdog
+    /// expired", having captured two frames successfully: the watchdog was
+    /// charging the fourteen asynchronous readbacks that [`CAPTURE_TIMEOUT`]
+    /// already governs, so a merely slow renderer read as a stuck state
+    /// machine. The watchdog measures *active, non-capture* wall time, so a
+    /// run whose clock ran past it only because of readbacks must survive.
+    #[test]
+    fn capture_waiting_never_expires_the_active_work_watchdog() {
+        const CAPTURES: u32 = 8;
+        /// Comfortably inside [`CAPTURE_TIMEOUT`], so every readback here is
+        /// late rather than lost.
+        const WAIT: Duration = Duration::from_secs(9);
+
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+        let waited = WAIT * CAPTURES;
+        assert!(
+            waited > APP_WATCHDOG,
+            "the fixture has to out-run the watchdog on wall clock alone"
+        );
+
+        for _ in 0..CAPTURES {
+            take_capture_lasting(&mut world, &mut run, &state, WAIT);
+        }
+        assert!(
+            run.started.elapsed() > APP_WATCHDOG,
+            "the run really has been alive longer than the watchdog: {:?}",
+            run.started.elapsed()
+        );
+        assert!(
+            !watchdog_expired(&run),
+            "{CAPTURES} completed readbacks of {WAIT:?} are the capture timeout's business, \
+             not the watchdog's"
+        );
+
+        // The readback that is outstanding *right now* is excluded too.
+        request_capture_waiting(&mut world, &mut run, &state, WAIT);
+        assert!(
+            !watchdog_expired(&run),
+            "the wait a capture is in the middle of is excluded while it is outstanding"
+        );
+
+        // Active time, and only active time, still expires it.
+        run.started -= APP_WATCHDOG + Duration::from_secs(1);
+        assert!(
+            watchdog_expired(&run),
+            "wall clock that is not capture waiting is exactly what the watchdog measures"
+        );
+    }
+
+    /// The watchdog still has to fire: a state machine that stops moving with
+    /// no capture outstanding is the stuck run it exists to name.
+    #[test]
+    fn active_time_past_the_watchdog_still_expires_it() {
+        let mut run = capture_run();
+        assert!(!watchdog_expired(&run), "a fresh run has not expired");
+
+        run.started = Instant::now() - (APP_WATCHDOG + Duration::from_secs(1));
+        assert!(
+            run.pending.is_none(),
+            "this run never asked for a capture, so nothing is excluded"
+        );
+        assert!(
+            watchdog_expired(&run),
+            "{APP_WATCHDOG:?} of active work with no capture outstanding must expire"
+        );
+    }
+
+    /// How far a banked wall-clock duration may miss the duration it is
+    /// banking. Everything under test here is measured from a real `Instant`,
+    /// so the only honest assertion is "the elapsed wait, plus the handful of
+    /// microseconds it took to observe it".
+    const BANK_SLACK: Duration = Duration::from_millis(250);
+
+    /// The exclusion has to be the capture's *own* wall duration: bank less
+    /// and a slow renderer still creeps towards expiry, bank more and the
+    /// watchdog stops measuring anything at all.
+    #[test]
+    fn a_completed_capture_banks_exactly_its_own_wall_duration() {
+        const WAIT: Duration = Duration::from_secs(6);
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+
+        assert_eq!(
+            run.capture_excluded,
+            Duration::ZERO,
+            "a run that has taken no captures has excluded nothing"
+        );
+        take_capture_lasting(&mut world, &mut run, &state, WAIT);
+        assert!(
+            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
+            "one {WAIT:?} readback must bank {WAIT:?}, banked {:?}",
+            run.capture_excluded
+        );
+
+        take_capture_lasting(&mut world, &mut run, &state, WAIT);
+        assert!(
+            (WAIT * 2..WAIT * 2 + BANK_SLACK).contains(&run.capture_excluded),
+            "a second {WAIT:?} readback accumulates onto the first, banked {:?}",
+            run.capture_excluded
+        );
+    }
+
+    /// A wait is excluded continuously from request to resolution, and exactly
+    /// once: the live subtraction while the capture is outstanding must not
+    /// survive the banking, or the run would be credited twice for one wait.
+    #[test]
+    fn an_outstanding_wait_is_excluded_live_and_banked_once() {
+        const WAIT: Duration = Duration::from_secs(6);
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+
+        run.started = Instant::now() - WAIT;
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        run.pending
+            .as_mut()
+            .expect("a capture is outstanding")
+            .requested_at = Instant::now() - WAIT;
+        assert_eq!(
+            run.capture_excluded,
+            Duration::ZERO,
+            "an outstanding wait is subtracted live, not banked early"
+        );
+        assert!(
+            run.active_elapsed() < BANK_SLACK,
+            "a run that has only ever waited on this capture has done no active work, \
+             it measured {:?}",
+            run.active_elapsed()
+        );
+
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        assert!(
+            capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the readback landed"),
+            "the landed readback completes the capture"
+        );
+        assert!(
+            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
+            "the resolved wait is banked once, banked {:?}",
+            run.capture_excluded
+        );
+        assert!(
+            run.active_elapsed() < BANK_SLACK,
+            "banking must replace the live subtraction, not double it: {:?}",
+            run.active_elapsed()
+        );
+    }
+
+    /// A capture that fails hands back the fixed step *and* leaves the
+    /// watchdog coherent: its wait is banked, so the failure the run reports
+    /// is the capture failure that names the frame, never a watchdog expiry
+    /// that names only a stage.
+    #[test]
+    fn a_timed_out_capture_restores_the_clock_and_banks_its_wait() {
+        const WAIT: Duration = Duration::from_secs(11);
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+
+        run.started = Instant::now() - WAIT;
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        run.pending
+            .as_mut()
+            .expect("a capture is outstanding")
+            .requested_at = Instant::now() - WAIT;
+
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a readback past its wall-clock budget is lost");
+        assert!(
+            reason.contains("screenshot callback"),
+            "the lost readback names itself: {reason}"
+        );
+        assert_eq!(
+            simulated_step(&world),
+            Duration::from_secs_f64(FIXED_STEP_SECONDS),
+            "a failed capture still hands the clock back"
+        );
+        assert!(
+            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
+            "a lost readback's wait is still the capture timeout's, banked {:?}",
+            run.capture_excluded
+        );
+        assert!(
+            !watchdog_expired(&run),
+            "the run failed on the capture timeout; the watchdog must have nothing to add"
+        );
+        assert!(
+            run.pending
+                .is_some_and(|pending| pending.charged && !pending.completed),
+            "the lost capture stays outstanding, and its wait stays banked exactly once"
+        );
+    }
+
+    /// A frame that comes back at the wrong size resolves the capture too, so
+    /// its wait is banked on that path as well.
+    #[test]
+    fn a_rejected_capture_banks_its_wait_before_it_fails() {
+        const WAIT: Duration = Duration::from_secs(4);
+        let mut world = capture_world();
+        let mut run = capture_run();
+        let state = capture_snapshot();
+        let (width, height) = CAPTURE_TEST_FRAME.size();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        run.pending
+            .as_mut()
+            .expect("a capture is outstanding")
+            .requested_at = Instant::now() - WAIT;
+        land_capture_sized(
+            &mut world,
+            &run,
+            CAPTURE_TEST_FRAME,
+            (width / 2, height / 2),
+        );
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a half-resolution surface is not the contracted frame");
+        assert!(
+            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
+            "a refused readback still waited, banked {:?}",
+            run.capture_excluded
+        );
+    }
+
+    /// The stall fixture's short watchdog is an override on the fault, and
+    /// nothing else can reach it: a production run has no fault, so it gets
+    /// the derived budget.
+    #[test]
+    fn only_the_stall_fault_shortens_the_active_work_watchdog() {
+        assert_eq!(
+            VerificationFault::Stall.watchdog_override(),
+            Some(STALL_WATCHDOG)
+        );
+        assert_eq!(VerificationFault::DropCapture.watchdog_override(), None);
+        assert_eq!(VerificationFault::Hang.watchdog_override(), None);
+        assert!(
+            STALL_WATCHDOG < APP_WATCHDOG,
+            "the override exists to be faster than production, not to weaken it"
+        );
+
+        let plugin = VerificationPlugin::new(scratch_output(), None, 0);
+        assert_eq!(
+            plugin.run().watchdog,
+            APP_WATCHDOG,
+            "a run with no injected fault is a production run"
+        );
+        assert_eq!(
+            VerificationPlugin::new(scratch_output(), Some(VerificationFault::Stall), 0)
+                .run()
+                .watchdog,
+            STALL_WATCHDOG,
+            "the stall fixture runs on its own short budget"
+        );
+        assert_eq!(
+            VerificationPlugin::new(scratch_output(), Some(VerificationFault::Hang), 0)
+                .run()
+                .watchdog,
+            APP_WATCHDOG,
+            "the hang fixture disables the watchdog rather than shortening it"
+        );
+    }
+
+    /// The parent's absolute cap is derived from the child's own named
+    /// budgets, so a fifteenth frame moves it without anyone editing a number.
+    #[test]
+    fn the_parent_cap_is_derived_from_the_child_budgets() {
+        assert_eq!(
+            PARENT_WATCHDOG,
+            APP_WATCHDOG + CAPTURE_TIMEOUT * FrameName::ALL.len() as u32 + LAUNCH_MARGIN,
+            "active work + one capture timeout per frame + startup and shutdown margin"
+        );
+        assert_eq!(PARENT_WATCHDOG, Duration::from_secs(210));
+        assert!(
+            PARENT_WATCHDOG > APP_WATCHDOG + CAPTURE_TIMEOUT * FrameName::ALL.len() as u32,
+            "the parent may never kill a child that is still inside its own budgets"
         );
     }
 

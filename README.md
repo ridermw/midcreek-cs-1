@@ -634,7 +634,8 @@ requires every other one to be refused without moving the machine.
   resumes the journey. A zero-delta frame simulates nothing: no tick, no rack
   timer, no seeded draw, no movement, no animation. Readback latency therefore
   cannot reach the report, and a slow renderer cannot be mistaken for a lost
-  callback. A landed readback must also be a PNG of the size the contract
+  callback — nor for a stuck one, because the app watchdog does not charge
+  readback waiting at all (see *Budgets* below). A landed readback must also be a PNG of the size the contract
   names, so a window server that hands back a half-resolution surface fails the
   run naming both sizes instead of reaching the gate as an unexplained pixel
   difference. A callback that has not arrived inside `CAPTURE_TIMEOUT` of wall
@@ -657,6 +658,46 @@ Real `ButtonInput<KeyCode>` press and release messages drive the journey: arrow
 keys resolved through the live `ViewBasis`, `E` for every orbit, one
 simultaneous `Q` and `E` that the run then requires to have cancelled, and
 `Space` for both the out-of-range rejection and the accepted repair.
+
+### Budgets
+
+Three named budgets bound the run, and each one measures a different thing.
+None of them is a round number chosen to feel safe.
+
+| Budget | Value | Measures |
+|---|---|---|
+| `CAPTURE_TIMEOUT` | 10 s | one screenshot readback, from request to landing |
+| `APP_WATCHDOG` | 45 s | the child's *active, non-capture* wall time |
+| `PARENT_WATCHDOG` | 210 s | the parent's absolute cap on one child process |
+
+The app watchdog exists to name a state machine that stopped moving, and it is
+deliberately **not** a budget for the run as a whole. Waiting on an
+asynchronous readback is not the machine failing to move — it is the machine
+doing exactly what it is supposed to do, and that wait is already policed
+second by second by `CAPTURE_TIMEOUT`, which fails a lost callback naming the
+frame, the stage, the pump count, and the artifact. Charging that wait to the
+watchdog as well made a merely slow renderer indistinguishable from a stuck
+one, which is precisely how a healthy CI run died in `keyboard-journey` with
+two frames already on disk. So while a capture is outstanding the watchdog
+clock is not running, and when that capture resolves — landed, timed out, or
+refused for coming back the wrong size — its whole wall duration is excluded
+for good, exactly once. A lost callback still fails the run; it fails through
+the capture timeout, which is strictly better evidence than a watchdog expiry
+could ever be.
+
+The parent's cap is therefore *derived* rather than chosen, because the longest
+a correct child can legitimately live is the sum of the budgets it is honouring:
+
+```text
+PARENT_WATCHDOG = APP_WATCHDOG + FrameName::ALL.len() * CAPTURE_TIMEOUT + LAUNCH_MARGIN
+                = 45 s        + 14 * 10 s                              + 25 s
+                = 210 s
+```
+
+`LAUNCH_MARGIN` covers what belongs to neither child budget: process start,
+asset load, window creation, writing the report, and shutdown. Tying the cap to
+`FrameName::ALL.len()` rather than to a number means a fifteenth frame moves it
+automatically, and the equation itself is asserted by the render contract.
 
 ### The fourteen frames
 
@@ -742,10 +783,19 @@ proven against the same image the gate accepted a moment earlier.
 
 - `drop-capture` never records a completed screenshot, so the run fails naming
   the frame whose callback was lost;
-- `stall` never leaves its stage, so the 45-second app watchdog fails the run
-  naming that stage;
-- `hang` also disables the app watchdog, so the 50-second parent watchdog has
-  to kill that exact child. Frames already captured are kept.
+- `stall` never leaves its stage, so the app watchdog fails the run naming that
+  stage;
+- `hang` also disables the app watchdog, so the parent watchdog has to kill
+  that exact child. Frames already captured are kept.
+
+Both watchdog fixtures run on deliberately short **test overrides**, and the
+report and this README say so rather than implying the gate sat through the
+production budgets. `stall` runs the child on `STALL_WATCHDOG` (20 s) under a
+90-second parent cap; `hang` runs under a 10-second parent cap. What each one
+proves — that inactivity is failed by name, and that the parent kills *that
+exact process* and keeps its artifacts — is the same code path at any budget,
+and neither override can be reached without asking for the fault on the command
+line. The production constants are asserted unchanged in the same tests.
 
 `--verify-capture-delay <pumps>` is the injected slow GPU: every screenshot
 readback is held open for that many further zero-time render pumps after the

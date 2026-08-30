@@ -641,7 +641,7 @@ mod progress_contract {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             assert_eq!(
                 sha256(root.join("docs/implementation-plan.md")),
-                "e2fb52fc73d63e96a512d8da7b2d916b0a2ef712b8cf085bbc738d105af8cc7c"
+                "bc948da3974c990b42f5bdd77ebeb347c9e70d1b37a951c26dac1969a8b475f4"
             );
         }
 
