@@ -2394,7 +2394,7 @@ pub fn assemble_site(
     // its package, which would otherwise erase the very inconsistency this
     // is meant to catch.
     let retained_playable_trusted = retained_playable_is_consistent(output);
-    reconcile_last_green(output)?;
+    reconcile_last_green(output, retained_playable_trusted)?;
     // `build_site` rendered the current run's own honest state before this
     // assembly ever ran, blind to whatever game the disposition above just
     // decided to keep alive. When this run produced no candidate of its own,
@@ -2495,7 +2495,20 @@ fn copy_previous_artifacts(
 /// published in it, never from a second record. A manifest this generator did
 /// not write does not parse, and assembly leaves it exactly as it found it
 /// rather than inventing one.
-fn reconcile_last_green(output: &Path) -> Result<(), SitegenError> {
+///
+/// The declared `game_files` list is only resynced when `retained_playable_trusted`
+/// is true. That flag is judged, by [`retained_playable_is_consistent`], from
+/// exactly what the previous publication declared; if it already disagreed
+/// with its own package, resyncing here would quietly repair that very
+/// disagreement into a manifest a *later* publication's own consistency
+/// check can no longer catch. Provenance found inconsistent must stay
+/// unavailable, not be rehabilitated by the next assembly's resync. The
+/// screenshot list and visual hash describe evidence, an independent
+/// concern from the playable game, so they are always resynced regardless.
+fn reconcile_last_green(
+    output: &Path,
+    retained_playable_trusted: bool,
+) -> Result<(), SitegenError> {
     let path = output.join(LAST_GREEN_FILE);
     let Ok(json) = fs::read_to_string(&path) else {
         return Ok(());
@@ -2503,7 +2516,9 @@ fn reconcile_last_green(output: &Path) -> Result<(), SitegenError> {
     let Ok(mut manifest) = serde_json::from_str::<LastGreenManifest>(&json) else {
         return Ok(());
     };
-    manifest.game_files = published_files(output, "play")?;
+    if retained_playable_trusted {
+        manifest.game_files = published_files(output, "play")?;
+    }
     manifest.screenshot_files = published_files(output, CURRENT_SCREENSHOTS)?;
     if let Some(hash) = promoted_visual_hash(output) {
         manifest.semantic_visual_hash = Some(hash);
@@ -3355,8 +3370,10 @@ fn current_evidence_succeeded(current: &Path) -> bool {
 /// runs) is treated exactly like no retained game at all, so the page stays
 /// pending rather than inventing provenance for something that cannot be
 /// trusted. The play and mode markers are replaced as one atomic pair: if
-/// either is missing or malformed, neither is touched, so an incorrect badge
-/// can never survive beside a reconciled iframe.
+/// either is missing, malformed, or its span crosses or nests with the
+/// other's, neither is touched, so an incorrect badge can never survive
+/// beside a reconciled iframe and a single replacement can never silently
+/// consume its counterpart's markers.
 fn reconcile_playable_display(
     output: &Path,
     current: &Path,
@@ -3384,7 +3401,19 @@ fn reconcile_playable_display(
     // The play and mode sections are replaced together or not at all: a
     // missing or malformed mode marker must never leave a stale badge beside
     // a freshly reconciled iframe.
-    if marked_span(&html, "mode").is_none() {
+    let Some((mode_start, mode_end)) = marked_span(&html, "mode") else {
+        return Ok(());
+    };
+    // Each marker is located independently by an isolated string search, so a
+    // malformed page can produce spans that cross or nest instead of sitting
+    // entirely before or after one another (e.g. a stray `<!--mode-->` inside
+    // what `play`'s search reports as its own span). Replacing one span in
+    // that case would silently delete or truncate the other marker before it
+    // is ever looked for, turning an atomic pair replacement into a partial
+    // one. Two ranges are genuinely disjoint only when one ends at or before
+    // the other begins; anything else is refused untouched.
+    let disjoint = play_end <= mode_start || mode_end <= play_start;
+    if !disjoint {
         return Ok(());
     }
     if !retained_playable_trusted {

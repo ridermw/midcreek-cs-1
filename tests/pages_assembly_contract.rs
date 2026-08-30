@@ -412,6 +412,107 @@ fn retained_metadata_declaring_a_file_list_inconsistent_with_its_package_leaves_
     assert!(!index.contains("play-embed"), "{index}");
 }
 
+/// A pending current page whose `{{PLAY}}` and `{{MODE}}` markers are
+/// malformed so that their located spans cross: the `mode` open marker sits
+/// inside what `marked_span("play", ..)` reports as the play span, and the
+/// `mode` close marker sits after it, so the two ranges overlap instead of
+/// nesting cleanly one after the other.
+const CROSSING_MARKERS_PAGE: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->PLAY_BODY<!--mode-->MODE_BODY<!--/play-->TAIL<!--/mode-->
+</main></body></html>"#;
+
+#[test]
+fn crossing_play_and_mode_markers_are_refused_without_partial_reconciliation() {
+    let previous = previous_retained_playable("previous-retained-playable-crossing-markers");
+    let current = fixture_site(
+        "current-failed-crossing-markers",
+        &[("index.html", CROSSING_MARKERS_PAGE)],
+    );
+    let output = TempDirectory::new("crossing-markers-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert_eq!(
+        index, CROSSING_MARKERS_PAGE,
+        "crossing/nested play and mode marker spans must be refused verbatim, \
+         never partially reconciled: {index}"
+    );
+}
+
+/// Two chained `assemble_site` runs, the second treating the first's output
+/// as its own `previous`, so a test can prove whether an inconsistency this
+/// round is still caught the *next* round rather than being silently
+/// resynced away.
+fn assemble_twice_with_untrusted_previous(
+    previous: &Path,
+    intermediate_name: &str,
+    final_name: &str,
+) -> TempDirectory {
+    let current_one = fixture_site(
+        &format!("{intermediate_name}-current"),
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let intermediate = TempDirectory::new(intermediate_name);
+    assemble_site(
+        Some(previous),
+        current_one.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        intermediate.path(),
+    )
+    .unwrap();
+
+    let current_two = fixture_site(
+        &format!("{final_name}-current"),
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new(final_name);
+    assemble_site(
+        Some(intermediate.path()),
+        current_two.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+    output
+}
+
+#[test]
+fn an_inconsistent_retained_file_list_is_never_rehabilitated_by_the_next_publication() {
+    // The manifest's declared file list disagrees with its own package (an
+    // extra file that does not exist), exactly like
+    // `retained_metadata_declaring_a_file_list_inconsistent_with_its_package_leaves_the_homepage_pending`.
+    // That test only proves *this* round stays pending. This test proves the
+    // inconsistency itself is not quietly repaired into trustworthy
+    // provenance for the *next* round to pick up.
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/decoy-file-not-really-published.json","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-inconsistent-file-list-chained", &files);
+
+    let output = assemble_twice_with_untrusted_previous(
+        previous.path(),
+        "inconsistent-file-list-intermediate",
+        "inconsistent-file-list-final",
+    );
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "an inconsistency detected one round must still be refused the next round, \
+         not silently rehabilitated by the intervening resync: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
 #[test]
 fn current_evidence_is_never_credited_from_a_run_that_attempted_no_verification_of_its_own() {
     let previous = previous_retained_playable("previous-retained-playable-with-succeeded-evidence");
