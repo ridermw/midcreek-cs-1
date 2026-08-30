@@ -735,6 +735,97 @@ fn promoted_frames_without_a_gallery_manifest_are_refused_as_partial_evidence() 
     );
 }
 
+/// `assemble` reads nothing out of a repository, so the workflow hands it
+/// none — and the workflow may not grow an option for one. It still may not
+/// publish into a source tree, and a binary run from anywhere but its own
+/// build directory cannot learn where that tree is from the path it was
+/// compiled in. The checkout is therefore discovered at run time: the
+/// workspace the runner exported, or the checkout the working directory sits
+/// inside.
+#[test]
+fn a_relocated_assemble_refuses_to_publish_into_the_checkout_it_runs_in() {
+    let checkout = fixture_site(
+        "relocated-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+        ],
+    );
+    let current = fixture_site(
+        "relocated-current",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+    let assemble = |working_directory: &Path, workspace: Option<&Path>, output: PathBuf| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sitegen"));
+        command.current_dir(working_directory).args([
+            "assemble",
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        match workspace {
+            Some(workspace) => command.env("GITHUB_WORKSPACE", workspace),
+            None => command.env_remove("GITHUB_WORKSPACE"),
+        };
+        command.output().expect("sitegen should launch")
+    };
+
+    let from_inside = assemble(checkout.path(), None, checkout.path().join("docs/site"));
+    assert_eq!(
+        from_inside.status.code(),
+        Some(1),
+        "the checkout the command runs inside is a source tree: {}",
+        String::from_utf8_lossy(&from_inside.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&from_inside.stderr).contains("refusing unsafe output path"),
+        "{}",
+        String::from_utf8_lossy(&from_inside.stderr)
+    );
+
+    let exported = assemble(
+        current.path(),
+        Some(checkout.path()),
+        checkout.path().join("docs/exported"),
+    );
+    assert_eq!(
+        exported.status.code(),
+        Some(1),
+        "the exported workspace is a source tree wherever the command runs: {}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
+
+    // Nothing else could have refused those two: with neither the working
+    // directory nor an exported workspace inside it, this tree is just a
+    // directory, and the compiled-in checkout says nothing about it.
+    let unknown = assemble(
+        current.path(),
+        None,
+        checkout.path().join("docs/unprotected"),
+    );
+    assert_eq!(
+        unknown.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    // The discovered checkout still publishes from its own build root, which
+    // is what a relocated run really does.
+    let build_root = assemble(checkout.path(), None, checkout.path().join("target/pages"));
+    assert_eq!(
+        build_root.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build_root.stderr)
+    );
+    assert!(checkout.path().join("target/pages/index.html").is_file());
+}
+
 #[test]
 fn assemble_cli_reports_status_only_retention_without_failure_label() {
     let previous = fixture_site(
@@ -1497,6 +1588,50 @@ mod workflow_contract {
             4,
             "every job-level runner expression the workflow really carried has \
              to be named: {report}"
+        );
+    }
+
+    /// The reduced shape is kept beside the full one. It is written from
+    /// scratch rather than rebuilt from the checked-in workflow, so it keeps
+    /// proving that the pinned linter refuses a job-level runner context even
+    /// if this repository's workflow is one day restructured so far that the
+    /// historical shape can no longer be reconstructed from it.
+    #[test]
+    fn the_pinned_linter_rejects_a_minimal_job_level_runner_context() {
+        let directory = TempDirectory::new("actionlint-minimal");
+        let minimal = directory.path().join("minimal.yml");
+        fs::write(
+            &minimal,
+            concat!(
+                "name: Regression\n",
+                "on:\n",
+                "  push:\n",
+                "    branches: [main]\n",
+                "jobs:\n",
+                "  verify:\n",
+                "    runs-on: ubuntu-latest\n",
+                "    env:\n",
+                "      RESULT: ${{ runner.temp }}/native\n",
+                "    steps:\n",
+                "      - run: echo \"$RESULT\"\n",
+            ),
+        )
+        .expect("the regression workflow should be writable");
+
+        let dirty = run_actionlint(&[minimal.to_string_lossy().into_owned()]);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&dirty.stdout),
+            String::from_utf8_lossy(&dirty.stderr)
+        );
+
+        assert!(
+            !dirty.status.success(),
+            "a job-level runner context must fail the gate: {report}"
+        );
+        assert!(
+            report.contains(r#"context "runner" is not allowed here"#),
+            "{report}"
         );
     }
 
@@ -3276,6 +3411,163 @@ mod publication_inputs {
     // One `sitegen inputs` run and the artifacts it was handed
     // -------------------------------------------------------------------
 
+    /// `inputs` publishes `docs/progress.json` and resolves exactly the
+    /// commits that document names. A document that cannot be read, or that
+    /// does not match the schema, is therefore not a run with no references:
+    /// it is a run that cannot publish. Treating the two the same silently
+    /// drops every reference the real document names and leaves the generator
+    /// to fail later — or, worse, to publish a timeline that resolves nothing.
+    #[test]
+    fn an_unpublishable_progress_document_stops_the_run_that_would_publish_it() {
+        for (case, document) in [
+            ("missing", None),
+            ("unreadable", Some("{ this is not JSON")),
+            (
+                "schema-invalid",
+                Some(r#"{"schema_version":1,"project":"Cell Shift"}"#),
+            ),
+        ] {
+            let repository = TempDirectory::new(&format!("inputs-progress-{case}"));
+            initialize_checkout(repository.path());
+            fs::create_dir_all(repository.path().join("docs")).unwrap();
+            if let Some(document) = document {
+                fs::write(repository.path().join("docs/progress.json"), document).unwrap();
+            }
+            let run = Run::new(&format!("inputs-progress-run-{case}"));
+
+            let finished = run.launch(
+                repository.path().to_str().unwrap(),
+                repository.path(),
+                "skipped",
+                "skipped",
+            );
+            let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+            assert_eq!(
+                finished.status.code(),
+                Some(1),
+                "a {case} progress document must stop the run: {stderr}"
+            );
+            assert!(
+                stderr.contains("progress.json"),
+                "the failure must name the document it could not publish: {stderr}"
+            );
+            assert!(
+                !run.output().join("inputs.json").exists(),
+                "nothing may be handed to the generator from a run that could not read \
+                 the document it was going to publish"
+            );
+        }
+    }
+
+    /// A checkout with one commit, so that the only thing wrong with a
+    /// repository under test is the thing the test put there.
+    fn initialize_checkout(root: &Path) {
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["commit", "--quiet", "--allow-empty", "-m", "root"],
+        ] {
+            let finished = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=midcreek-tests",
+                    "-c",
+                    "user.email=tests@midcreek.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(&arguments)
+                .output()
+                .expect("git should run");
+            assert!(
+                finished.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&finished.stderr)
+            );
+        }
+    }
+
+    /// `build` resolves the relative paths of an inputs document against the
+    /// directory that document lives in — the output directory, which is not
+    /// where a relative `--repository` was ever measured from. The repository
+    /// is therefore resolved once, at inputs time, against the working
+    /// directory it really meant. Publishing the whole real checkout through
+    /// it proves the resolved document works on the documents this repository
+    /// actually carries, not only on fixtures.
+    #[test]
+    fn a_relative_repository_publishes_the_real_documents_of_this_checkout() {
+        let run = Run::new("inputs-relative-repository");
+        run.native(
+            GateStatus::Passed,
+            &[("Clippy lints", GateStatus::Passed)],
+            true,
+        );
+
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let finished = run.launch(".", &checkout, "success", "skipped");
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+
+        let inputs = read_value(&run.output().join("inputs.json"));
+        let canonical = fs::canonicalize(&checkout).unwrap();
+        assert_eq!(
+            Path::new(inputs["repository"].as_str().unwrap()),
+            canonical,
+            "the declared repository must not stay relative: {inputs}"
+        );
+        for document in ["progress", "plan", "reference_manifest"] {
+            let path = Path::new(inputs[document].as_str().unwrap());
+            assert!(
+                path.starts_with(&canonical) && path.is_file(),
+                "{document} must resolve from anywhere: {}",
+                path.display()
+            );
+        }
+
+        // The published page renders the real plan, the real progress
+        // document, and real commit subjects, none of which any fixture
+        // carries. `build` validates its own output, so a page that leaked a
+        // path of this machine, or lost a link, fails right here.
+        let site = run.root.path().join("site");
+        let built = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(run.root.path())
+            .args([
+                "build",
+                "--inputs",
+                run.output().join("inputs.json").to_str().unwrap(),
+                "--output",
+                site.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        assert_eq!(
+            built.status.code(),
+            Some(0),
+            "the real documents must publish: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert!(site.join("index.html").is_file());
+        assert_eq!(
+            String::from_utf8_lossy(&built.stdout).trim(),
+            COMMIT,
+            "the published source commit is the one the run declared"
+        );
+
+        // The page really rendered those documents rather than an empty
+        // stand-in for them: a plan heading the real plan declares, and the
+        // head commit of the real checkout.
+        let page = fs::read_to_string(site.join("index.html")).unwrap();
+        let head = git(&["rev-parse", "HEAD"]);
+        assert!(page.contains(r#"id="plan-ci-baseline""#), "{page}");
+        assert!(page.contains(&head[..8]), "{page}");
+    }
+
     struct Run {
         root: TempDirectory,
         previous: std::cell::Cell<bool>,
@@ -3350,12 +3642,42 @@ mod publication_inputs {
         }
 
         fn execute(&self, native_outcome: &str, web_outcome: &str) -> (WorkflowSummary, Value) {
+            let finished = self.launch(
+                env!("CARGO_MANIFEST_DIR"),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                native_outcome,
+                web_outcome,
+            );
+            assert_eq!(
+                finished.status.code(),
+                Some(0),
+                "sitegen inputs should always publish: {}",
+                String::from_utf8_lossy(&finished.stderr)
+            );
+
+            let output = self.output();
+            let workflow = serde_json::from_str::<WorkflowSummary>(
+                &fs::read_to_string(output.join("workflow.json")).unwrap(),
+            )
+            .expect("the merged result should match the published schema");
+            (workflow, read_value(&output.join("inputs.json")))
+        }
+
+        /// One `sitegen inputs` run against a named repository argument, from
+        /// a named working directory, whatever it exits with.
+        fn launch(
+            &self,
+            repository: &str,
+            working_directory: &Path,
+            native_outcome: &str,
+            web_outcome: &str,
+        ) -> std::process::Output {
             let output = self.output();
             let mut command = Command::new(env!("CARGO_BIN_EXE_sitegen"));
-            command.args([
+            command.current_dir(working_directory).args([
                 "inputs",
                 "--repository",
-                env!("CARGO_MANIFEST_DIR"),
+                repository,
                 "--source-commit",
                 COMMIT,
                 "--run-url",
@@ -3379,20 +3701,7 @@ mod publication_inputs {
                     self.root.path().join("previous").to_str().unwrap(),
                 ]);
             }
-
-            let finished = command.output().expect("sitegen should launch");
-            assert_eq!(
-                finished.status.code(),
-                Some(0),
-                "sitegen inputs should always publish: {}",
-                String::from_utf8_lossy(&finished.stderr)
-            );
-
-            let workflow = serde_json::from_str::<WorkflowSummary>(
-                &fs::read_to_string(output.join("workflow.json")).unwrap(),
-            )
-            .expect("the merged result should match the published schema");
-            (workflow, read_value(&output.join("inputs.json")))
+            command.output().expect("sitegen should launch")
         }
     }
 

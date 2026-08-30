@@ -6,7 +6,7 @@ use std::{
 
 use image::ImageReader;
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
-use scraper::{Html, Node, Selector};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1141,6 +1141,11 @@ pub enum SitegenError {
     PartialEvidencePublication {
         path: PathBuf,
     },
+    /// No candidate source tree resolves, so nothing can vouch for the output
+    /// directory being outside one.
+    UnknownRepository {
+        candidates: Vec<PathBuf>,
+    },
 }
 
 impl fmt::Display for SitegenError {
@@ -1264,6 +1269,16 @@ impl fmt::Display for SitegenError {
                 formatter,
                 "{} is published without the gallery manifest that must accompany a promotion",
                 path.display()
+            ),
+            Self::UnknownRepository { candidates } => write!(
+                formatter,
+                "no source tree to protect resolves on this machine, so the output \
+                 cannot be proved to be outside one: {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -1907,14 +1922,20 @@ const METRIC_BOUNDS: [(&str, MetricBound, &str); 8] = [
 ];
 
 /// How many approved palette classes a published canvas has to show.
-const MINIMUM_PALETTE_CLASSES: usize = 3;
+///
+/// This is the browser gate's own `MINIMUM_PALETTE_CLASSES`, and
+/// `the_published_browser_bounds_are_the_browser_gates_own_constants` pins it
+/// there. A stricter number here would fail a canvas the gate itself passed
+/// and take the native evidence beside it down with the run.
+pub const MINIMUM_PALETTE_CLASSES: usize = 3;
 
 /// The longest a published browser gate may have waited for readiness.
 ///
-/// This is the browser gate's own `READY_TIMEOUT_SECONDS`. A report that
-/// records a longer wait than the gate would ever have allowed did not come
-/// from a passing gate, whatever else it says about itself.
-const BROWSER_READY_LIMIT_SECONDS: f64 = 30.0;
+/// This is the browser gate's own `READY_TIMEOUT_SECONDS`, pinned by the same
+/// test. A report that records a longer wait than the gate would ever have
+/// allowed did not come from a passing gate, whatever else it says about
+/// itself; a shorter bound here would invent a failure the gate never found.
+pub const BROWSER_READY_LIMIT_SECONDS: f64 = 30.0;
 
 #[derive(Clone, Copy)]
 enum MetricBound {
@@ -2234,10 +2255,25 @@ struct PublishedEvidence {
     gallery: GalleryManifest,
     /// The current frames, by stable label.
     current: BTreeMap<String, String>,
+    /// Every frame this build copied into the published tree, in the order it
+    /// copied them.
+    promoted: Vec<PromotedFrame>,
     /// The browser canvas proof, when the gate kept one.
     browser: Option<String>,
     /// Whether this build opened a new point in the history.
     appended: bool,
+}
+
+/// One frame a build copied into `screenshots/current`, and what it shows.
+///
+/// The page links these rather than the frame list the projection carries: the
+/// only pixels a visitor may be pointed at are the ones this build authorized
+/// and copied, so the record that authorized the copy is also the record that
+/// renders it.
+struct PromotedFrame {
+    path: String,
+    stage: String,
+    heading: String,
 }
 
 /// Promotes the current verified frames and updates the visual history.
@@ -2268,10 +2304,16 @@ fn publish_verification(
 
     let mut files = vec![PathBuf::from(VERIFICATION_FILE)];
     let mut current = BTreeMap::new();
+    let mut promoted = Vec::new();
     for frame in &summary.frames {
         let source = resolve_artifact(&evidence.artifacts, &frame.artifact)?;
         let relative = Path::new(CURRENT_SCREENSHOTS).join(&frame.name);
         copy_artifact(&source, &output.join(&relative))?;
+        promoted.push(PromotedFrame {
+            path: format!("{CURRENT_SCREENSHOTS}/{}", frame.name),
+            stage: frame.stage.clone(),
+            heading: frame.heading.clone(),
+        });
         files.push(relative);
     }
     for (label, file) in GALLERY_FRAMES {
@@ -2348,6 +2390,7 @@ fn publish_verification(
         semantic_visual_hash: summary.semantic_visual_hash.clone(),
         gallery,
         current,
+        promoted,
         browser,
         appended,
     }))
@@ -2405,6 +2448,23 @@ pub fn assemble_site(
     workflow: &WorkflowSummary,
     output: &Path,
 ) -> Result<BuildDisposition, SitegenError> {
+    assemble_site_in(&default_repository(), previous, current, workflow, output)
+}
+
+/// Assembles one publication for a declared repository.
+///
+/// Assembly reads nothing out of the repository; it needs one only to know
+/// which source tree it may not publish into. A relocated binary's compiled-in
+/// checkout is not on the machine, so a caller that knows where the checkout
+/// really is passes it here rather than leaving the output guard with nothing
+/// to compare against.
+pub fn assemble_site_in(
+    repository: &Path,
+    previous: Option<&Path>,
+    current: &Path,
+    workflow: &WorkflowSummary,
+    output: &Path,
+) -> Result<BuildDisposition, SitegenError> {
     require_directory(current)?;
 
     let disposition = match (workflow.native, workflow.web, previous) {
@@ -2432,7 +2492,7 @@ pub fn assemble_site(
     );
     let evidence = evidence_publication(current)?;
 
-    prepare_assembly_output(output)?;
+    prepare_assembly_output(repository, output)?;
 
     // The two domains are retained independently. A build may promote verified
     // evidence without producing a game, and a new game never invalidates the
@@ -2790,10 +2850,10 @@ pub fn validate_site_output_in(
         validate_local_target(output, &ids, &retained, &index_path, target)?;
     }
 
-    if let Some(found) = published_absolute_path(repository, &document, &html) {
+    if let Some(found) = published_host_path(repository, output, &html) {
         return Err(invalid_html(
             &index_path,
-            format!("absolute local path is present: {found}"),
+            format!("a path of the publishing machine is present: {found}"),
         ));
     }
 
@@ -2892,8 +2952,8 @@ fn prepare_output(repository: &Path, output: &Path) -> Result<(), SitegenError> 
     })
 }
 
-fn prepare_assembly_output(output: &Path) -> Result<(), SitegenError> {
-    validate_output_path(output)?;
+fn prepare_assembly_output(repository: &Path, output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_in(repository, output)?;
     match fs::symlink_metadata(output) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             Err(SitegenError::UnsafeOutputPath {
@@ -3112,10 +3172,23 @@ pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
 /// Two roots are protected: the repository the caller declared, which is the
 /// checkout this run is publishing from, and the one this binary was compiled
 /// in, which is where a developer's own source tree lives. Declaring a
-/// repository therefore only ever adds protection. A root that is not on this
-/// machine at all — what a relocated binary's compiled-in path is — protects
-/// nothing and is skipped rather than failing the run that no longer has it.
+/// repository therefore only ever adds protection.
 pub fn validate_output_path_in(repository: &Path, output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_under(&[repository.to_path_buf(), default_repository()], output)
+}
+
+/// The same rule against an explicit set of candidate source trees.
+///
+/// A candidate that is not on this machine — what a relocated binary's
+/// compiled-in path is — cannot be compared with anything and is skipped. If
+/// *no* candidate resolves, nothing is left to compare the output against, and
+/// a check that can prove nothing may not report success: a run with no
+/// repository context refuses to publish rather than silently publishing
+/// anywhere.
+pub fn validate_output_path_under(
+    candidates: &[PathBuf],
+    output: &Path,
+) -> Result<(), SitegenError> {
     if output.as_os_str().is_empty() || output == Path::new(".") {
         return Err(SitegenError::UnsafeOutputPath {
             path: output.to_path_buf(),
@@ -3129,13 +3202,18 @@ pub fn validate_output_path_in(repository: &Path, output: &Path) -> Result<(), S
 
     let resolved = resolve_destination(output)?;
     let mut protected = Vec::new();
-    for root in [repository.to_path_buf(), default_repository()] {
-        let Ok(canonical) = fs::canonicalize(&root) else {
+    for root in candidates {
+        let Ok(canonical) = fs::canonicalize(root) else {
             continue;
         };
         if !protected.contains(&canonical) {
             protected.push(canonical);
         }
+    }
+    if protected.is_empty() {
+        return Err(SitegenError::UnknownRepository {
+            candidates: candidates.to_vec(),
+        });
     }
     for root in protected {
         if resolved.starts_with(&root) && !resolved.starts_with(root.join("target")) {
@@ -3755,11 +3833,11 @@ fn render_task(task: &ProgressTask, repo: &RepoFacts) -> String {
 
 fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
     // A promotion copies every captured frame into the published tree, so
-    // every one of them is rendered here. A frame this build published and
-    // linked from nowhere would be weight the site serves and nobody can see.
+    // every one of them is rendered here. The links come from the record that
+    // authorized and made those copies rather than from the projection beside
+    // it, so the page can only ever point at pixels this build really wrote.
     let current = evidence
-        .and(inputs.verification.as_ref())
-        .map(|evidence| render_current_frames(&evidence.summary))
+        .map(|published| render_current_frames(&published.promoted))
         .unwrap_or_default();
     let gallery = evidence
         .map(|published| &published.gallery)
@@ -3839,14 +3917,13 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
 }
 
 /// Every frame this build promoted into `screenshots/current`.
-fn render_current_frames(summary: &VerificationSummary) -> String {
-    let figures = summary
-        .frames
+fn render_current_frames(promoted: &[PromotedFrame]) -> String {
+    let figures = promoted
         .iter()
         .map(|frame| {
             format!(
-                r#"<figure><img src="{CURRENT_SCREENSHOTS}/{}" alt="Verified {} capture at the {} heading" loading="lazy"><figcaption>{}</figcaption></figure>"#,
-                escape_html(&frame.name),
+                r#"<figure><img src="{}" alt="Verified {} capture at the {} heading" loading="lazy"><figcaption>{}</figcaption></figure>"#,
+                escape_html(&frame.path),
                 escape_html(&frame.stage),
                 escape_html(&frame.heading),
                 escape_html(&frame.stage),
@@ -4308,80 +4385,72 @@ fn validate_local_target(
     }
 }
 
-/// The first absolute local path the generated page publishes, if any.
+/// The first path of the publishing machine the generated page names, if any.
 ///
-/// A rule that names one platform's home directory only ever says something
-/// about the machine the last leak came from: the same page rendered on macOS
-/// carries `/Users/...`, on a runner `/home/runner/...`, and from a Windows
-/// checkout a drive letter. What all of them have in common is that they are
-/// absolute, so that is what is refused — across the text the page really
-/// renders and across every attribute value it emits, whatever produced the
-/// content. The repository roots are still named exactly, because a path
-/// inside one is otherwise indistinguishable from the relative paths the site
-/// publishes on purpose.
-fn published_absolute_path(repository: &Path, document: &Html, html: &str) -> Option<String> {
-    for root in [repository.to_path_buf(), default_repository()] {
-        for candidate in [Some(root.clone()), fs::canonicalize(&root).ok()]
+/// A published page is served from a URL, so no location on the machine that
+/// built it ever belongs in one. The rule is stated over the places this run
+/// really used — the repository it published from, the compiled-in checkout,
+/// the directory it published into, the working directory it resolved
+/// relative paths against, and the host roots the environment handed it —
+/// rather than over what an absolute path looks like. The page renders
+/// reserved prose (the plan, the progress document, commit subjects), and
+/// prose legitimately contains absolute paths like `/var/lib/foo` or the
+/// `/midcreek-cs-1/` URL prefix this project is served below. Guessing which
+/// of those is a leak tunes the guard to today's wording; naming this run's
+/// own paths states the invariant the page has to meet whatever it renders.
+fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<String> {
+    for root in host_roots(repository, output) {
+        if html.contains(&root) || html.contains(&escape_html(&root)) {
+            return Some(root);
+        }
+    }
+    // A local filesystem URL is never a published location either: whatever
+    // path follows it, the page is telling a visitor to read the builder's
+    // disk.
+    html.contains("file://").then(|| "file://".to_owned())
+}
+
+/// Every filesystem location this run knows to be on the publishing machine.
+///
+/// Each candidate is taken both as it was handed over and as it canonicalizes,
+/// because a leak carries whichever form the code that leaked it held. A root
+/// shallower than two components — `/`, `/tmp`, `/home` — is a shared system
+/// location rather than an identifying one, and matching it would be a guess
+/// about prose again, so it is not used.
+fn host_roots(repository: &Path, output: &Path) -> Vec<String> {
+    let mut candidates = vec![
+        repository.to_path_buf(),
+        default_repository(),
+        output.to_path_buf(),
+        std::env::temp_dir(),
+    ];
+    candidates.extend(std::env::current_dir());
+    candidates.extend(
+        ["HOME", "USERPROFILE", "RUNNER_TEMP", "GITHUB_WORKSPACE"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from),
+    );
+
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        for path in [Some(candidate.clone()), fs::canonicalize(&candidate).ok()]
             .into_iter()
             .flatten()
         {
-            let text = candidate.to_string_lossy().into_owned();
-            if candidate.is_absolute() && text.len() > 1 && html.contains(&text) {
-                return Some(text);
+            let identifying = path.is_absolute()
+                && path
+                    .components()
+                    .filter(|component| matches!(component, std::path::Component::Normal(_)))
+                    .count()
+                    >= 2;
+            let text = path.to_string_lossy().into_owned();
+            if identifying && !roots.contains(&text) {
+                roots.push(text);
             }
         }
     }
-    if html.contains("file://") {
-        return Some("file://".to_owned());
-    }
-
-    for node in document.tree.nodes() {
-        match node.value() {
-            Node::Text(text) => {
-                if let Some(found) = absolute_path_token(text) {
-                    return Some(found);
-                }
-            }
-            Node::Element(element) => {
-                for (_, value) in element.attrs() {
-                    if let Some(found) = absolute_path_token(value) {
-                        return Some(found);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The first whitespace-delimited token of one published string that names an
-/// absolute filesystem path.
-///
-/// An absolute path names at least two components below the root: that is what
-/// separates `/home/runner/work` and `/Users/someone/checkout` from the single
-/// URL path prefix (`/midcreek-cs-1/`) this project's own prose really talks
-/// about, and from a lone separator or a prose slash. Every relative path the
-/// site publishes on purpose fails the leading-root test outright.
-fn absolute_path_token(value: &str) -> Option<String> {
-    value.split_whitespace().find_map(|token| {
-        // Only trailing punctuation is dropped: a leading `.` is part of the
-        // relative paths the site publishes on purpose, and trimming it would
-        // turn `../midcreek-concept/...` into something that looks absolute.
-        let token = token
-            .trim_start_matches(['"', '\'', '(', '[', '{', '`'])
-            .trim_end_matches(['"', '\'', ')', ']', '}', ',', ';', ':', '.', '`']);
-        let posix = token.strip_prefix('/').is_some_and(|rest| {
-            rest.starts_with(|value: char| value.is_ascii_alphanumeric())
-                && rest.split('/').filter(|part| !part.is_empty()).count() >= 2
-        });
-        let bytes = token.as_bytes();
-        let windows = bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'/' | b'\\');
-        (posix || windows).then(|| token.to_owned())
-    })
+    roots
 }
 
 /// Every history frame the published gallery manifest vouches for.

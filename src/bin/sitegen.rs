@@ -18,7 +18,7 @@ mod native {
             BrowserGateReport, CommitSummary, GalleryManifest, GateStatus, GateSummary, JobOutcome,
             JobReport, JobResult, PlayableBuild, ProgressDocument, ProgressStatus, RESULT_FILE,
             ReferenceManifest, RepoFacts, SiteInputs, VerificationEvidence, WorkflowSummary,
-            assemble_site, build_site_in, default_repository, gate_verdict, merge_job_results,
+            assemble_site_in, build_site_in, default_repository, gate_verdict, merge_job_results,
             missing_playable_parts, plan_task_ids_from_markdown, read_gate_records,
             validate_job_result, validate_progress, validate_reference_manifest,
             validate_workflow_summary,
@@ -321,7 +321,7 @@ mod native {
         let root = inputs_path.parent().unwrap_or_else(|| Path::new("."));
         let repository = paths
             .repository
-            .map_or_else(default_repository, |declared| root.join(declared));
+            .map_or_else(runtime_repository, |declared| root.join(declared));
         let progress_path = root.join(paths.progress);
         let plan_path = root.join(paths.plan);
         let reference_path = root.join(paths.reference_manifest);
@@ -424,13 +424,36 @@ mod native {
         if let Err(error) = validate_workflow_summary(&workflow) {
             return content_error(error.to_string());
         }
-        match assemble_site(previous, current, &workflow, output) {
+        match assemble_site_in(&runtime_repository(), previous, current, &workflow, output) {
             Ok(disposition) => {
                 println!("{disposition}");
                 ExitCode::SUCCESS
             }
             Err(error) => content_error(error.to_string()),
         }
+    }
+
+    /// The checkout this invocation is really running against.
+    ///
+    /// Nothing is read out of it: it is the source tree the output may not be
+    /// written into. The compiled-in path is the last resort because a
+    /// relocated binary's is not on the machine at all, and a run that can name
+    /// no source tree refuses to publish rather than publishing anywhere. The
+    /// workflow declares nothing extra for this: a job that checked the
+    /// repository out either exported `GITHUB_WORKSPACE` or is running inside
+    /// the checkout.
+    fn runtime_repository() -> PathBuf {
+        env::var_os("GITHUB_WORKSPACE")
+            .map(PathBuf::from)
+            .filter(|workspace| workspace.join(".git").exists())
+            .or_else(|| {
+                let working = env::current_dir().ok()?;
+                working
+                    .ancestors()
+                    .find(|ancestor| ancestor.join(".git").exists())
+                    .map(Path::to_path_buf)
+            })
+            .unwrap_or_else(default_repository)
     }
 
     // -----------------------------------------------------------------------
@@ -550,6 +573,19 @@ mod native {
             return content_error(format!("{}: {error}", output.display()));
         }
 
+        // Every path this document publishes is built from the repository
+        // root, and `build` resolves the document's own relative paths against
+        // the directory the document lives in. A relative `--repository` would
+        // therefore be reinterpreted against the output directory later, so it
+        // is resolved once, here, against the working directory it was really
+        // meant for.
+        let repository = &match fs::canonicalize(repository) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return content_error(format!("{}: {error}", repository.display()));
+            }
+        };
+
         let native_report = read_job_report(native, native_outcome);
         let web_report = read_job_report(web, web_outcome);
         let mut extra = Vec::new();
@@ -572,11 +608,15 @@ mod native {
 
         // The site resolves exactly the commits the progress document it
         // publishes names, so that document decides which commits have to be
-        // looked up at all.
-        let published_progress =
-            read_json::<ProgressDocument>(&repository.join("docs/progress.json"))
-                .map(|progress| referenced_commits(&progress))
-                .unwrap_or_default();
+        // looked up at all. It is the document this run is about to publish:
+        // one that cannot be read, or that does not match the schema, is a
+        // failure of this run rather than a run with no references, because
+        // publishing it is exactly what happens next.
+        let progress_path = repository.join("docs/progress.json");
+        let published_progress = match read_json::<ProgressDocument>(&progress_path) {
+            Ok(progress) => referenced_commits(&progress),
+            Err(message) => return content_error(message),
+        };
         let repo = match read_repo_facts(repository, &published_progress) {
             Ok(repo) => repo,
             Err(message) => return content_error(message),
@@ -592,7 +632,7 @@ mod native {
 
         let paths = SiteInputPaths {
             repository: Some(repository.to_path_buf()),
-            progress: repository.join("docs/progress.json"),
+            progress: progress_path,
             plan: repository.join("docs/implementation-plan.md"),
             reference_manifest: repository.join("docs/reference/manifest.json"),
             workflow: PathBuf::from("workflow.json"),

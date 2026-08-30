@@ -343,40 +343,78 @@ mod output_validation_contract {
         );
     }
 
-    /// The generator runs on macOS locally and on Linux in CI, and a page may
-    /// carry a path from either. A rule that only names one platform's home
-    /// directory proves nothing about the other, so the guard is stated over
-    /// what an absolute path *is* rather than over where the last leak came
-    /// from.
+    /// A published page is served from a URL, so no location on the machine
+    /// that built it belongs in one — in rendered text, in an attribute, or
+    /// anywhere else in the document. The rule names the paths this run really
+    /// used rather than guessing which absolute-looking prose is a leak.
     #[test]
-    fn rejects_an_absolute_local_path_from_any_platform_in_rendered_text() {
-        for absolute in [
-            "/home/runner/work/midcreek-cs-1/checkout",
-            "/Users/example/checkout/site",
-            "/var/folders/kt/T/midcreek-render",
-        ] {
-            let site = build_fixture_site("green").unwrap();
-            mutate_index(&site, |html| {
-                html.replace(
-                    "Render the progress hub",
-                    &format!("Rendered from {absolute}"),
-                )
-            });
+    fn rejects_a_path_of_the_machine_that_published_the_page() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let mut leaks = vec![
+            repository.join("docs/reference").display().to_string(),
+            fs::canonicalize(repository).unwrap().display().to_string(),
+            "file:///anywhere/at/all".to_owned(),
+        ];
+        leaks.extend(
+            home.filter(|home| home.is_absolute())
+                .map(|home| home.join("checkout/site").display().to_string()),
+        );
 
-            let result = validate_site_output(site.root(), &fixture("green/progress.json"));
-            assert!(
-                matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
-                    if message.contains("absolute local path")),
-                "{absolute} survived validation: {result:?}"
-            );
+        for leak in leaks {
+            for (label, mutation) in [
+                ("rendered text", "Rendered from {leak}"),
+                ("an attribute", r#"<span title="{leak}">from</span>"#),
+            ] {
+                let site = build_fixture_site("green").unwrap();
+                let injected = mutation.replace("{leak}", &leak);
+                mutate_index(&site, |html| {
+                    html.replace("Render the progress hub", &injected)
+                });
+
+                // The site root is itself one of this run's own locations, so
+                // the guard is asked about the repository it published from.
+                let result = midcreek_cs_1::sitegen::validate_site_output_in(
+                    repository,
+                    site.root(),
+                    &fixture("green/progress.json"),
+                );
+                assert!(
+                    matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                        if message.contains("path of the publishing machine")),
+                    "{leak} survived validation in {label}: {result:?}"
+                );
+            }
         }
     }
 
-    /// The same rule may not fire on the relative paths the page publishes on
-    /// purpose, on the prose that merely contains a slash, or on the served
-    /// URL prefix this project's own published prose really talks about.
+    /// The directory a page was published into is a location on the same
+    /// machine, and a build that names its own output is leaking the runner's
+    /// layout just as surely as one that names the checkout.
     #[test]
-    fn accepts_the_relative_paths_and_prose_slashes_the_page_really_publishes() {
+    fn rejects_the_output_directory_the_page_was_published_into() {
+        let site = build_fixture_site("green").unwrap();
+        let output = site.root().display().to_string();
+        mutate_index(&site, |html| {
+            html.replace("Render the progress hub", &format!("Written to {output}"))
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+
+        assert!(
+            matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                if message.contains("path of the publishing machine")),
+            "{result:?}"
+        );
+    }
+
+    /// The same rule may not fire on the relative paths the page publishes on
+    /// purpose, on prose that merely contains a slash, or on the absolute
+    /// paths the reserved plan, progress, and commit prose really contain. A
+    /// guard tuned to what an absolute path looks like rejects a checked-in
+    /// sentence about `/var/lib` and stops the whole publication for it.
+    #[test]
+    fn accepts_the_relative_paths_and_absolute_prose_the_page_really_publishes() {
         let site = build_fixture_site("verified-game").unwrap();
         let html = site.index_html();
 
@@ -391,18 +429,60 @@ mod output_validation_contract {
             Ok(())
         );
 
-        // The canonical challenge record really says this, and it names the
-        // URL prefix the game is served below rather than anything on the
-        // machine that built the page.
-        mutate_index(&site, |html| {
-            html.replace(
-                "Working on",
-                "Served below the /midcreek-cs-1/ project prefix. Working on",
-            )
-        });
-        assert_eq!(
-            validate_site_output(site.root(), &fixture("verified-game/progress.json")),
-            Ok(())
+        // Each of these really appears in this project's own published prose
+        // or is exactly the kind of sentence it may carry next: the URL prefix
+        // the game is served below, a system path that belongs to no machine
+        // in particular, and a documentation path.
+        for prose in [
+            "Served below the /midcreek-cs-1/ project prefix.",
+            "The daemon keeps its state in /var/lib/midcreek.",
+            "Installed alongside /usr/share/doc/midcreek/README.",
+        ] {
+            let site = build_fixture_site("verified-game").unwrap();
+            mutate_index(&site, |html| {
+                html.replace("Working on", &format!("{prose} Working on"))
+            });
+            assert_eq!(
+                validate_site_output(site.root(), &fixture("verified-game/progress.json")),
+                Ok(()),
+                "{prose} is prose, not a leak"
+            );
+        }
+    }
+
+    /// Commit subjects are free text this repository writes and the page
+    /// renders verbatim, so they are the most likely carrier of a real leak
+    /// and of legitimate absolute prose alike. Both are decided here, on the
+    /// same field, by whether the path belongs to the publishing machine.
+    #[test]
+    fn a_commit_subject_may_carry_prose_paths_but_never_the_checkout() {
+        let leaked = format!(
+            "fix: publish from {}",
+            Path::new(env!("CARGO_MANIFEST_DIR")).display()
+        );
+        let mut inputs = site_inputs("green");
+        assert!(
+            !inputs.repo.commits.is_empty(),
+            "this fixture publishes a commit timeline"
+        );
+        inputs.repo.commits[0].subject = leaked.clone();
+
+        let result = build_site_from_inputs("commit-subject-leak", &inputs);
+        assert!(
+            matches!(&result.as_ref().err(), Some(SitegenError::InvalidHtml { message, .. })
+                if message.contains("path of the publishing machine")),
+            "{leaked} must never reach the page: {:?}",
+            result.err()
+        );
+
+        inputs.repo.commits[0].subject =
+            "fix: read the seed from /var/lib/midcreek/seed.json".to_owned();
+        let published = build_site_from_inputs("commit-subject-prose", &inputs)
+            .expect("an ordinary absolute path in a subject is not a leak")
+            .index_html();
+        assert!(
+            published.contains("/var/lib/midcreek/seed.json"),
+            "{published}"
         );
     }
 
@@ -445,7 +525,10 @@ mod output_validation_contract {
 
 mod build_safety_contract {
     use super::*;
-    use midcreek_cs_1::sitegen::{trusted_playable_roots_in, validate_output_path_in};
+    use midcreek_cs_1::sitegen::{
+        trusted_playable_roots_in, validate_output_path_in, validate_output_path_under,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_source_directories_as_site_output() {
@@ -509,6 +592,45 @@ mod build_safety_contract {
         assert_eq!(
             validate_output_path_in(declared.path(), &source),
             Err(SitegenError::UnsafeOutputPath { path: source })
+        );
+    }
+
+    /// A relocated binary's compiled-in checkout is not on the machine, and a
+    /// caller that declares no repository of its own leaves the guard with
+    /// nothing to compare the output against. Skipping the roots that do not
+    /// resolve is what lets a relocated run work at all, so the case where
+    /// *none* of them resolves is the one that must refuse: a check that can
+    /// prove nothing may not report success.
+    #[test]
+    fn an_output_path_with_no_resolvable_source_tree_is_refused() {
+        let declared = relocated_repository("no-resolvable-root");
+        let output = declared.path().join("target/site");
+        let missing = [
+            PathBuf::from("/midcreek-no-such-declared-checkout"),
+            PathBuf::from("/midcreek-no-such-compiled-checkout"),
+        ];
+
+        assert_eq!(
+            validate_output_path_under(&missing, &output),
+            Err(SitegenError::UnknownRepository {
+                candidates: missing.to_vec(),
+            }),
+            "a run that can name no source tree must refuse to publish"
+        );
+        assert_eq!(
+            validate_output_path_under(&[declared.path().to_path_buf()], &output),
+            Ok(()),
+            "one resolvable root is all the same output needs to be accepted"
+        );
+        assert_eq!(
+            validate_output_path_under(
+                &[missing[0].clone(), declared.path().to_path_buf()],
+                &declared.path().join("docs")
+            ),
+            Err(SitegenError::UnsafeOutputPath {
+                path: declared.path().join("docs"),
+            }),
+            "an unresolvable root beside a real one must not weaken the real one"
         );
     }
 
@@ -1864,6 +1986,26 @@ process.exit(0);
             .unwrap_or_else(|| panic!("{name} must be a number, found {line}"))
     }
 
+    /// The generator judges a published browser report against bounds of its
+    /// own. Those bounds are only honest if they are the gate's: a stricter
+    /// readiness limit fails a browser the gate itself let through, a stricter
+    /// palette floor fails a canvas it accepted, and either verdict marks the
+    /// whole run unsuccessful — which suppresses the fourteen native frames
+    /// beside it, none of which the browser had anything to do with.
+    #[test]
+    fn the_published_browser_bounds_are_the_browser_gates_own_constants() {
+        assert_eq!(
+            midcreek_cs_1::sitegen::BROWSER_READY_LIMIT_SECONDS,
+            gate_constant("READY_TIMEOUT_SECONDS"),
+            "the published readiness bound must be the gate's own timeout"
+        );
+        assert_eq!(
+            midcreek_cs_1::sitegen::MINIMUM_PALETTE_CLASSES as f64,
+            gate_constant("MINIMUM_PALETTE_CLASSES"),
+            "the published palette floor must be the gate's own minimum"
+        );
+    }
+
     #[test]
     fn the_browser_gate_proves_keyboard_ownership_against_the_neutral_probe() {
         let gate = source("scripts/browser_gate.py");
@@ -3176,6 +3318,46 @@ mod verification_publication_contract {
                 "{target} was promoted but the page links nothing to it"
             );
         }
+    }
+
+    /// The other direction of the same rule: the current-frame strip may only
+    /// point at pixels this build itself copied. The projection the strip used
+    /// to be rendered from is an input that describes what a run *reported*;
+    /// the publication record describes what was really written, and only the
+    /// second one can vouch for a link. When the two disagree the page has to
+    /// follow the copies, because a visitor can only open a file that exists.
+    #[test]
+    fn the_current_frame_strip_links_exactly_the_frames_this_build_copied() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let document = scraper::Html::parse_document(&site.index_html());
+        let selector = scraper::Selector::parse("#screenshots img[src]").unwrap();
+        let linked = document
+            .select(&selector)
+            .filter_map(|image| image.value().attr("src"))
+            .filter(|source| source.starts_with(&format!("{CURRENT_SCREENSHOTS}/")))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        let mut published = Vec::new();
+        collect_relative(
+            &site.root().join(CURRENT_SCREENSHOTS),
+            site.root(),
+            &mut published,
+        );
+        // The technician crop and the browser canvas are derived proofs shown
+        // beside the references they are compared with, not captures of the
+        // run, so the strip is the whole of the rest.
+        let captured = published
+            .iter()
+            .map(|file| file.to_string_lossy().into_owned())
+            .filter(|file| !file.ends_with(WORKER_CROP_FILE) && !file.ends_with(BROWSER_FRAME_FILE))
+            .collect::<BTreeSet<_>>();
+
+        assert!(captured.len() > 1, "{captured:?}");
+        assert_eq!(
+            linked, captured,
+            "the strip must link the frames this build copied, no more and no less"
+        );
     }
 
     #[test]
