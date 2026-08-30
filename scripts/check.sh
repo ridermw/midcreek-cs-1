@@ -120,8 +120,21 @@ browser_available() {
   return 1
 }
 
+# `rustup target list --installed | grep -q ...` is a false skip waiting to
+# happen. `grep -q` exits at the first match, `rustup` is then killed by
+# SIGPIPE, and `pipefail` reports the whole pipeline as failed — so an
+# installed target reads as a missing one and the browser gate below is skipped
+# while the run still looks green. That is the one failure this script must
+# never have, so the list is captured before anything reads it and nothing is
+# ever asked to write into a closed pipe.
+wasm_target_installed() {
+  local installed
+  installed="$(rustup target list --installed)" || return 1
+  grep -qx wasm32-unknown-unknown <<<"$installed"
+}
+
 if command -v wasm-bindgen >/dev/null 2>&1 \
-  && rustup target list --installed | grep -qx wasm32-unknown-unknown \
+  && wasm_target_installed \
   && browser_available; then
   step "playable web build and browser gate"
   ./scripts/build-web.sh "$web_package"
