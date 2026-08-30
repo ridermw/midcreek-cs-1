@@ -242,6 +242,24 @@
       "approach": "Two rejected alternatives shaped this. Running each gate as its own workflow step with `continue-on-error` loses the measured duration and forces every result to be reassembled from step outcomes in workflow expressions, which cannot be tested anywhere. Parsing the job log for results was rejected outright: raw command output is exactly what may never reach a public page.",
       "resolution": "scripts/run-gate.sh runs one named gate, measures its wall clock, appends a single line naming the gate, its status, and its duration, and always exits zero, so every later gate still runs. Each job then summarizes those lines into a strict result manifest, uploads the manifest with its evidence in an `if: always()` step, and only afterwards fails once in a verdict step of its own. Publish merges the two manifests, synthesizing skipped and failed rows for a job that produced none, so a job that never uploaded anything publishes the gap it left instead of a silent green.",
       "resolved_commit": "HEAD"
+    },
+    {
+      "id": "capture-waits-consume-the-active-work-watchdog",
+      "title": "Screenshot readback time consumed the active-work watchdog",
+      "status": "open",
+      "impact": "The Ubuntu llvmpipe verification run reached the keyboard journey after landing real screenshots, then failed because the 45-second state-machine watchdog counted time already governed by each capture's independent timeout. A progressing but slow software renderer was therefore indistinguishable from a stuck application.",
+      "approach": "Measure only active non-capture work in the child, settle each capture wait exactly once, keep the per-capture timeout responsible for lost callbacks, and derive the parent process cap from the active-work budget, the number of named frames, each capture budget, and the launch margin. Keep the challenge open until the corrected behavior passes the live Linux workflow.",
+      "resolution": null,
+      "resolved_commit": null
+    },
+    {
+      "id": "retained-game-is-not-rendered-on-the-homepage",
+      "title": "A retained playable build exists but the homepage hides it",
+      "status": "open",
+      "impact": "After a failed current run, status-always assembly keeps the previous play package, so the direct /play/ route works, but site generation receives no current playable candidate and renders the homepage's no-game state. Visitors cannot discover or launch the verified retained game from the project homepage.",
+      "approach": "Separate the current candidate from the playable build displayed by the homepage. Failed runs must publish current red status while rendering the retained game's commit metadata, iframe, and direct-play link without claiming that the failed commit verified those bytes. Cover the fallback through assembly tests and a real homepage browser journey.",
+      "resolution": null,
+      "resolved_commit": null
     }
   ]
 }
