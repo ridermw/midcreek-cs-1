@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -245,6 +246,32 @@ class WebSocketReassemblyTest(unittest.TestCase):
             client.receive()
 
         self.assertIn("masked", str(failure.exception))
+
+
+# ---------------------------------------------------------------------------
+# Readiness deadline
+# ---------------------------------------------------------------------------
+
+
+class BrowserReadinessDeadlineTest(unittest.TestCase):
+    def test_ready_observed_after_the_deadline_is_not_accepted(self) -> None:
+        class Session:
+            def __init__(self) -> None:
+                self.answers = iter(["ready", []])
+
+            def evaluate(self, _expression: str) -> object:
+                return next(self.answers)
+
+        with (
+            patch.object(
+                browser_gate.time,
+                "monotonic",
+                side_effect=[0.0, 29.9, 30.1],
+            ),
+            patch.object(browser_gate, "write_diagnostics"),
+            self.assertRaises(GateFailure),
+        ):
+            browser_gate.wait_for_ready(Session(), Path("."))
 
 
 # ---------------------------------------------------------------------------

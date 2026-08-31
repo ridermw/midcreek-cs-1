@@ -139,6 +139,922 @@ fn web_failure_retains_previous_game_with_failure_disposition() {
     assert_eq!(sha256(output.path().join("play/game_bg.wasm")), old_hash);
 }
 
+// ---------------------------------------------------------------------------
+// The homepage displayed by assembly must agree with the game assembly
+// really retained, distinct from whatever the failing current run produced.
+// ---------------------------------------------------------------------------
+
+/// A previous publication's complete package plus the retained metadata that
+/// names the commit it was built from.
+fn previous_retained_playable(name: &str) -> TempDirectory {
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    fixture_site(name, &files)
+}
+
+/// A `current` tree exactly as `build_site` leaves one when the run produced
+/// no playable candidate of its own: the reconcilable `{{PLAY}}`/`{{MODE}}`
+/// sections are marked, and the pending panel carries no `play-embed` iframe.
+/// The status grid mirrors `render_status`'s own shape for a failed run at
+/// `workflow_summary`'s commit, so tests can assert it survives reconciliation
+/// untouched.
+const PENDING_CURRENT_PAGE: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<div class="status-grid"><div class="status-item"><span>Source</span><strong>CURRENT SOURCE: FAILED AT 11111111</strong></div>
+<div class="status-item"><span>Native</span><strong class="status-failed">Failed</strong></div>
+<div class="status-item"><span>Web</span><strong class="status-skipped">Not run</strong></div></div>
+<!--play--><div class="play-frame" role="img" aria-label="pending"><div class="empty-state play-empty"><h2>No verified playable build yet</h2></div></div><!--/play-->
+<!--mode--><div class="hero-badge"><strong>Status</strong><small>Game pending verification</small></div><!--/mode-->
+</main></body></html>"#;
+
+#[test]
+fn a_failed_run_with_a_complete_retained_package_shows_the_playable_iframe() {
+    let previous = previous_retained_playable("previous-retained-playable");
+    let current = fixture_site(
+        "current-failed-no-candidate",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("failed-retained-playable-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        // The current run's own commit, distinct from the retained one.
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains(r#"<iframe class="play-embed" src="play/index.html""#),
+        "the retained package must be embedded: {index}"
+    );
+    assert!(
+        index.contains(r#"<a href="play/index.html">"#),
+        "a direct play link must point at the retained package: {index}"
+    );
+    assert!(
+        !index.contains("No verified playable build yet"),
+        "the pending panel must not survive a real retained package: {index}"
+    );
+    assert!(
+        index.contains(r#"<dt>Playable build</dt><dd><code>22222222</code></dd>"#),
+        "the retained commit must be named honestly: {index}"
+    );
+    // Production only ever renders the short SHA, so the meaningful refusal
+    // is that the *current* run's own short SHA is never credited as the
+    // retained build, not merely that the full 40-char SHA is absent (it
+    // never appears anywhere, bug or not).
+    assert!(
+        !index.contains(r#"<dt>Playable build</dt><dd><code>11111111</code></dd>"#),
+        "the failed current commit must never be credited with the retained game: {index}"
+    );
+    assert!(
+        index.contains(">Retained<"),
+        "the mode badge must distinguish a retained game from a current one: {index}"
+    );
+    assert!(!index.contains(">Status<"), "{index}");
+    // The current run's own failing source and gate status must survive
+    // reconciliation untouched: reconciling the playable panel must never
+    // touch the status grid that reports the current run's own truth.
+    assert!(
+        index.contains("CURRENT SOURCE: FAILED AT 11111111"),
+        "the current run's own failing source must be preserved verbatim: {index}"
+    );
+    assert!(
+        index.contains(r#"<strong class="status-failed">Failed</strong>"#),
+        "the current run's own gate status must be preserved verbatim: {index}"
+    );
+    // The retained iframe path really resolves against the assembled tree.
+    validate_assembled_links(output.path()).unwrap();
+}
+
+#[test]
+fn a_status_only_retention_without_failure_also_shows_the_playable_iframe() {
+    let previous = previous_retained_playable("previous-retained-playable-status-only");
+    let current = fixture_site(
+        "current-status-only-no-candidate",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("status-only-retained-playable-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains(r#"<iframe class="play-embed" src="play/index.html""#),
+        "{index}"
+    );
+}
+
+#[test]
+fn a_run_that_already_shows_its_own_game_is_left_exactly_as_it_is() {
+    let previous = previous_retained_playable("previous-retained-playable-superseded");
+    let current = fixture_site(
+        "current-with-its-own-game",
+        &[(
+            "index.html",
+            r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play--><div class="play-frame play-frame-live"><iframe class="play-embed" src="play/index.html"></iframe></div><!--/play-->
+<!--mode--><div class="hero-badge"><strong>Verified</strong></div><!--/mode-->
+</main></body></html>"#,
+        )],
+    );
+    let output = TempDirectory::new("already-playable-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &status_only_workflow(),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(index.contains(">Verified<"), "{index}");
+}
+
+#[test]
+fn malformed_retained_metadata_leaves_the_homepage_pending() {
+    let mut files = vec![("last-green.json", "not json")];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-malformed-metadata", &files);
+    let current = fixture_site(
+        "current-failed-malformed-metadata",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("malformed-metadata-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "a retained package with unparsable metadata must never be trusted: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+#[test]
+fn an_incomplete_retained_package_leaves_the_homepage_pending() {
+    let previous = fixture_site(
+        "previous-incomplete-package",
+        &[
+            (
+                "last-green.json",
+                r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":null,"game_files":["play/index.html"],"screenshot_files":[]}"#,
+            ),
+            ("play/index.html", "old shell"),
+        ],
+    );
+    let current = fixture_site(
+        "current-failed-incomplete-retained",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("incomplete-retained-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "an incomplete retained package must never be embedded: {index}"
+    );
+}
+
+#[test]
+fn a_retained_source_commit_that_is_not_a_full_sha_leaves_the_homepage_pending() {
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"not-a-real-commit-sha","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-unsafe-commit-text", &files);
+    let current = fixture_site(
+        "current-failed-unsafe-commit-text",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("unsafe-commit-text-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "a retained commit that is not a full SHA must never be trusted as provenance: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+#[test]
+fn retained_metadata_declaring_a_file_list_inconsistent_with_its_package_leaves_the_homepage_pending()
+ {
+    // The package on disk is structurally complete (every required file and
+    // the assets directory are present), but the manifest's own declared
+    // file list disagrees with it by naming a file the package does not
+    // actually contain alongside the real ones. `missing_playable_parts`
+    // alone cannot catch this: it only checks the fixed required set, never
+    // cross-checks the manifest's own declared list against reality.
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/decoy-file-not-really-published.json","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-inconsistent-file-list", &files);
+    let current = fixture_site(
+        "current-failed-inconsistent-file-list",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("inconsistent-file-list-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "a manifest whose declared file list disagrees with its package must never be trusted: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+/// A pending current page whose `{{PLAY}}` and `{{MODE}}` markers are
+/// malformed so that their located spans cross: the `mode` open marker sits
+/// inside what `marked_span("play", ..)` reports as the play span, and the
+/// `mode` close marker sits after it, so the two ranges overlap instead of
+/// nesting cleanly one after the other.
+const CROSSING_MARKERS_PAGE: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->PLAY_BODY<!--mode-->MODE_BODY<!--/play-->TAIL<!--/mode-->
+</main></body></html>"#;
+
+#[test]
+fn crossing_play_and_mode_markers_are_refused_without_partial_reconciliation() {
+    let previous = previous_retained_playable("previous-retained-playable-crossing-markers");
+    let current = fixture_site(
+        "current-failed-crossing-markers",
+        &[("index.html", CROSSING_MARKERS_PAGE)],
+    );
+    let output = TempDirectory::new("crossing-markers-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert_eq!(
+        index, CROSSING_MARKERS_PAGE,
+        "crossing/nested play and mode marker spans must be refused verbatim, \
+         never partially reconciled: {index}"
+    );
+}
+
+/// A `{{PLAY}}` section with two opening markers before its single closing
+/// marker. `marked_span`'s naive first-open/first-close search locates the
+/// span from the *first* open to the *first* close, so a replacement would
+/// consume only `<!--play-->PLAY_ONE<!--play-->PLAY_TWO<!--/play-->` and
+/// leave the literal `TAIL` text stranded in the assembled page. The `mode`
+/// marker pair is well-formed and disjoint from that (wrongly) located play
+/// span, so this defect is isolated from the already-covered play/mode
+/// crossing case above: it is a defect entirely within one marker name.
+const DUPLICATE_OPENING_PLAY_MARKERS: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->PLAY_ONE<!--play-->PLAY_TWO<!--/play-->TAIL
+<!--mode-->MODE_BODY<!--/mode-->
+</main></body></html>"#;
+
+/// A `{{PLAY}}` section with two closing markers after its single opening
+/// marker. The naive search locates `<!--play-->PLAY_ONE<!--/play-->` as the
+/// span, stranding the literal `TAIL<!--/play-->` text after it.
+const DUPLICATE_CLOSING_PLAY_MARKERS: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->PLAY_ONE<!--/play-->TAIL<!--/play-->
+<!--mode-->MODE_BODY<!--/mode-->
+</main></body></html>"#;
+
+/// A `{{PLAY}}` section nested inside another same-named section:
+/// `<!--play-->A<!--play-->B<!--/play-->C<!--/play-->`. The naive search
+/// locates only the inner `<!--play-->B<!--/play-->` pair, stranding both the
+/// leading duplicate opening marker and the trailing `C<!--/play-->` text.
+const SAME_NAME_NESTED_PLAY_MARKERS: &str = r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play-->A<!--play-->B<!--/play-->C<!--/play-->
+<!--mode-->MODE_BODY<!--/mode-->
+</main></body></html>"#;
+
+#[test]
+fn duplicate_or_nested_same_name_play_markers_are_refused_without_partial_reconciliation() {
+    for malformed_page in [
+        DUPLICATE_OPENING_PLAY_MARKERS,
+        DUPLICATE_CLOSING_PLAY_MARKERS,
+        SAME_NAME_NESTED_PLAY_MARKERS,
+    ] {
+        let previous = previous_retained_playable("previous-retained-playable-duplicate-markers");
+        let current = fixture_site(
+            "current-failed-duplicate-markers",
+            &[("index.html", malformed_page)],
+        );
+        let output = TempDirectory::new("duplicate-markers-output");
+
+        assemble_site(
+            Some(previous.path()),
+            current.path(),
+            &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+            output.path(),
+        )
+        .unwrap();
+
+        let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert_eq!(
+            index, *malformed_page,
+            "a play marker with more than one opening or closing tag for the \
+             same name must be refused verbatim, never partially \
+             reconciled: {index}"
+        );
+    }
+}
+
+/// Two chained `assemble_site` runs, the second treating the first's output
+/// as its own `previous`, so a test can prove whether an inconsistency this
+/// round is still caught the *next* round rather than being silently
+/// resynced away.
+fn assemble_twice_with_untrusted_previous(
+    previous: &Path,
+    intermediate_name: &str,
+    final_name: &str,
+) -> TempDirectory {
+    let current_one = fixture_site(
+        &format!("{intermediate_name}-current"),
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let intermediate = TempDirectory::new(intermediate_name);
+    assemble_site(
+        Some(previous),
+        current_one.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        intermediate.path(),
+    )
+    .unwrap();
+
+    let current_two = fixture_site(
+        &format!("{final_name}-current"),
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new(final_name);
+    assemble_site(
+        Some(intermediate.path()),
+        current_two.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+    output
+}
+
+#[test]
+fn an_inconsistent_retained_file_list_is_never_rehabilitated_by_the_next_publication() {
+    // The manifest's declared file list disagrees with its own package (an
+    // extra file that does not exist), exactly like
+    // `retained_metadata_declaring_a_file_list_inconsistent_with_its_package_leaves_the_homepage_pending`.
+    // That test only proves *this* round stays pending. This test proves the
+    // inconsistency itself is not quietly repaired into trustworthy
+    // provenance for the *next* round to pick up.
+    let mut files = vec![(
+        "last-green.json",
+        r#"{"source_commit":"2222222222222222222222222222222222222222","semantic_visual_hash":"aaaaaaaa","game_files":["play/assets/generated/rack.glb","play/decoy-file-not-really-published.json","play/game.js","play/game_bg.wasm","play/index.html","play/play.css","play/play.js"],"screenshot_files":[]}"#,
+    )];
+    files.extend_from_slice(COMPLETE_PACKAGE);
+    let previous = fixture_site("previous-inconsistent-file-list-chained", &files);
+
+    let output = assemble_twice_with_untrusted_previous(
+        previous.path(),
+        "inconsistent-file-list-intermediate",
+        "inconsistent-file-list-final",
+    );
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains("No verified playable build yet"),
+        "an inconsistency detected one round must still be refused the next round, \
+         not silently rehabilitated by the intervening resync: {index}"
+    );
+    assert!(!index.contains("play-embed"), "{index}");
+}
+
+#[test]
+fn current_evidence_is_never_credited_from_a_run_that_attempted_no_verification_of_its_own() {
+    let previous = previous_retained_playable("previous-retained-playable-with-succeeded-evidence");
+    // The previous publication's own run succeeded. A naive read of the
+    // assembled tree's retained `verification.json` (rather than what the
+    // *current* run itself produced) would see exactly this document and
+    // wrongly credit it to the current run.
+    fs::write(previous.path().join("verification.json"), GREEN_PROJECTION).unwrap();
+    let current = fixture_site(
+        // No verification.json at all: this run attempted no verification of
+        // its own (`EvidencePublication::Absent`), distinct from a run whose
+        // own verification failed.
+        "current-failed-no-verification-attempted",
+        &[("index.html", PENDING_CURRENT_PAGE)],
+    );
+    let output = TempDirectory::new("no-verification-attempted-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        index.contains(r#"<iframe class="play-embed" src="play/index.html""#),
+        "the retained package must still be embedded: {index}"
+    );
+    assert!(
+        index.contains("current run did not verify"),
+        "a run that attempted no verification of its own must not claim success: {index}"
+    );
+    assert!(
+        !index.contains("verified separately"),
+        "the previous run's own retained success must never be credited to a current run \
+         that attempted no verification at all: {index}"
+    );
+}
+
+#[test]
+fn incomplete_successful_current_evidence_is_refused() {
+    let previous = previous_retained_playable("previous-retained-playable-malformed-evidence");
+    let current = fixture_site(
+        "current-malformed-verification-summary",
+        &[
+            ("index.html", PENDING_CURRENT_PAGE),
+            ("verification.json", r#"{"succeeded":true}"#),
+        ],
+    );
+    let output = TempDirectory::new("malformed-current-evidence-output");
+
+    let result = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::Json { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_missing_mode_marker_leaves_the_play_panel_unreconciled_too() {
+    let previous = previous_retained_playable("previous-retained-playable-for-atomicity");
+    // The play marker is present and reconcilable, but the mode marker is
+    // absent entirely (a malformed or hand-edited page). Reconciliation must
+    // treat the two markers as one atomic unit: either both are replaced, or
+    // neither is, never an embedded iframe beside a badge no one updated.
+    let current = fixture_site(
+        "current-failed-missing-mode-marker",
+        &[(
+            "index.html",
+            r#"<!doctype html><html><head><title>Hub</title></head><body><main>
+<!--play--><div class="play-frame" role="img" aria-label="pending"><div class="empty-state play-empty"><h2>No verified playable build yet</h2></div></div><!--/play-->
+<div class="hero-badge"><strong>Status</strong><small>Game pending verification</small></div>
+</main></body></html>"#,
+        )],
+    );
+    let output = TempDirectory::new("missing-mode-marker-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(
+        !index.contains("play-embed"),
+        "the play panel must never be reconciled without its paired mode badge: {index}"
+    );
+    assert!(
+        index.contains("No verified playable build yet"),
+        "an unreconciled pair must leave the original pending panel intact: {index}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The hub iframe path itself is validated after assembly, not only the
+// anchor links beside it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_broken_iframe_target_is_refused_after_assembly() {
+    let mut current_files = vec![(
+        "index.html",
+        r#"<!doctype html><html><head><title>Hub</title></head><body><main><iframe class="play-embed" src="play/missing.html" title="game"></iframe></main></body></html>"#,
+    )];
+    current_files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("current-broken-iframe", &current_files);
+    let output = TempDirectory::new("broken-iframe-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::BrokenLocalLink { .. })),
+        "{result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The public assembly API must never leak a game a disposition promises it
+// never publishes, and must never assume promoted evidence is atomic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn first_run_status_only_never_publishes_an_inconsistent_current_playable_package() {
+    let mut current_files = vec![("index.html", "CURRENT SOURCE: FAILED")];
+    current_files.extend_from_slice(COMPLETE_PACKAGE);
+    let current = fixture_site("current-inconsistent-first-run", &current_files);
+    let output = TempDirectory::new("first-run-inconsistent-output");
+
+    let disposition = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FirstRunStatusOnly);
+    assert!(!output.path().join("play").exists());
+    assert!(!output.path().join("last-green.json").exists());
+}
+
+#[test]
+fn promoted_frames_without_a_gallery_manifest_are_refused_as_partial_evidence() {
+    let current = fixture_site(
+        "current-partial-evidence",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("screenshots/current/01-healthy-center-ne.png", "frame"),
+        ],
+    );
+    let output = TempDirectory::new("partial-evidence-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(
+            &result,
+            Err(SitegenError::PartialEvidencePublication { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn successful_projection_without_promoted_artifacts_is_refused_as_partial_evidence() {
+    let current = fixture_site(
+        "current-successful-projection-only",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("verification.json", GREEN_PROJECTION),
+        ],
+    );
+    let output = TempDirectory::new("successful-projection-only-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(
+            &result,
+            Err(SitegenError::PartialEvidencePublication { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn promoted_artifacts_without_a_projection_are_refused_as_partial_evidence() {
+    let current = fixture_site(
+        "current-promoted-artifacts-without-projection",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("gallery.json", PRIOR_GALLERY),
+            (CURRENT_FRAME, "frame"),
+        ],
+    );
+    let output = TempDirectory::new("promoted-artifacts-without-projection-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(
+            &result,
+            Err(SitegenError::PartialEvidencePublication { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn promoted_artifacts_with_an_incomplete_projection_are_refused() {
+    let current = fixture_site(
+        "current-promoted-artifacts-with-incomplete-projection",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("gallery.json", r#"{"entries":[]}"#),
+            ("verification.json", r#"{"succeeded":true}"#),
+            (CURRENT_FRAME, "frame"),
+        ],
+    );
+    let output = TempDirectory::new("promoted-artifacts-with-incomplete-projection-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::Json { .. })),
+        "{result:?}"
+    );
+}
+
+/// `assemble` reads nothing out of a repository, so the workflow hands it
+/// none — and the workflow may not grow an option for one. It still may not
+/// publish into a source tree, and a binary run from anywhere but its own
+/// build directory cannot learn where that tree is from the path it was
+/// compiled in. The checkout is therefore discovered at run time: the
+/// workspace the runner exported, or the checkout the working directory sits
+/// inside.
+#[test]
+fn a_relocated_assemble_refuses_to_publish_into_the_checkout_it_runs_in() {
+    let checkout = fixture_site(
+        "relocated-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+        ],
+    );
+    let current = fixture_site(
+        "relocated-current",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+    let assemble = |working_directory: &Path, workspace: Option<&Path>, output: PathBuf| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sitegen"));
+        command.current_dir(working_directory).args([
+            "assemble",
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        match workspace {
+            Some(workspace) => command.env("GITHUB_WORKSPACE", workspace),
+            None => command.env_remove("GITHUB_WORKSPACE"),
+        };
+        command.output().expect("sitegen should launch")
+    };
+
+    let from_inside = assemble(checkout.path(), None, checkout.path().join("docs/site"));
+    assert_eq!(
+        from_inside.status.code(),
+        Some(1),
+        "the checkout the command runs inside is a source tree: {}",
+        String::from_utf8_lossy(&from_inside.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&from_inside.stderr).contains("refusing unsafe output path"),
+        "{}",
+        String::from_utf8_lossy(&from_inside.stderr)
+    );
+
+    let exported = assemble(
+        current.path(),
+        Some(checkout.path()),
+        checkout.path().join("docs/exported"),
+    );
+    assert_eq!(
+        exported.status.code(),
+        Some(1),
+        "the exported workspace is a source tree wherever the command runs: {}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
+
+    // Nothing else could have refused those two: with neither the working
+    // directory nor an exported workspace inside it, this tree is just a
+    // directory, and the compiled-in checkout says nothing about it.
+    let unknown = assemble(
+        current.path(),
+        None,
+        checkout.path().join("docs/unprotected"),
+    );
+    assert_eq!(
+        unknown.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    // The discovered checkout still publishes from its own build root, which
+    // is what a relocated run really does.
+    let build_root = assemble(checkout.path(), None, checkout.path().join("target/pages"));
+    assert_eq!(
+        build_root.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build_root.stderr)
+    );
+    assert!(checkout.path().join("target/pages/index.html").is_file());
+}
+
+/// The checkout is *discovered*, so an exported `GITHUB_WORKSPACE` is a hint,
+/// and an empty, relative, missing, or non-directory one is no hint at all: it
+/// must fall through to discovery rather than replace it.
+///
+/// The empty string is the dangerous shape. It names no directory, but its
+/// `.git` probe resolves relative to the working directory, so a run standing
+/// inside a checkout "found" a workspace of `""`, stopped looking, and lost
+/// the very source tree it was standing in — leaving the compiled-in path as
+/// the only protected root, which on a runner is not on the machine at all.
+#[test]
+fn an_unusable_workspace_hint_cannot_suppress_checkout_discovery() {
+    let checkout = fixture_site(
+        "workspace-hint-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+            ("notes.txt", "a file, not a workspace"),
+        ],
+    );
+    let current = fixture_site(
+        "workspace-hint-current",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    for (case, workspace) in [
+        ("empty", String::new()),
+        ("relative", ".".to_owned()),
+        ("relative below the checkout", "docs".to_owned()),
+        ("missing", "/midcreek-no-such-exported-workspace".to_owned()),
+        (
+            "not a directory",
+            checkout.path().join("notes.txt").display().to_string(),
+        ),
+    ] {
+        let output = checkout
+            .path()
+            .join(format!("docs/site-{}", case.replace(' ', "-")));
+        let finished = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(checkout.path())
+            .env("GITHUB_WORKSPACE", &workspace)
+            .args([
+                "assemble",
+                "--current",
+                current.path().to_str().unwrap(),
+                "--result",
+                result_path.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+
+        assert_eq!(
+            finished.status.code(),
+            Some(1),
+            "an {case} workspace must not lose the checkout the run stands in: {} {}",
+            String::from_utf8_lossy(&finished.stdout),
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&finished.stderr).contains("refusing unsafe output path"),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert!(
+            !output.exists(),
+            "nothing may be published into the discovered checkout"
+        );
+    }
+}
+
+#[test]
+fn a_stale_workspace_hint_cannot_override_the_checkout_containing_the_command() {
+    let active = fixture_site(
+        "active-workspace-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+        ],
+    );
+    let stale = fixture_site(
+        "stale-workspace-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+        ],
+    );
+    let current = fixture_site(
+        "stale-workspace-current",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let output = active.path().join("docs/site");
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+        .current_dir(active.path())
+        .env("GITHUB_WORKSPACE", stale.path())
+        .args([
+            "assemble",
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("sitegen should launch");
+
+    assert_eq!(
+        finished.status.code(),
+        Some(1),
+        "the active checkout must take precedence over a stale workspace hint: {} {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        !output.exists(),
+        "nothing may be published into the active checkout"
+    );
+}
+
 #[test]
 fn assemble_cli_reports_status_only_retention_without_failure_label() {
     let previous = fixture_site(
@@ -173,6 +1089,130 @@ fn assemble_cli_reports_status_only_retention_without_failure_label() {
         "RetainLastGreen\n"
     );
     assert!(command.stderr.is_empty());
+}
+
+/// A symbolic link at the top of the current tree has never been copied. A
+/// link buried three directories down reaches the same `copy_artifact` only
+/// through the recursion, so the containment rule has to be proved where it is
+/// actually easy to lose: nested, below a directory that is itself perfectly
+/// ordinary.
+#[test]
+fn a_nested_symlink_inside_the_current_tree_is_refused_rather_than_followed() {
+    let outside = fixture_site("nested-symlink-target", &[("secret.txt", "not ours")]);
+    let current = fixture_site(
+        "current-nested-symlink",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("evidence/deep/real.txt", "published"),
+        ],
+    );
+    let link = current.path().join("evidence/deep/secret.txt");
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "not ours",
+        "the link really resolves, so only the containment rule can refuse it"
+    );
+    let output = TempDirectory::new("nested-symlink-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::UnsafeOutputPath { path }) if path == &link),
+        "{result:?}"
+    );
+    assert!(
+        !output.path().join("evidence/deep/secret.txt").exists(),
+        "a refused link must never reach the published tree"
+    );
+}
+
+/// A history entry may only name images inside its own commit's directory.
+/// A path that merely starts with the history prefix can point at another
+/// entry's pixels, and every check that follows — the link checker and the
+/// retained-history rule — would be satisfied by a file that belongs to a
+/// different point in time.
+#[test]
+fn a_history_frame_that_points_into_another_entrys_directory_is_refused() {
+    let previous = fixture_site(
+        "previous-scoped-history",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("gallery.json", PRIOR_GALLERY),
+            (OLD_HISTORY, "old history"),
+        ],
+    );
+    // The second entry belongs to commit 1111..., but its frame names the
+    // image the 2222... entry published. The file is really there.
+    let crossed = PRIOR_GALLERY.replace(
+        r#"{"entries":["#,
+        &format!(
+            r#"{{"entries":[{{"semantic_visual_hash":"bbbbbbbb","source_commit":"1111111111111111111111111111111111111111","committed_at":"2026-08-30T00:00:00Z","current_task":"pages-status-always","frames":{{"center":"{OLD_HISTORY}"}},"metrics":{{}},"metric_deltas":{{}}}},"#
+        ),
+    );
+    let current = fixture_site(
+        "current-crossed-history",
+        &[
+            ("index.html", &index_linking(&[OLD_HISTORY])),
+            ("gallery.json", &crossed),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "current frame"),
+        ],
+    );
+    let output = TempDirectory::new("crossed-history-output");
+
+    let error = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .expect_err("an entry may not publish another entry's pixels as its own");
+
+    match &error {
+        SitegenError::HistoryFrameOutsideEntry { frames } => {
+            assert_eq!(frames, &vec![OLD_HISTORY.to_owned()]);
+        }
+        other => panic!("expected a misscoped-history failure, got {other}"),
+    }
+    assert!(error.to_string().contains(OLD_HISTORY), "{error}");
+}
+
+#[test]
+fn a_history_frame_that_points_outside_history_is_refused() {
+    let gallery = PRIOR_GALLERY.replace(OLD_HISTORY, CURRENT_FRAME);
+    let current = fixture_site(
+        "current-history-pointing-at-current",
+        &[
+            ("index.html", &index_linking(&[CURRENT_FRAME])),
+            ("gallery.json", &gallery),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "current frame"),
+        ],
+    );
+    let output = TempDirectory::new("history-pointing-at-current-output");
+
+    let error = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .expect_err("a history entry may not publish current pixels as its own");
+
+    assert!(
+        matches!(
+            &error,
+            SitegenError::HistoryFrameOutsideEntry { frames }
+                if frames == &vec![CURRENT_FRAME.to_owned()]
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -707,6 +1747,26 @@ mod workflow_contract {
     fn no_job_level_env_names_the_runner_context() {
         let workflow = workflow_source();
 
+        // The checked-in workflow declares no job-level `env:` at all, so a
+        // loop over what the detector finds in it would pass by finding
+        // nothing. The detector is therefore proved able to fail first, on the
+        // exact shape this rule exists to refuse.
+        let offending = concat!(
+            "jobs:\n",
+            "  verify:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    env:\n",
+            "      RESULT: ${{ runner.temp }}/native\n",
+            "    steps:\n",
+            "      - run: echo \"$RESULT\"\n",
+        );
+        assert_eq!(
+            job_level_env_blocks(offending),
+            vec!["      RESULT: ${{ runner.temp }}/native"],
+            "the detector has to find a job-level env: before its verdict on \
+             this workflow means anything"
+        );
+
         for block in job_level_env_blocks(&workflow) {
             assert!(
                 !block.contains("runner."),
@@ -741,10 +1801,16 @@ mod workflow_contract {
 
     /// The rule above is GitHub's, not this repository's, so it is proved with
     /// GitHub's own rules rather than with a string match: the pinned linter
-    /// has to accept the workflow as it stands and reject the shape it used to
-    /// have.
+    /// has to accept the workflow as it stands and reject the whole workflow
+    /// in exactly the shape it really had.
+    ///
+    /// The invalid file is rebuilt from the current one rather than read out
+    /// of Git history, because a shallow checkout — what CI does by default —
+    /// has no history to read and a gate that quietly stops running is worse
+    /// than one that never existed.
     #[test]
     fn the_pinned_linter_accepts_this_workflow_and_rejects_the_shape_it_replaced() {
+        let workflow = workflow_source();
         let clean = run_actionlint(&[repository()
             .join(".github/workflows/pages.yml")
             .to_string_lossy()
@@ -756,10 +1822,47 @@ mod workflow_contract {
             String::from_utf8_lossy(&clean.stderr)
         );
 
+        let regressed = with_historical_job_level_env(&workflow);
+        assert_eq!(
+            job_level_env_blocks(&regressed).len(),
+            2,
+            "both jobs carried the defect, so both have to be rebuilt: {regressed}"
+        );
         let directory = TempDirectory::new("actionlint-regression");
         let regression = directory.path().join("regression.yml");
+        fs::write(&regression, &regressed).expect("the regression workflow should be writable");
+
+        let dirty = run_actionlint(&[regression.to_string_lossy().into_owned()]);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&dirty.stdout),
+            String::from_utf8_lossy(&dirty.stderr)
+        );
+        assert!(
+            !dirty.status.success(),
+            "a job-level runner context must fail the gate: {report}"
+        );
+        assert_eq!(
+            report
+                .matches(r#"context "runner" is not allowed here"#)
+                .count(),
+            4,
+            "every job-level runner expression the workflow really carried has \
+             to be named: {report}"
+        );
+    }
+
+    /// The reduced shape is kept beside the full one. It is written from
+    /// scratch rather than rebuilt from the checked-in workflow, so it keeps
+    /// proving that the pinned linter refuses a job-level runner context even
+    /// if this repository's workflow is one day restructured so far that the
+    /// historical shape can no longer be reconstructed from it.
+    #[test]
+    fn the_pinned_linter_rejects_a_minimal_job_level_runner_context() {
+        let directory = TempDirectory::new("actionlint-minimal");
+        let minimal = directory.path().join("minimal.yml");
         fs::write(
-            &regression,
+            &minimal,
             concat!(
                 "name: Regression\n",
                 "on:\n",
@@ -776,12 +1879,13 @@ mod workflow_contract {
         )
         .expect("the regression workflow should be writable");
 
-        let dirty = run_actionlint(&[regression.to_string_lossy().into_owned()]);
+        let dirty = run_actionlint(&[minimal.to_string_lossy().into_owned()]);
         let report = format!(
             "{}{}",
             String::from_utf8_lossy(&dirty.stdout),
             String::from_utf8_lossy(&dirty.stderr)
         );
+
         assert!(
             !dirty.status.success(),
             "a job-level runner context must fail the gate: {report}"
@@ -790,6 +1894,30 @@ mod workflow_contract {
             report.contains(r#"context "runner" is not allowed here"#),
             "{report}"
         );
+    }
+
+    /// The Pages workflow as it stands, with the job-level `env:` each gated
+    /// job really carried before the fix put back exactly where it was: after
+    /// the job's permissions and before its steps.
+    fn with_historical_job_level_env(workflow: &str) -> String {
+        let mut regressed = workflow.to_owned();
+        for (job, root) in [("build-web", "web"), ("verify", "native")] {
+            let job_start = regressed
+                .find(&format!("\n  {job}:\n"))
+                .unwrap_or_else(|| panic!("the workflow should declare the {job} job"));
+            let steps = regressed[job_start..]
+                .find("\n    steps:\n")
+                .map(|offset| job_start + offset + 1)
+                .unwrap_or_else(|| panic!("the {job} job should declare steps"));
+            regressed.insert_str(
+                steps,
+                &format!(
+                    "    env:\n      RESULT: ${{{{ runner.temp }}}}/{root}\n      \
+                     GATES: ${{{{ runner.temp }}}}/{root}/gates.jsonl\n"
+                ),
+            );
+        }
+        regressed
     }
 
     /// A linter that changes its rules under the gate is a gate that changes
@@ -1218,6 +2346,7 @@ fn a_green_replacement_keeps_the_previous_screenshot_history() {
     let mut current_files = vec![
         ("index.html", "CURRENT SOURCE: GREEN"),
         ("gallery.json", r#"{"entries":[{"source_commit":"new"}]}"#),
+        ("verification.json", GREEN_PROJECTION),
         (
             "screenshots/current/01-healthy-center-ne.png",
             "new current",
@@ -1337,6 +2466,11 @@ fn a_first_green_run_without_a_previous_site_publishes_its_own_history() {
     let mut files = vec![
         ("index.html", "CURRENT SOURCE: GREEN"),
         ("gallery.json", r#"{"entries":[]}"#),
+        ("verification.json", GREEN_PROJECTION),
+        (
+            "screenshots/current/01-healthy-center-ne.png",
+            "new current",
+        ),
         (
             "screenshots/history/11111111/01-healthy-center-ne.png",
             "new history",
@@ -1379,12 +2513,57 @@ const NEW_HISTORY: &str = "screenshots/history/11111111/01-healthy-center-ne.png
 const CURRENT_FRAME: &str = "screenshots/current/01-healthy-center-ne.png";
 
 /// A green projection, exactly as `verification.json` records one.
-const GREEN_PROJECTION: &str = r#"{"succeeded":true,"semantic_visual_hash":"bbbbbbbb"}"#;
+const GREEN_PROJECTION: &str = r##"{
+  "schema_version": 1,
+  "succeeded": true,
+  "failed_stage": null,
+  "stages": [],
+  "semantic_visual_hash": "bbbbbbbb",
+  "camera": {
+    "tonemapping": "TonyMcMapface",
+    "deband_dither": "Enabled",
+    "msaa_samples": 1,
+    "clear_color": "#000000"
+  },
+  "hashes": {
+    "assets": {},
+    "asset_sources": {},
+    "references": {},
+    "sources": {}
+  },
+  "frames": [],
+  "browser": null,
+  "metrics": {},
+  "metric_failures": [],
+  "gates": []
+}"##;
 
 /// A failed projection: the current status, with no pixels behind it. It still
 /// carries the run's semantic hash, exactly as `VerificationSummary` does.
-const FAILED_PROJECTION: &str =
-    r#"{"succeeded":false,"failed_stage":"repair","semantic_visual_hash":"cccccccc"}"#;
+const FAILED_PROJECTION: &str = r##"{
+  "schema_version": 1,
+  "succeeded": false,
+  "failed_stage": "repair",
+  "stages": [],
+  "semantic_visual_hash": "cccccccc",
+  "camera": {
+    "tonemapping": "TonyMcMapface",
+    "deband_dither": "Enabled",
+    "msaa_samples": 1,
+    "clear_color": "#000000"
+  },
+  "hashes": {
+    "assets": {},
+    "asset_sources": {},
+    "references": {},
+    "sources": {}
+  },
+  "frames": [],
+  "browser": null,
+  "metrics": {},
+  "metric_failures": [],
+  "gates": []
+}"##;
 
 /// An index that links exactly the given site-relative targets.
 fn index_linking(targets: &[&str]) -> String {
@@ -2247,6 +3426,54 @@ mod publication_inputs {
         assert!(inputs["playable"].is_null(), "{inputs}");
     }
 
+    /// Both jobs passed, but the browser gate's own canvas is unreadable. The
+    /// native run proved everything it proved regardless, so publishing
+    /// nothing at all would throw away fourteen verified frames because of one
+    /// corrupt PNG from the other job.
+    #[test]
+    fn unprojectable_browser_evidence_never_costs_the_native_evidence_beside_it() {
+        let run = Run::new("inputs-browser-unprojectable");
+        run.native(
+            GateStatus::Passed,
+            &[("Clippy lints", GateStatus::Passed)],
+            true,
+        );
+        run.web(
+            GateStatus::Passed,
+            &[("Headless browser gate", GateStatus::Passed)],
+            true,
+        );
+        fs::write(
+            run.web_root().join("browser/canvas.png"),
+            b"\x89PNG\r\n\x1a\nnot actually an image",
+        )
+        .unwrap();
+
+        let (workflow, inputs) = run.execute("success", "success");
+
+        assert!(
+            inputs["verification"]["report"].is_string(),
+            "the native evidence still projects on its own: {inputs}"
+        );
+        assert!(
+            inputs["verification"]["browser"].is_null(),
+            "the unusable browser evidence is dropped, not published: {inputs}"
+        );
+        assert_eq!(
+            gate(&workflow, "Published browser evidence").status,
+            GateStatus::Failed,
+            "the gap is published rather than hidden"
+        );
+        assert!(
+            !workflow
+                .gates
+                .iter()
+                .any(|gate| gate.name == "Published verification evidence"),
+            "the native evidence did not fail: {:?}",
+            gate_names(&workflow)
+        );
+    }
+
     /// A job that passed every gate it measured and then failed anyway is
     /// published as a failure, and the extra row says where it failed.
     #[test]
@@ -2408,9 +3635,250 @@ mod publication_inputs {
         }
     }
 
+    /// `known_commits` exists to resolve the commits the published documents
+    /// name. Enumerating the whole repository grows the published facts, and
+    /// the work of collecting them, with every commit anybody ever pushes, so
+    /// it is bounded by what is really published: the timeline, the head, and
+    /// the commits the progress document actually references.
+    #[test]
+    fn the_published_repository_facts_are_bounded_by_what_they_have_to_resolve() {
+        let run = Run::new("inputs-bounded-facts");
+        run.native(
+            GateStatus::Passed,
+            &[("Clippy lints", GateStatus::Passed)],
+            true,
+        );
+        run.execute("success", "skipped");
+
+        let repo = read_value(&run.output().join("repo.json"));
+        let known = repo["known_commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let timeline = repo["commits"].as_array().unwrap().len();
+        let referenced = referenced_commits();
+        let history = git(&["rev-list", "--all"]);
+        let history = history.lines().collect::<Vec<_>>();
+
+        assert!(
+            known.len() <= timeline + referenced.len() + 1,
+            "the published facts enumerate {} commits for a timeline of {timeline} and \
+             {} referenced commits",
+            known.len(),
+            referenced.len()
+        );
+        assert!(
+            known.contains(repo["head_sha"].as_str().unwrap()),
+            "the head always resolves: {known:?}"
+        );
+        for commit in &referenced {
+            assert!(
+                known.contains(commit),
+                "the progress document references {commit}, which must still resolve"
+            );
+        }
+
+        // Whatever else this repository's history holds is not published.
+        let recent = git(&["log", "--max-count", "20", "--format=%H"]);
+        if let Some(old) = history.iter().find(|sha| {
+            !recent.lines().any(|recent| recent == **sha) && !referenced.contains(**sha)
+        }) {
+            assert!(
+                !known.contains(*old),
+                "{old} is neither on the timeline nor referenced, so it must not be published"
+            );
+        }
+    }
+
+    /// Every commit `docs/progress.json` names, as a full SHA.
+    fn referenced_commits() -> std::collections::BTreeSet<String> {
+        let document =
+            read_value(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/progress.json"));
+        let tasks = document["tasks"].as_array().unwrap().iter();
+        let challenges = document["challenges"].as_array().unwrap().iter();
+        tasks
+            .filter_map(|task| task["completed_commit"].as_str())
+            .chain(challenges.filter_map(|challenge| challenge["resolved_commit"].as_str()))
+            .filter(|commit| {
+                commit.len() == 40 && commit.chars().all(|value| value.is_ascii_hexdigit())
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn git(args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(args)
+            .output()
+            .expect("git should run in the checkout");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).expect("git output should be UTF-8")
+    }
+
     // -------------------------------------------------------------------
     // One `sitegen inputs` run and the artifacts it was handed
     // -------------------------------------------------------------------
+
+    /// `inputs` publishes `docs/progress.json` and resolves exactly the
+    /// commits that document names. A document that cannot be read, or that
+    /// does not match the schema, is therefore not a run with no references:
+    /// it is a run that cannot publish. Treating the two the same silently
+    /// drops every reference the real document names and leaves the generator
+    /// to fail later — or, worse, to publish a timeline that resolves nothing.
+    #[test]
+    fn an_unpublishable_progress_document_stops_the_run_that_would_publish_it() {
+        for (case, document) in [
+            ("missing", None),
+            ("unreadable", Some("{ this is not JSON")),
+            (
+                "schema-invalid",
+                Some(r#"{"schema_version":1,"project":"Cell Shift"}"#),
+            ),
+        ] {
+            let repository = TempDirectory::new(&format!("inputs-progress-{case}"));
+            initialize_checkout(repository.path());
+            fs::create_dir_all(repository.path().join("docs")).unwrap();
+            if let Some(document) = document {
+                fs::write(repository.path().join("docs/progress.json"), document).unwrap();
+            }
+            let run = Run::new(&format!("inputs-progress-run-{case}"));
+
+            let finished = run.launch(
+                repository.path().to_str().unwrap(),
+                repository.path(),
+                "skipped",
+                "skipped",
+            );
+            let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+            assert_eq!(
+                finished.status.code(),
+                Some(1),
+                "a {case} progress document must stop the run: {stderr}"
+            );
+            assert!(
+                stderr.contains("progress.json"),
+                "the failure must name the document it could not publish: {stderr}"
+            );
+            assert!(
+                !run.output().join("inputs.json").exists(),
+                "nothing may be handed to the generator from a run that could not read \
+                 the document it was going to publish"
+            );
+        }
+    }
+
+    /// A checkout with one commit, so that the only thing wrong with a
+    /// repository under test is the thing the test put there.
+    fn initialize_checkout(root: &Path) {
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["commit", "--quiet", "--allow-empty", "-m", "root"],
+        ] {
+            let finished = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=midcreek-tests",
+                    "-c",
+                    "user.email=tests@midcreek.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(&arguments)
+                .output()
+                .expect("git should run");
+            assert!(
+                finished.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&finished.stderr)
+            );
+        }
+    }
+
+    /// `build` resolves the relative paths of an inputs document against the
+    /// directory that document lives in — the output directory, which is not
+    /// where a relative `--repository` was ever measured from. The repository
+    /// is therefore resolved once, at inputs time, against the working
+    /// directory it really meant. Publishing the whole real checkout through
+    /// it proves the resolved document works on the documents this repository
+    /// actually carries, not only on fixtures.
+    #[test]
+    fn a_relative_repository_publishes_the_real_documents_of_this_checkout() {
+        let run = Run::new("inputs-relative-repository");
+        run.native(
+            GateStatus::Passed,
+            &[("Clippy lints", GateStatus::Passed)],
+            true,
+        );
+
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let finished = run.launch(".", &checkout, "success", "skipped");
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+
+        let inputs = read_value(&run.output().join("inputs.json"));
+        let canonical = fs::canonicalize(&checkout).unwrap();
+        assert_eq!(
+            Path::new(inputs["repository"].as_str().unwrap()),
+            canonical,
+            "the declared repository must not stay relative: {inputs}"
+        );
+        for document in ["progress", "plan", "reference_manifest"] {
+            let path = Path::new(inputs[document].as_str().unwrap());
+            assert!(
+                path.starts_with(&canonical) && path.is_file(),
+                "{document} must resolve from anywhere: {}",
+                path.display()
+            );
+        }
+
+        // The published page renders the real plan, the real progress
+        // document, and real commit subjects, none of which any fixture
+        // carries. `build` validates its own output, so a page that leaked a
+        // path of this machine, or lost a link, fails right here.
+        let site = run.root.path().join("site");
+        let built = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(run.root.path())
+            .args([
+                "build",
+                "--inputs",
+                run.output().join("inputs.json").to_str().unwrap(),
+                "--output",
+                site.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        assert_eq!(
+            built.status.code(),
+            Some(0),
+            "the real documents must publish: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert!(site.join("index.html").is_file());
+        assert_eq!(
+            String::from_utf8_lossy(&built.stdout).trim(),
+            COMMIT,
+            "the published source commit is the one the run declared"
+        );
+
+        // The page really rendered those documents rather than an empty
+        // stand-in for them: a plan heading the real plan declares, and the
+        // head commit of the real checkout.
+        let page = fs::read_to_string(site.join("index.html")).unwrap();
+        let head = git(&["rev-parse", "HEAD"]);
+        assert!(page.contains(r#"id="plan-ci-baseline""#), "{page}");
+        assert!(page.contains(&head[..8]), "{page}");
+    }
 
     struct Run {
         root: TempDirectory,
@@ -2486,12 +3954,42 @@ mod publication_inputs {
         }
 
         fn execute(&self, native_outcome: &str, web_outcome: &str) -> (WorkflowSummary, Value) {
+            let finished = self.launch(
+                env!("CARGO_MANIFEST_DIR"),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                native_outcome,
+                web_outcome,
+            );
+            assert_eq!(
+                finished.status.code(),
+                Some(0),
+                "sitegen inputs should always publish: {}",
+                String::from_utf8_lossy(&finished.stderr)
+            );
+
+            let output = self.output();
+            let workflow = serde_json::from_str::<WorkflowSummary>(
+                &fs::read_to_string(output.join("workflow.json")).unwrap(),
+            )
+            .expect("the merged result should match the published schema");
+            (workflow, read_value(&output.join("inputs.json")))
+        }
+
+        /// One `sitegen inputs` run against a named repository argument, from
+        /// a named working directory, whatever it exits with.
+        fn launch(
+            &self,
+            repository: &str,
+            working_directory: &Path,
+            native_outcome: &str,
+            web_outcome: &str,
+        ) -> std::process::Output {
             let output = self.output();
             let mut command = Command::new(env!("CARGO_BIN_EXE_sitegen"));
-            command.args([
+            command.current_dir(working_directory).args([
                 "inputs",
                 "--repository",
-                env!("CARGO_MANIFEST_DIR"),
+                repository,
                 "--source-commit",
                 COMMIT,
                 "--run-url",
@@ -2515,20 +4013,7 @@ mod publication_inputs {
                     self.root.path().join("previous").to_str().unwrap(),
                 ]);
             }
-
-            let finished = command.output().expect("sitegen should launch");
-            assert_eq!(
-                finished.status.code(),
-                Some(0),
-                "sitegen inputs should always publish: {}",
-                String::from_utf8_lossy(&finished.stderr)
-            );
-
-            let workflow = serde_json::from_str::<WorkflowSummary>(
-                &fs::read_to_string(output.join("workflow.json")).unwrap(),
-            )
-            .expect("the merged result should match the published schema");
-            (workflow, read_value(&output.join("inputs.json")))
+            command.output().expect("sitegen should launch")
         }
     }
 
@@ -2792,6 +4277,23 @@ mod result_manifest_safety {
             assert_eq!(report.status(), GateStatus::Failed, "{report:?}");
             assert_eq!(report.evidence(), None, "{report:?}");
         }
+    }
+
+    #[test]
+    fn a_passed_manifest_cannot_contain_a_failed_gate() {
+        let mut result = manifest(
+            "verify",
+            Some("verification"),
+            &[("Rendered image contracts", None)],
+        );
+        result.gates[0].status = GateStatus::Failed;
+        result.gates[0].passed = 0;
+        result.gates[0].failed = 1;
+
+        assert!(
+            validate_job_result(&result).is_err(),
+            "a passed manifest must not contain a failed gate: {result:?}"
+        );
     }
 
     /// A job that fell over before its first gate still uploads a manifest,

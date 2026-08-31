@@ -105,6 +105,52 @@ mod generated_site_contract {
         }
     }
 
+    /// Task cards and challenge cards both publish commit links. They are
+    /// built in different functions, so a repository rename applied to one and
+    /// not the other publishes dead links from the other. One constant is the
+    /// only thing either may name.
+    #[test]
+    fn every_published_commit_link_is_built_from_one_repository_url() {
+        let html = build_fixture_site("verified-game").unwrap().index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("a[href*=\"/commit/\"]").unwrap();
+        let links = document
+            .select(&selector)
+            .map(|link| link.value().attr("href").unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        let expected = format!("{}/commit/", midcreek_cs_1::sitegen::REPOSITORY_URL);
+
+        assert_eq!(
+            links.len(),
+            3,
+            "this fixture publishes two task commits and one resolved challenge: {links:?}"
+        );
+        assert!(
+            document
+                .select(&scraper::Selector::parse("#progress a[href*=\"/commit/\"]").unwrap())
+                .count()
+                >= 1,
+            "the task cards must be one of the two link sources"
+        );
+        assert!(
+            document
+                .select(&scraper::Selector::parse("#challenges a[href*=\"/commit/\"]").unwrap())
+                .count()
+                >= 1,
+            "the challenge cards must be the other link source"
+        );
+        for href in &links {
+            assert!(
+                href.starts_with(&expected),
+                "{href} is not built from {expected}"
+            );
+        }
+        assert!(
+            midcreek_cs_1::sitegen::REPOSITORY_URL.starts_with("https://github.com/"),
+            "the repository constant must stay on the one trusted host"
+        );
+    }
+
     #[test]
     fn progress_tasks_link_to_rendered_plan_headings() {
         let html = build_fixture_site("green").unwrap().index_html();
@@ -297,6 +343,311 @@ mod output_validation_contract {
         );
     }
 
+    /// A published page is served from a URL, so the checkout it was published
+    /// from never belongs in one — in rendered text, in an attribute, or
+    /// anywhere else in the document. The rule names the repository and the
+    /// output this publication was handed rather than guessing which
+    /// absolute-looking prose is a leak.
+    #[test]
+    fn rejects_a_path_of_the_machine_that_published_the_page() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let leaks = [
+            repository.join("docs/reference").display().to_string(),
+            fs::canonicalize(repository).unwrap().display().to_string(),
+            "file:///anywhere/at/all".to_owned(),
+        ];
+
+        for leak in leaks {
+            for (label, mutation) in [
+                ("rendered text", "Rendered from {leak}"),
+                ("an attribute", r#"<span title="{leak}">from</span>"#),
+            ] {
+                let site = build_fixture_site("green").unwrap();
+                let injected = mutation.replace("{leak}", &leak);
+                mutate_index(&site, |html| {
+                    html.replace("Render the progress hub", &injected)
+                });
+
+                // The public entry point declares the compiled-in checkout as
+                // the repository, which is the one this build really published
+                // from.
+                let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+                assert!(
+                    matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                        if message.contains("path of the publishing machine")),
+                    "{leak} survived validation in {label}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// The directory a page was published into is one of the two locations
+    /// this publication was handed, and a build that names its own output is
+    /// leaking the runner's layout just as surely as one that names the
+    /// checkout. The directory that *encloses* the output is not: it is
+    /// nothing this run chose, and refusing it would be refusing whatever
+    /// shared root the host happens to hand out. This proves the output root
+    /// itself is what decides, not the temporary root it sits under.
+    #[test]
+    fn rejects_the_output_directory_the_page_was_published_into() {
+        let enclosing = std::env::temp_dir().display().to_string();
+        let staged = build_fixture_site("green").unwrap();
+        assert!(
+            staged.root().starts_with(&enclosing),
+            "this fixture publishes below {enclosing}"
+        );
+        mutate_index(&staged, |html| {
+            html.replace(
+                "Render the progress hub",
+                &format!("Staged below {enclosing}"),
+            )
+        });
+        assert_eq!(
+            validate_site_output(staged.root(), &fixture("green/progress.json")),
+            Ok(()),
+            "the root the output happens to sit under is not this publication's own"
+        );
+
+        let site = build_fixture_site("green").unwrap();
+        let output = site.root().display().to_string();
+        mutate_index(&site, |html| {
+            html.replace("Render the progress hub", &format!("Written to {output}"))
+        });
+
+        let result = validate_site_output(site.root(), &fixture("green/progress.json"));
+
+        assert!(
+            matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                if message.contains("path of the publishing machine")),
+            "{result:?}"
+        );
+    }
+
+    /// The repository a run publishes from is whatever root the caller named,
+    /// and a shallow one is still a checkout. Skipping roots with too few
+    /// components to look "identifying" was a guess about path shapes: `/srv`
+    /// is an ordinary place to check a repository out, and a page that names
+    /// it names the machine that built it.
+    #[test]
+    fn a_shallow_declared_repository_is_still_the_checkout_it_names() {
+        for root in ["/srv", "/srv/hub"] {
+            let site = build_fixture_site("green").unwrap();
+            mutate_index(&site, |html| {
+                html.replace(
+                    "Render the progress hub",
+                    &format!("Published from {root}/docs/reference"),
+                )
+            });
+
+            let result = midcreek_cs_1::sitegen::validate_site_output_in(
+                Path::new(root),
+                site.root(),
+                &fixture("green/progress.json"),
+            );
+            assert!(
+                matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                    if message.contains("path of the publishing machine")),
+                "{root} is the declared checkout: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_prefix_sibling_is_not_the_declared_repository() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace(
+                "Render the progress hub",
+                "Published from /srv/hubris/docs/reference",
+            )
+        });
+
+        assert_eq!(
+            midcreek_cs_1::sitegen::validate_site_output_in(
+                Path::new("/srv/hub"),
+                site.root(),
+                &fixture("green/progress.json"),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_segment_is_not_the_declared_repository_root() {
+        for text in [
+            "Published from /mnt/srv/hub/docs/reference",
+            "Published from https://example.invalid/srv/hub/docs/reference",
+        ] {
+            let site = build_fixture_site("green").unwrap();
+            mutate_index(&site, |html| html.replace("Render the progress hub", text));
+
+            assert_eq!(
+                midcreek_cs_1::sitegen::validate_site_output_in(
+                    Path::new("/srv/hub"),
+                    site.root(),
+                    &fixture("green/progress.json"),
+                ),
+                Ok(()),
+                "{text} does not name the declared repository root"
+            );
+        }
+    }
+
+    /// The same bytes, checked against the same declared repository and
+    /// output, must reach the same verdict on every machine and from every
+    /// working directory. A gate that consulted the environment publishes a
+    /// page on a laptop and refuses the identical page on the runner, which
+    /// makes the check unreproducible and its failures unexplainable.
+    ///
+    /// The page below names this host's home directory, its temporary root,
+    /// the working directory the suite runs in — which is also the checkout
+    /// this binary was compiled in — and the two paths a GitHub runner
+    /// exports. None of them is the repository or the output this publication
+    /// was handed, so none of them decides anything.
+    #[test]
+    fn the_hosts_environment_never_decides_whether_a_page_is_publishable() {
+        let foreign_checkout = "/home/runner/work/other-project/other-project";
+        let mut ambient = vec![
+            std::env::temp_dir().display().to_string(),
+            std::env::current_dir().unwrap().display().to_string(),
+            foreign_checkout.to_owned(),
+            "/home/runner/_temp/other-project".to_owned(),
+        ];
+        ambient.extend(
+            ["HOME", "USERPROFILE"]
+                .into_iter()
+                .filter_map(std::env::var_os)
+                .map(|value| std::path::PathBuf::from(value).display().to_string()),
+        );
+
+        let site = build_fixture_site("green").unwrap();
+        for (index, value) in ambient.iter().enumerate() {
+            mutate_index(&site, |html| {
+                html.replace(
+                    "Render the progress hub",
+                    &format!("Ambient {index}: {value}. Render the progress hub"),
+                )
+            });
+        }
+
+        // A repository that is not on this machine at all: only what the
+        // caller declared can matter, so nothing has to resolve.
+        let declared = std::env::temp_dir().join("midcreek-declared-checkout-elsewhere");
+        assert_eq!(
+            midcreek_cs_1::sitegen::validate_site_output_in(
+                &declared,
+                site.root(),
+                &fixture("green/progress.json"),
+            ),
+            Ok(()),
+            "no value the host happens to carry may decide a publication"
+        );
+
+        // The very same bytes are refused the moment the caller declares the
+        // checkout they name: the verdict follows the declaration.
+        let result = midcreek_cs_1::sitegen::validate_site_output_in(
+            Path::new(foreign_checkout),
+            site.root(),
+            &fixture("green/progress.json"),
+        );
+        assert!(
+            matches!(&result, Err(SitegenError::InvalidHtml { message, .. })
+                if message.contains("path of the publishing machine")),
+            "the declared repository decides, whichever machine it is on: {result:?}"
+        );
+    }
+
+    /// The same rule may not fire on the relative paths the page publishes on
+    /// purpose, on prose that merely contains a slash, or on the absolute
+    /// paths the reserved plan, progress, and commit prose really contain. A
+    /// guard tuned to what an absolute path looks like rejects a checked-in
+    /// sentence about `/var/lib` and stops the whole publication for it.
+    #[test]
+    fn accepts_the_relative_paths_and_absolute_prose_the_page_really_publishes() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+
+        assert!(
+            html.contains("docs/reference/cel-shift-key-art.png"),
+            "{html}"
+        );
+        assert!(html.contains("../midcreek-concept/"), "{html}");
+        assert!(html.contains("Key art / current frame"), "{html}");
+        assert_eq!(
+            validate_site_output(site.root(), &fixture("verified-game/progress.json")),
+            Ok(())
+        );
+
+        // Each of these really appears in this project's own published prose
+        // or is exactly the kind of sentence it may carry next: the URL prefix
+        // the game is served below, a system path that belongs to no machine
+        // in particular, and a documentation path.
+        for prose in [
+            "Served below the /midcreek-cs-1/ project prefix.",
+            "The daemon keeps its state in /var/lib/midcreek.",
+            "Installed alongside /usr/share/doc/midcreek/README.",
+        ] {
+            let site = build_fixture_site("verified-game").unwrap();
+            mutate_index(&site, |html| {
+                html.replace("Working on", &format!("{prose} Working on"))
+            });
+            assert_eq!(
+                validate_site_output(site.root(), &fixture("verified-game/progress.json")),
+                Ok(()),
+                "{prose} is prose, not a leak"
+            );
+        }
+    }
+
+    /// Commit subjects are free text this repository writes and the page
+    /// renders verbatim, so they are the most likely carrier of a real leak
+    /// and of legitimate absolute prose alike. Both are decided here, on the
+    /// same field, by whether the path belongs to the publishing machine.
+    #[test]
+    fn a_commit_subject_may_carry_prose_paths_but_never_the_checkout() {
+        let leaked = format!(
+            "fix: publish from {}",
+            Path::new(env!("CARGO_MANIFEST_DIR")).display()
+        );
+        let mut inputs = site_inputs("green");
+        assert!(
+            !inputs.repo.commits.is_empty(),
+            "this fixture publishes a commit timeline"
+        );
+        inputs.repo.commits[0].subject = leaked.clone();
+
+        let result = build_site_from_inputs("commit-subject-leak", &inputs);
+        assert!(
+            matches!(&result.as_ref().err(), Some(SitegenError::InvalidHtml { message, .. })
+                if message.contains("path of the publishing machine")),
+            "{leaked} must never reach the page: {:?}",
+            result.err()
+        );
+
+        inputs.repo.commits[0].subject =
+            "fix: read the seed from /var/lib/midcreek/seed.json".to_owned();
+        let published = build_site_from_inputs("commit-subject-prose", &inputs)
+            .expect("an ordinary absolute path in a subject is not a leak")
+            .index_html();
+        assert!(
+            published.contains("/var/lib/midcreek/seed.json"),
+            "{published}"
+        );
+
+        // Another machine's checkout is prose too. It is not this run's
+        // repository or output, and the page renders it exactly as written
+        // wherever the page is validated.
+        inputs.repo.commits[0].subject =
+            "fix: mirror /home/runner/work/other-project/other-project/docs".to_owned();
+        let published = build_site_from_inputs("commit-subject-foreign", &inputs)
+            .expect("a foreign checkout path in a subject is not this publication's")
+            .index_html();
+        assert!(
+            published.contains("/home/runner/work/other-project/other-project/docs"),
+            "{published}"
+        );
+    }
+
     #[test]
     fn rejects_inline_script_content() {
         let site = build_fixture_site("green").unwrap();
@@ -336,6 +687,10 @@ mod output_validation_contract {
 
 mod build_safety_contract {
     use super::*;
+    use midcreek_cs_1::sitegen::{
+        trusted_playable_roots_in, validate_output_path_in, validate_output_path_under,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_source_directories_as_site_output() {
@@ -360,6 +715,200 @@ mod build_safety_contract {
         let _ = fs::remove_dir_all(output);
 
         assert!(matches!(result, Err(SitegenError::Reference(_))));
+    }
+
+    /// A relocated `sitegen` still has to protect the repository it was told
+    /// about, and still has to accept that repository's own build root. Both
+    /// are decided from the declared root, not from the path the binary was
+    /// compiled in.
+    #[test]
+    fn a_declared_repository_protects_its_own_tree_and_allows_its_own_build_root() {
+        let declared = relocated_repository("declared-root");
+
+        assert_eq!(
+            validate_output_path_in(declared.path(), &declared.path().join("target/site")),
+            Ok(())
+        );
+        assert_eq!(
+            validate_output_path_in(declared.path(), &declared.path().join("docs")),
+            Err(SitegenError::UnsafeOutputPath {
+                path: declared.path().join("docs"),
+            }),
+            "a declared repository's own source tree is never a publication target"
+        );
+        assert!(
+            trusted_playable_roots_in(declared.path())
+                .contains(&fs::canonicalize(declared.path().join("target")).unwrap()),
+            "a declared repository's build root is where its packaged game comes from"
+        );
+    }
+
+    /// The compile-time root keeps protecting the checkout the binary was
+    /// built in, so declaring another repository can never open the real
+    /// source tree up as an output directory.
+    #[test]
+    fn a_declared_repository_never_unlocks_the_compiled_repositorys_source_tree() {
+        let declared = relocated_repository("declared-root-containment");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+
+        assert_eq!(
+            validate_output_path_in(declared.path(), &source),
+            Err(SitegenError::UnsafeOutputPath { path: source })
+        );
+    }
+
+    /// A relocated binary's compiled-in checkout is not on the machine, and a
+    /// caller that declares no repository of its own leaves the guard with
+    /// nothing to compare the output against. Skipping the roots that do not
+    /// resolve is what lets a relocated run work at all, so the case where
+    /// *none* of them resolves is the one that must refuse: a check that can
+    /// prove nothing may not report success.
+    #[test]
+    fn an_output_path_with_no_resolvable_source_tree_is_refused() {
+        let declared = relocated_repository("no-resolvable-root");
+        let output = declared.path().join("target/site");
+        let missing = [
+            PathBuf::from("/midcreek-no-such-declared-checkout"),
+            PathBuf::from("/midcreek-no-such-compiled-checkout"),
+        ];
+
+        assert_eq!(
+            validate_output_path_under(&missing, &output),
+            Err(SitegenError::UnknownRepository {
+                candidates: missing.to_vec(),
+            }),
+            "a run that can name no source tree must refuse to publish"
+        );
+        assert_eq!(
+            validate_output_path_under(&[declared.path().to_path_buf()], &output),
+            Ok(()),
+            "one resolvable root is all the same output needs to be accepted"
+        );
+        assert_eq!(
+            validate_output_path_under(
+                &[missing[0].clone(), declared.path().to_path_buf()],
+                &declared.path().join("docs")
+            ),
+            Err(SitegenError::UnsafeOutputPath {
+                path: declared.path().join("docs"),
+            }),
+            "an unresolvable root beside a real one must not weaken the real one"
+        );
+    }
+
+    /// A minimal repository copy: the approved references the generator reads,
+    /// its own build root, and a source directory that must stay protected.
+    fn relocated_repository(name: &str) -> RelocatedRepository {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/relocated-repositories")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(root.join("docs/reference")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        for relative in [
+            "docs/reference/cel-shift-key-art.png",
+            "docs/reference/cel-shift-character-sheet.png",
+            "docs/reference/manifest.json",
+        ] {
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(relative),
+                root.join(relative),
+            )
+            .unwrap();
+        }
+        RelocatedRepository(root)
+    }
+
+    struct RelocatedRepository(std::path::PathBuf);
+
+    impl RelocatedRepository {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for RelocatedRepository {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `sitegen build` reads the approved references out of the repository its
+    /// own inputs declare. A copy whose references were tampered with is
+    /// refused even though the compiled-in checkout still holds the approved
+    /// ones, which is the only way to prove the declared root is what was
+    /// really read.
+    #[test]
+    fn the_build_cli_reads_the_references_of_the_repository_its_inputs_declare() {
+        let declared = relocated_repository("declared-references");
+        let workspace = relocated_repository("declared-references-inputs");
+        let inputs = workspace.path().join("inputs.json");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sitegen/green");
+        fs::write(
+            &inputs,
+            serde_json::json!({
+                "repository": declared.path(),
+                "progress": fixtures.join("progress.json"),
+                "plan": fixtures.join("plan.md"),
+                "reference_manifest": declared.path().join("docs/reference/manifest.json"),
+                "workflow": fixtures.join("workflow.json"),
+                "repo": fixtures.join("repo.json"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = declared.path().join("target/site");
+
+        let published = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(workspace.path())
+            .args([
+                "build",
+                "--inputs",
+                inputs.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        assert_eq!(
+            published.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&published.stderr)
+        );
+        assert!(output.join("reference/cel-shift-key-art.png").is_file());
+
+        fs::write(
+            declared.path().join("docs/reference/cel-shift-key-art.png"),
+            b"not the approved reference",
+        )
+        .unwrap();
+        fs::remove_dir_all(&output).unwrap();
+        let tampered = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(workspace.path())
+            .args([
+                "build",
+                "--inputs",
+                inputs.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("sitegen should launch");
+        let stderr = String::from_utf8_lossy(&tampered.stderr).into_owned();
+
+        assert_eq!(
+            tampered.status.code(),
+            Some(1),
+            "the declared repository's tampered reference must be refused: {stderr}"
+        );
+        assert!(stderr.contains("SHA-256"), "{stderr}");
     }
 }
 
@@ -401,6 +950,51 @@ mod progress_contract {
                 .map(str::to_owned)
                 .collect()
             );
+        }
+
+        /// The reviewed plan declares task IDs through heading prose and
+        /// nothing else, so the coupling is total: a heading reworded by one
+        /// article stops declaring its IDs, and every progress task naming one
+        /// stops validating. Anybody loosening the match to a prefix, a case
+        /// fold, or a task number would break that contract silently.
+        #[test]
+        fn renaming_a_reviewed_plan_heading_drops_the_task_ids_it_declared() {
+            let declared = plan_task_ids_from_markdown(
+                "## Task 9: Add CI and publish the reproducible POC baseline\n",
+            );
+            assert_eq!(
+                declared,
+                ["ci-baseline"].into_iter().map(str::to_owned).collect()
+            );
+
+            for reworded in [
+                "## Task 9: Add CI and publish a reproducible POC baseline\n",
+                "## Task 9: add CI and publish the reproducible POC baseline\n",
+                "## Task 9\n",
+                "## Task 9: Add CI and publish the reproducible POC baseline (revised)\n",
+            ] {
+                assert!(
+                    plan_task_ids_from_markdown(reworded).is_empty(),
+                    "{reworded}"
+                );
+            }
+        }
+
+        /// Heading depth is editorial, so the same reviewed text declares the
+        /// same IDs wherever the plan nests it.
+        #[test]
+        fn a_reviewed_heading_declares_its_task_ids_at_every_depth() {
+            for depth in 1..=6 {
+                let heading = format!(
+                    "{} Task 5: Add clamped four-way camera orbit\n",
+                    "#".repeat(depth)
+                );
+                assert_eq!(
+                    plan_task_ids_from_markdown(&heading),
+                    ["camera-orbit"].into_iter().map(str::to_owned).collect(),
+                    "{heading}"
+                );
+            }
         }
 
         #[test]
@@ -898,7 +1492,7 @@ mod progress_contract {
                 impact: "The game might not render.".to_owned(),
                 approach: "Wait for the readiness signal.".to_owned(),
                 resolution: Some(" ".to_owned()),
-                resolved_commit: Some("3333333333333333333333333333333333333333".to_owned()),
+                resolved_commit: None,
             },
         ];
 
@@ -921,6 +1515,61 @@ mod progress_contract {
                     field: "resolved_commit".to_owned(),
                 },
             ]
+        );
+    }
+
+    /// A challenge that names a commit nobody can find is a different mistake
+    /// from a challenge that names none: the first is a wrong reference to
+    /// chase, the second is a missing field to fill in. Reporting the first as
+    /// the second sends the reader looking for an empty field that is right
+    /// there in the document.
+    #[test]
+    fn a_resolved_challenge_naming_an_unknown_commit_is_reported_as_unknown_not_missing() {
+        let mut document = fixture("green-progress.json");
+        document.challenges = vec![Challenge {
+            id: "browser-readiness".to_owned(),
+            title: "Browser readiness".to_owned(),
+            status: ChallengeStatus::Resolved,
+            impact: "The game might not render.".to_owned(),
+            approach: "Wait for the readiness signal.".to_owned(),
+            resolution: Some("Waited for the readiness signal.".to_owned()),
+            resolved_commit: Some("3333333333333333333333333333333333333333".to_owned()),
+        }];
+
+        let errors = validate_progress(&document, &plan_ids(), &repo_facts()).unwrap_err();
+
+        assert_eq!(
+            errors,
+            [ProgressError::UnknownChallengeCommit {
+                challenge_id: "browser-readiness".to_owned(),
+                commit: "3333333333333333333333333333333333333333".to_owned(),
+            }]
+        );
+        assert_eq!(
+            errors[0].to_string(),
+            "challenge browser-readiness references unknown commit \
+             3333333333333333333333333333333333333333"
+        );
+    }
+
+    /// The commit a resolved challenge really names is accepted, so the new
+    /// error names a wrong reference and nothing else.
+    #[test]
+    fn a_resolved_challenge_naming_a_known_commit_is_accepted() {
+        let mut document = fixture("green-progress.json");
+        document.challenges = vec![Challenge {
+            id: "browser-readiness".to_owned(),
+            title: "Browser readiness".to_owned(),
+            status: ChallengeStatus::Resolved,
+            impact: "The game might not render.".to_owned(),
+            approach: "Wait for the readiness signal.".to_owned(),
+            resolution: Some("Waited for the readiness signal.".to_owned()),
+            resolved_commit: Some("2222222222222222222222222222222222222222".to_owned()),
+        }];
+
+        assert_eq!(
+            validate_progress(&document, &plan_ids(), &repo_facts()),
+            Ok(())
         );
     }
 }
@@ -1129,15 +1778,22 @@ mod playable_publication_contract {
     }
 
     #[test]
-    fn the_trusted_root_itself_is_not_a_package() {
+    fn no_trusted_root_is_itself_a_publishable_package() {
         let roots = trusted_playable_roots();
 
-        let result = resolve_playable_package(&roots[0], &roots);
-
         assert!(
-            matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
-            "{result:?}"
+            !roots.is_empty(),
+            "the repository build root is always trusted, so an empty list is a bug \
+             in root discovery rather than a fact about this machine"
         );
+        for root in &roots {
+            let result = resolve_playable_package(root, &roots);
+            assert!(
+                matches!(&result, Err(SitegenError::UntrustedPlayablePackage { .. })),
+                "{}: {result:?}",
+                root.display()
+            );
+        }
     }
 
     const PACKAGE_FILES: &[(&str, &str)] = &[
@@ -1201,9 +1857,23 @@ mod playable_publication_contract {
     }
 
     /// A package outside every trusted build root.
+    ///
+    /// The system temporary directory is only outside them on a machine where
+    /// `RUNNER_TEMP` is somewhere else, which is true of a GitHub runner and
+    /// of a developer machine but is not guaranteed by anything. A run where
+    /// that stops holding must say so, rather than let a fixture that is
+    /// silently trusted decide what "untrusted" proved.
     fn untrusted_package(name: &str, files: &[(&str, &str)]) -> Package {
         let root = std::env::temp_dir().join(unique_name(name));
         write_package(&root, files);
+        let canonical = fs::canonicalize(&root).unwrap();
+        let roots = trusted_playable_roots();
+        assert!(
+            !roots.iter().any(|trusted| canonical.starts_with(trusted)),
+            "{} must sit outside every trusted build root {roots:?}; RUNNER_TEMP is {:?}",
+            canonical.display(),
+            std::env::var_os("RUNNER_TEMP")
+        );
         Package(root)
     }
 }
@@ -1316,13 +1986,7 @@ mod web_source_contract {
             "the play page must mark its deliberate scroll reserve"
         );
 
-        let rule = css
-            .split_once(".scroll-reserve {")
-            .expect("play.css must style the scroll reserve")
-            .1
-            .split_once('}')
-            .expect("the scroll reserve rule must close")
-            .0;
+        let rule = css_rule(&css, ".scroll-reserve");
         assert!(
             rule.contains("min-height"),
             "the reserve must be a floor, not a fixed height, found {rule}"
@@ -1332,7 +1996,7 @@ mod web_source_contract {
             "the reserve must outgrow whatever viewport the runner has, found {rule}"
         );
 
-        let absolute = reserve_pixels(rule);
+        let absolute = reserve_pixels(rule).unwrap_or_else(|error| panic!("{error}"));
         let demanded = gate_constant("MINIMUM_SCROLL_RESERVE_PIXELS");
         assert!(
             absolute >= demanded,
@@ -1341,21 +2005,187 @@ mod web_source_contract {
         );
     }
 
-    /// The absolute pixel term of the reserve, on top of the full viewport.
-    fn reserve_pixels(rule: &str) -> f64 {
-        let calc = rule
-            .split_once("calc(")
-            .expect("the reserve must state a viewport plus an absolute floor")
-            .1;
-        let pixels = calc
-            .split_once("px")
-            .expect("the reserve must carry an absolute pixel term")
-            .0;
-        pixels
-            .rsplit(|c: char| !c.is_ascii_digit() && c != '.')
-            .next()
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or_else(|| panic!("could not read the reserve pixels from {rule}"))
+    /// The reserve exists for the browser gate's positive control, which
+    /// always loads this page as the whole document. The hub embeds the same
+    /// page in a 16:9 iframe, where the reserve only makes the embedded
+    /// document a full viewport taller than the frame showing it. A framed
+    /// document therefore drops the reserve, and the standalone page — the one
+    /// the gate actually measures — keeps every pixel of it.
+    #[test]
+    fn a_framed_play_page_drops_the_reserve_the_standalone_page_keeps() {
+        let css = source("site/static/play.css");
+        let embedded = css_rule(&css, r#"body[data-embedded="true"] .scroll-reserve"#);
+
+        assert_eq!(
+            reserve_pixels(embedded),
+            Ok(0.0),
+            "an embedded document must reserve no scroll room at all: {embedded}"
+        );
+        assert!(
+            reserve_pixels(css_rule(&css, ".scroll-reserve"))
+                .is_ok_and(|pixels| pixels >= gate_constant("MINIMUM_SCROLL_RESERVE_PIXELS")),
+            "the standalone reserve must survive the embedded override"
+        );
+
+        for (mode, expected) in [("framed", "true"), ("standalone", "")] {
+            let harness = r#"
+const fs = require("fs");
+const body = { dataset: {} };
+global.MutationObserver = class { observe() {} };
+global.document = {
+  body,
+  activeElement: null,
+  getElementById: () => null,
+  querySelector: () => null,
+};
+const self = {};
+global.window = {
+  self,
+  top: process.argv[2] === "framed" ? {} : self,
+  location: { origin: "https://example.invalid" },
+  addEventListener: () => {},
+};
+try {
+  eval(fs.readFileSync(process.argv[1], "utf8"));
+} catch (failure) {
+  if (!String(failure).includes("game.js")) {
+    console.error(failure);
+    process.exit(20);
+  }
+}
+const marker = body.dataset.embedded ?? "";
+if (marker !== process.argv[3]) {
+  console.error(`expected ${process.argv[3] || "no marker"}, got ${marker || "no marker"}`);
+  process.exit(21);
+}
+process.exit(0);
+"#;
+            let run = Command::new("node")
+                .args([
+                    "-e",
+                    harness,
+                    repository().join("site/static/play.js").to_str().unwrap(),
+                    mode,
+                    expected,
+                ])
+                .output()
+                .expect("Node should execute the dependency-free play bootstrap");
+
+            assert_eq!(
+                run.status.code(),
+                Some(0),
+                "{mode}: stdout {} stderr {}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+    }
+
+    /// The hub embeds the play page, so the two have to agree about what
+    /// "embedded" means. The stylesheet names an attribute and the bootstrap
+    /// sets one; if they drift apart the reserve silently comes back.
+    #[test]
+    fn the_stylesheet_and_the_bootstrap_agree_on_the_embedded_marker() {
+        let css = source("site/static/play.css");
+        let js = source("site/static/play.js");
+        let selector = css
+            .lines()
+            .find(|line| line.contains("data-embedded"))
+            .expect("play.css must scope a rule to the embedded document");
+
+        assert!(
+            selector.contains(r#"body[data-embedded="true"]"#),
+            "{selector}"
+        );
+        assert!(
+            js.contains("dataset.embedded"),
+            "the bootstrap must set the attribute the stylesheet keys on: {js}"
+        );
+        assert!(
+            js.contains("window.top"),
+            "the bootstrap must decide from the frame it is in: {js}"
+        );
+    }
+
+    /// One CSS rule body, from a selector that starts its own line.
+    fn css_rule<'css>(css: &'css str, selector: &str) -> &'css str {
+        let marker = format!("\n{selector} {{");
+        let start = css
+            .find(&marker)
+            .unwrap_or_else(|| panic!("play.css must declare a {selector} rule"))
+            + marker.len();
+        let body = &css[start..];
+        &body[..body.find('}').expect("the rule must close")]
+    }
+
+    /// The absolute pixel term of one `min-height` declaration.
+    ///
+    /// The browser gate demands its scroll reserve in pixels, so a rule stated
+    /// in any other absolute unit cannot be compared with that demand at all.
+    /// Reporting which unit was found leaves an actionable failure rather than
+    /// a number read out of the wrong term.
+    fn reserve_pixels(rule: &str) -> Result<f64, String> {
+        let declaration = rule
+            .split(';')
+            .find_map(|declaration| declaration.split_once("min-height:"))
+            .map(|(_, value)| value.trim())
+            .ok_or_else(|| format!("no min-height declaration in {rule}"))?;
+        let terms = match declaration.split_once("calc(") {
+            Some((_, rest)) => {
+                rest.split_once(')')
+                    .ok_or_else(|| format!("unterminated calc() in {declaration}"))?
+                    .0
+            }
+            None => declaration,
+        };
+
+        let mut pixels = 0.0;
+        for term in terms
+            .split('+')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+        {
+            let digits = term.trim_end_matches(|value: char| value.is_ascii_alphabetic());
+            let unit = &term[digits.len()..];
+            let value = digits
+                .parse::<f64>()
+                .map_err(|_| format!("{term:?} is not a length"))?;
+            match unit {
+                "px" => pixels += value,
+                // The viewport term is deliberate: the reserve is stated on top
+                // of whatever window the runner has.
+                "vh" => {}
+                "" if value == 0.0 => {}
+                other => {
+                    return Err(format!(
+                        "the reserve is stated in {other}, which cannot be compared with \
+                         the browser gate's pixel demand: {term:?}"
+                    ));
+                }
+            }
+        }
+        Ok(pixels)
+    }
+
+    /// The parser decides whether the reserve satisfies the gate, so a unit it
+    /// cannot convert has to be reported rather than silently read as the
+    /// number in front of it.
+    #[test]
+    fn the_reserve_parser_reports_a_unit_it_cannot_compare() {
+        assert_eq!(
+            reserve_pixels("min-height: calc(100vh + 720px);"),
+            Ok(720.0)
+        );
+        assert_eq!(reserve_pixels("min-height: 0;"), Ok(0.0));
+
+        let rem = reserve_pixels("min-height: calc(100vh + 45rem);\n  border: 3px solid;")
+            .expect_err("a rem reserve cannot be compared with a pixel demand");
+        assert!(rem.contains("rem"), "{rem}");
+        assert!(
+            !rem.contains("3px"),
+            "the border must never be read as the reserve: {rem}"
+        );
+        assert!(reserve_pixels("padding: 1.25rem;").is_err());
     }
 
     /// A numeric constant declared at the top of the browser gate.
@@ -1369,6 +2199,26 @@ mod web_source_contract {
             .next()
             .and_then(|value| value.trim().parse::<f64>().ok())
             .unwrap_or_else(|| panic!("{name} must be a number, found {line}"))
+    }
+
+    /// The generator judges a published browser report against bounds of its
+    /// own. Those bounds are only honest if they are the gate's: a stricter
+    /// readiness limit fails a browser the gate itself let through, a stricter
+    /// palette floor fails a canvas it accepted, and either verdict marks the
+    /// whole run unsuccessful — which suppresses the fourteen native frames
+    /// beside it, none of which the browser had anything to do with.
+    #[test]
+    fn the_published_browser_bounds_are_the_browser_gates_own_constants() {
+        assert_eq!(
+            midcreek_cs_1::sitegen::BROWSER_READY_LIMIT_SECONDS,
+            gate_constant("READY_TIMEOUT_SECONDS"),
+            "the published readiness bound must be the gate's own timeout"
+        );
+        assert_eq!(
+            midcreek_cs_1::sitegen::MINIMUM_PALETTE_CLASSES as f64,
+            gate_constant("MINIMUM_PALETTE_CLASSES"),
+            "the published palette floor must be the gate's own minimum"
+        );
     }
 
     #[test]
@@ -1695,15 +2545,15 @@ mod web_source_contract {
 
 mod verification_publication_contract {
     use super::support::{
-        browser_root, green_evidence, prior_gallery, raw_report, verification_root,
+        browser_root, green_evidence, prior_gallery, raw_browser, raw_report, verification_root,
     };
     use super::*;
     use midcreek_cs_1::{
         design::{CHARACTER_SHEET_SHA256, KEY_ART_SHA256},
         sitegen::{
             BROWSER_FRAME_FILE, CURRENT_SCREENSHOTS, GALLERY_FILE, GALLERY_FRAMES, GalleryManifest,
-            GateStatus, GateSummary, HISTORY_SCREENSHOTS, VERIFICATION_FILE, VerificationEvidence,
-            VerificationSummary, WORKER_CROP_FILE, update_gallery,
+            GateStatus, GateSummary, HISTORY_SCREENSHOTS, SCREENSHOTS_ROOT, VERIFICATION_FILE,
+            VerificationEvidence, VerificationSummary, WORKER_CROP_FILE, update_gallery,
         },
         verification::{ARTIFACT_NAMES, FrameName, VerificationReport},
     };
@@ -1717,11 +2567,63 @@ mod verification_publication_contract {
     fn the_public_projection_carries_only_declared_evidence() {
         let summary = green_evidence().summary;
         let json = serde_json::to_string(&summary).unwrap();
+        let value = serde_json::to_value(&summary).unwrap();
 
-        // Round-tripping through the strict public shape proves the projection
-        // emits nothing the published schema does not declare.
-        let parsed = serde_json::from_str::<VerificationSummary>(&json).unwrap();
-        assert_eq!(parsed, summary);
+        // The published schema is the whole contract: a projection that grew a
+        // field would publish it, whatever the strict shape claims, so the
+        // exact key set is asserted against a hand-written list rather than
+        // round-tripped through the same shape that produced it.
+        assert_eq!(
+            keys(&value),
+            [
+                "browser",
+                "camera",
+                "failed_stage",
+                "frames",
+                "gates",
+                "hashes",
+                "metric_failures",
+                "metrics",
+                "schema_version",
+                "semantic_visual_hash",
+                "stages",
+                "succeeded",
+            ]
+        );
+        assert_eq!(
+            keys(&value["frames"][0]),
+            [
+                "artifact",
+                "camera_settled",
+                "camera_yaw_degrees",
+                "equipment_on_screen",
+                "heading",
+                "height",
+                "hud_status",
+                "name",
+                "open_tickets",
+                "rack_states",
+                "stage",
+                "width",
+                "worker_crop",
+            ]
+        );
+        assert_eq!(
+            keys(&value["browser"]),
+            [
+                "canvas_height",
+                "canvas_width",
+                "palette_classes",
+                "ready_seconds",
+                "sampled_pixels",
+                "screenshot",
+                "unmatched_share",
+            ]
+        );
+        assert_eq!(
+            keys(&value["hashes"]),
+            ["asset_sources", "assets", "references", "sources"]
+        );
         for forbidden in [
             "command_line",
             "stdout",
@@ -1736,6 +2638,18 @@ mod verification_publication_contract {
         ] {
             assert!(!json.contains(forbidden), "{forbidden} leaked into {json}");
         }
+    }
+
+    /// Every key of one published object, in sorted order.
+    fn keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .unwrap_or_else(|| panic!("expected a published object, got {value}"))
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     #[test]
@@ -1765,14 +2679,140 @@ mod verification_publication_contract {
         assert_eq!(summary.metrics.get("browser.palette-classes"), Some(&9.0));
     }
 
+    /// The published hash has to describe the report the game wrote, not the
+    /// run that published it: the same report projected from a different
+    /// directory, and with or without the browser gate beside it, is the same
+    /// visual point, while any change to what the game actually recorded is a
+    /// different one. That is what the screenshot history deduplicates on, so
+    /// a hash that tracked anything else would either duplicate a point or
+    /// swallow a real change.
     #[test]
-    fn the_semantic_hash_is_the_games_own_canonical_report_hash() {
-        let report = raw_report("report.json");
-        let expected = midcreek_cs_1::verification::semantic_hash(
-            &midcreek_cs_1::verification::canonical_json(&report),
+    fn the_semantic_hash_describes_the_report_and_nothing_around_it() {
+        let published = green_evidence().summary.semantic_visual_hash;
+        assert_eq!(published.len(), 64, "{published}");
+        assert!(
+            published
+                .chars()
+                .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()),
+            "{published}"
         );
 
-        assert_eq!(green_evidence().summary.semantic_visual_hash, expected);
+        let relocated = scratch("semantic-hash-relocated");
+        copy_verification_fixture(relocated.path());
+        assert_eq!(
+            hash_of(&raw_report("report.json"), relocated.path()),
+            published,
+            "the same report published from another directory is the same point"
+        );
+        assert_eq!(
+            hash_of(&raw_report("report.json"), &verification_root()),
+            published,
+            "the browser gate beside it is not part of the game's own report"
+        );
+
+        // A field the projection publishes, and a field it deliberately drops,
+        // both belong to the report and both have to move the hash.
+        let mut published_field = raw_report("report.json");
+        published_field.gameplay.tickets_emitted += 1;
+        assert_ne!(hash_of(&published_field, &verification_root()), published);
+
+        let mut dropped_field = raw_report("report.json");
+        dropped_field.failure_reason = Some("the capture timed out while writing".to_owned());
+        assert_ne!(hash_of(&dropped_field, &verification_root()), published);
+        assert!(
+            !serde_json::to_string(
+                &VerificationEvidence::project(&dropped_field, &verification_root(), None)
+                    .unwrap()
+                    .summary
+            )
+            .unwrap()
+            .contains("timed out"),
+            "the dropped field still never reaches the page"
+        );
+    }
+
+    fn hash_of(report: &VerificationReport, artifacts: &Path) -> String {
+        VerificationEvidence::project(report, artifacts, None)
+            .expect("the fixture evidence projects")
+            .summary
+            .semantic_visual_hash
+    }
+
+    /// A browser gate row that is green because a report exists says nothing
+    /// about what the browser did. Readiness is published from the measured
+    /// seconds against the bound the gate itself enforces.
+    #[test]
+    fn a_browser_slower_than_the_published_readiness_bound_fails_its_own_gate() {
+        let mut gate = raw_browser();
+        gate.ready_seconds = 45.0;
+
+        let summary = project_with_browser(&gate).summary;
+
+        let readiness = named_gate(&summary, "Browser readiness");
+        assert_eq!(readiness.status, GateStatus::Failed);
+        assert_eq!((readiness.passed, readiness.failed), (0, 1));
+        assert!(
+            summary
+                .metric_failures
+                .iter()
+                .any(|failure| failure.metric == "browser.ready-seconds"),
+            "{:?}",
+            summary.metric_failures
+        );
+        assert!(!summary.succeeded);
+    }
+
+    /// The same row stays green, and keeps reporting the duration it really
+    /// measured, for a browser that was ready in time.
+    #[test]
+    fn a_browser_ready_within_the_bound_still_publishes_a_passed_readiness_gate() {
+        let summary = green_evidence().summary;
+
+        let readiness = named_gate(&summary, "Browser readiness");
+        assert_eq!(readiness.status, GateStatus::Passed);
+        assert_eq!((readiness.passed, readiness.failed), (1, 0));
+        assert_eq!(readiness.duration_ms, 4_820);
+    }
+
+    /// A palette row that failed used to publish "0 failed", so the published
+    /// matrix said a red gate found nothing wrong with it.
+    #[test]
+    fn a_canvas_missing_approved_palette_classes_publishes_the_failure_it_found() {
+        let mut gate = raw_browser();
+        gate.pixels.palette_classes = vec!["floor".to_owned(), "rack".to_owned()];
+
+        let summary = project_with_browser(&gate).summary;
+
+        let palette = named_gate(&summary, "Browser canvas palette");
+        assert_eq!(palette.status, GateStatus::Failed);
+        assert_eq!(palette.passed, 2);
+        assert_eq!(
+            palette.failed, 1,
+            "a failed gate has to report at least one failure"
+        );
+        assert!(!summary.succeeded);
+    }
+
+    fn project_with_browser(
+        gate: &midcreek_cs_1::sitegen::BrowserGateReport,
+    ) -> VerificationEvidence {
+        VerificationEvidence::project(
+            &raw_report("report.json"),
+            &verification_root(),
+            Some((gate, browser_root().as_path())),
+        )
+        .expect("the fixture evidence projects")
+    }
+
+    fn named_gate<'summary>(
+        summary: &'summary VerificationSummary,
+        name: &str,
+    ) -> &'summary GateSummary {
+        summary
+            .gates
+            .iter()
+            .find(|gate| gate.name == name)
+            .unwrap_or_else(|| panic!("expected a {name:?} gate in {:?}", summary.gates))
     }
 
     #[test]
@@ -2043,6 +3083,66 @@ mod verification_publication_contract {
         assert_eq!(
             entry.frames.get("worker").map(String::as_str),
             Some(format!("{HISTORY_SCREENSHOTS}/33333333/{WORKER_CROP_FILE}").as_str())
+        );
+    }
+
+    /// Only the *latest* entry's hash suppresses a new point, so a revert to
+    /// pixels the history already recorded earlier opens a new point rather
+    /// than reusing the old one. That is the documented behaviour: the history
+    /// is a timeline of what was published when, not a set of distinct
+    /// appearances, and a revert really is a later moment at which the project
+    /// looked that way.
+    #[test]
+    fn reverting_to_an_older_visual_hash_opens_a_new_history_point() {
+        let original = prior_gallery();
+        let first_hash = original.entries[0].semantic_visual_hash.clone();
+        let moved_on = update_gallery(
+            &original,
+            &report_with_hash(&"b".repeat(64)),
+            &commit_summary("3333333333333333333333333333333333333333"),
+        );
+        assert_eq!(moved_on.entries.len(), 2);
+
+        let reverted = update_gallery(
+            &moved_on,
+            &report_with_hash(&first_hash),
+            &commit_summary("4444444444444444444444444444444444444444"),
+        );
+
+        assert_eq!(reverted.entries.len(), 3);
+        let entry = reverted.entries.last().unwrap();
+        assert_eq!(entry.semantic_visual_hash, first_hash);
+        assert_eq!(entry.source_commit, "4".repeat(40));
+
+        let mut inputs = site_inputs("verified-game");
+        inputs.gallery = Some(moved_on);
+        inputs
+            .verification
+            .as_mut()
+            .unwrap()
+            .summary
+            .semantic_visual_hash = first_hash;
+        let source_commit = inputs.workflow.source_commit.clone();
+        let html = build_site_from_inputs("rendered-revert", &inputs)
+            .unwrap()
+            .index_html();
+        let document = scraper::Html::parse_document(&html);
+        let entries = scraper::Selector::parse("#screenshots .screenshot-entry").unwrap();
+        let new_entries = document
+            .select(&entries)
+            .filter(|entry| entry.text().any(|text| text.contains("New this build")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            new_entries.len(),
+            1,
+            "only the appended history point may carry the badge: {html}"
+        );
+        assert!(
+            new_entries[0]
+                .text()
+                .any(|text| text.contains(&source_commit[..8])),
+            "the badge must identify the appended commit: {html}"
         );
     }
 
@@ -2419,6 +3519,122 @@ mod verification_publication_contract {
         assert!(html.contains(summary.hashes.sources["src/verification.rs"].as_str()));
     }
 
+    /// A history point can move a dozen metrics at once, so the list has to
+    /// lead with the movement a reader is looking for rather than with
+    /// whichever metric name sorts first.
+    #[test]
+    fn the_history_lists_the_largest_metric_movement_first() {
+        let mut inputs = site_inputs("green");
+        let mut gallery = prior_gallery();
+        gallery.entries[0].metric_deltas = [
+            ("aaa.tiny", 0.25),
+            ("mmm.middling", -5.0),
+            ("zzz.largest", 42.0),
+            ("bbb.unmoved", 0.0),
+        ]
+        .into_iter()
+        .map(|(name, delta)| (name.to_owned(), delta))
+        .collect();
+        inputs.gallery = Some(gallery);
+
+        let html = build_site_from_inputs("delta-order", &inputs)
+            .unwrap()
+            .index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("#screenshots .delta-list code").unwrap();
+        let order = document
+            .select(&selector)
+            .map(|code| code.text().collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            ["zzz.largest", "mmm.middling", "aaa.tiny"],
+            "the list must be ordered by how far each metric moved"
+        );
+    }
+
+    /// Every pixel a build promotes is evidence somebody has to be able to
+    /// look at. A frame copied into the published tree but linked from
+    /// nowhere is weight the site serves and nobody can see.
+    #[test]
+    fn every_promoted_pixel_is_linked_from_the_published_page() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let html = site.index_html();
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse("img[src], a[href], iframe[src]").unwrap();
+        let linked = document
+            .select(&selector)
+            .filter_map(|element| {
+                element
+                    .value()
+                    .attr("src")
+                    .or_else(|| element.value().attr("href"))
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        let mut promoted = Vec::new();
+        collect_relative(
+            &site.root().join(SCREENSHOTS_ROOT),
+            site.root(),
+            &mut promoted,
+        );
+        promoted.sort();
+
+        assert!(
+            promoted.len() > GALLERY_FRAMES.len(),
+            "this fixture promotes every captured frame: {promoted:?}"
+        );
+        for file in &promoted {
+            let target = file.to_string_lossy().into_owned();
+            assert!(
+                linked.contains(&target),
+                "{target} was promoted but the page links nothing to it"
+            );
+        }
+    }
+
+    /// The other direction of the same rule: the current-frame strip may only
+    /// point at pixels this build itself copied. The projection the strip used
+    /// to be rendered from is an input that describes what a run *reported*;
+    /// the publication record describes what was really written, and only the
+    /// second one can vouch for a link. When the two disagree the page has to
+    /// follow the copies, because a visitor can only open a file that exists.
+    #[test]
+    fn the_current_frame_strip_links_exactly_the_frames_this_build_copied() {
+        let site = build_fixture_site("verified-game").unwrap();
+        let document = scraper::Html::parse_document(&site.index_html());
+        let selector = scraper::Selector::parse("#screenshots img[src]").unwrap();
+        let linked = document
+            .select(&selector)
+            .filter_map(|image| image.value().attr("src"))
+            .filter(|source| source.starts_with(&format!("{CURRENT_SCREENSHOTS}/")))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        let mut published = Vec::new();
+        collect_relative(
+            &site.root().join(CURRENT_SCREENSHOTS),
+            site.root(),
+            &mut published,
+        );
+        // The technician crop and the browser canvas are derived proofs shown
+        // beside the references they are compared with, not captures of the
+        // run, so the strip is the whole of the rest.
+        let captured = published
+            .iter()
+            .map(|file| file.to_string_lossy().into_owned())
+            .filter(|file| !file.ends_with(WORKER_CROP_FILE) && !file.ends_with(BROWSER_FRAME_FILE))
+            .collect::<BTreeSet<_>>();
+
+        assert!(captured.len() > 1, "{captured:?}");
+        assert_eq!(
+            linked, captured,
+            "the strip must link the frames this build copied, no more and no less"
+        );
+    }
+
     #[test]
     fn renders_the_screenshot_history_with_accessible_images() {
         let site = build_fixture_site("verified-game").unwrap();
@@ -2744,6 +3960,687 @@ mod verification_publication_contract {
         for entry in fs::read_dir(verification_root()).unwrap() {
             let entry = entry.unwrap();
             fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+/// The generated README status block, the `check` gate that maintains it, and
+/// the `readme` command that regenerates it.
+mod readme_status_contract {
+    use std::{
+        path::PathBuf,
+        process::{Command, Output, Stdio},
+    };
+
+    use midcreek_cs_1::sitegen::{
+        Challenge, ChallengeStatus, ProgressDocument, ProgressStatus, ProgressTask,
+        README_STATUS_END, README_STATUS_START, ReadmeStatusError, check_readme_status,
+        readme_status_block, render_readme_status, replace_readme_status,
+    };
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // What the generated block says
+    // -----------------------------------------------------------------------
+
+    /// The published facts are read from the parsed progress document and the
+    /// plan; the identity rows are digests of the stored source bytes. The two
+    /// are deliberately independent, so this test hands over sources whose
+    /// bytes say nothing about the document, and hand-computed digests of
+    /// exactly those bytes.
+    #[test]
+    fn the_generated_block_publishes_the_current_task_counts_and_source_digests() {
+        let block = render_readme_status(&sample_progress(), PROGRESS_BYTES, PLAN_BYTES);
+
+        assert_eq!(
+            block,
+            "<!-- sitegen:status:start -->\n\
+             <!-- Generated by `sitegen readme --repository .`; never edit this block by hand. -->\n\
+             \n\
+             | Generated status | Value |\n\
+             | --- | --- |\n\
+             | Working now | `camera-orbit` — Add clamped four-way camera orbit |\n\
+             | Tasks | 2 done, 1 in progress, 1 future, 4 total |\n\
+             | Challenges | 1 open, 2 resolved, 3 total |\n\
+             | Reviewed plan tasks | 1 |\n\
+             | `docs/progress.json` | sha256 `2da8132c318debfb` |\n\
+             | `docs/implementation-plan.md` | sha256 `2d4cd172d74e4d1b` |\n\
+             <!-- sitegen:status:end -->"
+        );
+    }
+
+    #[test]
+    fn a_project_with_nothing_in_progress_publishes_that_instead_of_a_task() {
+        let mut progress = sample_progress();
+        progress
+            .tasks
+            .retain(|task| task.status == ProgressStatus::Done);
+
+        let block = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        assert!(
+            block.contains("| Working now | all planned work complete |"),
+            "{block}"
+        );
+        assert!(
+            block.contains("| Tasks | 2 done, 0 in progress, 0 future, 2 total |"),
+            "{block}"
+        );
+    }
+
+    /// The block is the README's promise that it still describes the sources.
+    /// A change either source can make that the published counts do not move —
+    /// a reworded summary, an added plan paragraph — must still make a stored
+    /// block stale, or the promise is only about the counts.
+    #[test]
+    fn a_source_change_the_counts_do_not_show_still_makes_a_stored_block_stale() {
+        let progress = sample_progress();
+        let baseline = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        // One trailing space: the same document, different stored bytes.
+        let reformatted = render_readme_status(&progress, "{\"canonical\":\"bytes\"} ", PLAN_BYTES);
+        // One added paragraph: the same declared plan tasks, different prose.
+        let annotated = render_readme_status(
+            &progress,
+            PROGRESS_BYTES,
+            "# Reviewed plan\n\n## Task 5: Add clamped four-way camera orbit\n\nA note.\n",
+        );
+
+        assert!(
+            reformatted.contains("sha256 `19483733685a28a5`"),
+            "{reformatted}"
+        );
+        assert!(
+            annotated.contains("sha256 `d3fa800b0dbe02a3`"),
+            "{annotated}"
+        );
+        assert!(check_readme_status(&stored(&baseline), &reformatted).is_err());
+        assert!(check_readme_status(&stored(&baseline), &annotated).is_err());
+        assert!(check_readme_status(&stored(&baseline), &baseline).is_ok());
+    }
+
+    /// Task titles are prose, and a `|` in prose closes a Markdown table cell.
+    /// A title that could open a column of its own would publish a row nobody
+    /// wrote into a block nobody is allowed to hand-edit.
+    #[test]
+    fn a_task_title_can_never_break_out_of_its_generated_table_cell() {
+        let mut progress = sample_progress();
+        progress
+            .tasks
+            .iter_mut()
+            .find(|task| task.status == ProgressStatus::InProgress)
+            .expect("the sample document has a current task")
+            .title = "Ship | now\nand later".to_owned();
+
+        let block = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        assert!(
+            block.contains("| Working now | `camera-orbit` — Ship \\| now and later |\n"),
+            "{block}"
+        );
+        assert_eq!(
+            block.lines().count(),
+            render_readme_status(&sample_progress(), PROGRESS_BYTES, PLAN_BYTES)
+                .lines()
+                .count()
+        );
+    }
+
+    #[test]
+    fn a_backslash_before_a_pipe_cannot_break_out_of_a_generated_table_cell() {
+        let mut progress = sample_progress();
+        progress
+            .tasks
+            .iter_mut()
+            .find(|task| task.status == ProgressStatus::InProgress)
+            .expect("the sample document has a current task")
+            .title = r"Ship \| now".to_owned();
+
+        let block = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        assert!(
+            block.contains(
+                r"| Working now | `camera-orbit` — Ship \\\| now |
+"
+            ),
+            "{block}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading and replacing the block
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regenerating_the_block_preserves_every_byte_outside_it() {
+        let readme = format!(
+            "# Title\n\nProse before.\n\n{README_STATUS_START}\nold\n{README_STATUS_END}\n\nProse after.\n"
+        );
+
+        let updated = replace_readme_status(
+            &readme,
+            &format!("{README_STATUS_START}\nnew\n{README_STATUS_END}"),
+        )
+        .expect("a well formed block should be replaceable");
+
+        assert_eq!(
+            updated,
+            format!(
+                "# Title\n\nProse before.\n\n{README_STATUS_START}\nnew\n{README_STATUS_END}\n\nProse after.\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_block_a_readme_carries_is_read_back_with_its_delimiters() {
+        let block = format!("{README_STATUS_START}\nbody\n{README_STATUS_END}");
+        let readme = format!("before\n{block}\nafter\n");
+
+        assert_eq!(readme_status_block(&readme), Ok(block.as_str()));
+    }
+
+    /// Every one of these is a README a mutating command must refuse rather
+    /// than "repair": each has more than one, or fewer than one, plausible
+    /// span, and choosing any of them rewrites bytes the generator does not
+    /// own.
+    #[test]
+    fn a_missing_duplicated_or_inverted_block_is_refused_rather_than_repaired() {
+        let cases: [(&str, String, ReadmeStatusError); 6] = [
+            (
+                "neither delimiter",
+                "# Title\n\nProse only.\n".to_owned(),
+                ReadmeStatusError::Missing,
+            ),
+            (
+                "opened but never closed",
+                format!("before\n{README_STATUS_START}\nbody\n"),
+                ReadmeStatusError::MissingDelimiter {
+                    delimiter: README_STATUS_END,
+                },
+            ),
+            (
+                "closed but never opened",
+                format!("before\nbody\n{README_STATUS_END}\n"),
+                ReadmeStatusError::MissingDelimiter {
+                    delimiter: README_STATUS_START,
+                },
+            ),
+            (
+                "two openings",
+                format!("{README_STATUS_START}\na\n{README_STATUS_START}\nb\n{README_STATUS_END}"),
+                ReadmeStatusError::DuplicateDelimiter {
+                    delimiter: README_STATUS_START,
+                    count: 2,
+                },
+            ),
+            (
+                "two closings",
+                format!("{README_STATUS_START}\na\n{README_STATUS_END}\nb\n{README_STATUS_END}"),
+                ReadmeStatusError::DuplicateDelimiter {
+                    delimiter: README_STATUS_END,
+                    count: 2,
+                },
+            ),
+            (
+                "closed before it opens",
+                format!("{README_STATUS_END}\nbody\n{README_STATUS_START}"),
+                ReadmeStatusError::Inverted,
+            ),
+        ];
+
+        for (case, readme, expected) in cases {
+            assert_eq!(
+                readme_status_block(&readme),
+                Err(expected.clone()),
+                "{case}"
+            );
+            assert_eq!(
+                replace_readme_status(&readme, "anything"),
+                Err(expected),
+                "{case}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `sitegen check` against this repository
+    // -----------------------------------------------------------------------
+
+    /// The gate has to pass for the checkout it is committed in, and its
+    /// verdict may not depend on where it was launched from.
+    #[test]
+    fn check_passes_for_this_repository_from_an_unrelated_working_directory() {
+        let finished = sitegen(
+            &["check", "--repository", repository().to_str().unwrap()],
+            &std::env::temp_dir(),
+        );
+
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert_eq!(String::from_utf8(finished.stdout).unwrap(), "ci-baseline\n");
+        assert!(String::from_utf8_lossy(&finished.stderr).is_empty());
+    }
+
+    /// `check` builds a whole site to validate it. Leaving that build behind
+    /// would grow the temporary directory of every machine and every runner
+    /// that ever ran the gate.
+    #[test]
+    fn check_removes_the_site_it_builds_to_reach_its_verdict() {
+        let child = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(std::env::temp_dir())
+            .args(["check", "--repository", repository().to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sitegen should launch");
+        let prefix = format!("sitegen-check-{}-", child.id());
+        let finished = child.wait_with_output().expect("sitegen should finish");
+
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        let left_behind = fs::read_dir(std::env::temp_dir())
+            .expect("the temporary directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect::<Vec<_>>();
+
+        assert!(left_behind.is_empty(), "{left_behind:?}");
+    }
+
+    #[test]
+    fn check_and_readme_require_a_repository() {
+        for arguments in [
+            vec!["check"],
+            vec!["readme"],
+            vec!["check", "--progress", "docs/progress.json"],
+            vec!["readme", "--repository", ".", "--plan", "docs/x.md"],
+        ] {
+            let finished = sitegen(&arguments, repository());
+
+            assert_eq!(finished.status.code(), Some(2), "{arguments:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `sitegen check` against a mirror of this repository
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_refuses_a_readme_whose_generated_block_is_missing_duplicated_or_stale() {
+        for (case, mutate, expected) in [
+            (
+                "stale",
+                &(|mirror: &Mirror| {
+                    let readme = mirror.read("README.md");
+                    let block = readme_status_block(&readme).unwrap().replace(
+                        "| Reviewed plan tasks | 13 |",
+                        "| Reviewed plan tasks | 99 |",
+                    );
+                    mirror.write(
+                        "README.md",
+                        &replace_readme_status(&readme, &block).unwrap(),
+                    );
+                }) as &dyn Fn(&Mirror),
+                "the generated status block is stale",
+            ),
+            (
+                "missing",
+                &|mirror: &Mirror| {
+                    let readme = mirror.read("README.md");
+                    mirror.write("README.md", &replace_readme_status(&readme, "").unwrap());
+                },
+                "the generated status block is missing",
+            ),
+            (
+                "duplicated",
+                &|mirror: &Mirror| {
+                    let readme = mirror.read("README.md");
+                    let block = readme_status_block(&readme).unwrap().to_owned();
+                    mirror.write("README.md", &format!("{readme}\n{block}\n"));
+                },
+                "appears 2 times",
+            ),
+            (
+                "left behind by an edited progress document",
+                &|mirror: &Mirror| {
+                    let progress = mirror.read("docs/progress.json");
+                    mirror.write("docs/progress.json", &format!("{progress}\n"));
+                },
+                "the generated status block is stale",
+            ),
+        ] {
+            let mirror = Mirror::new(case);
+            mutate(&mirror);
+            let refused = mirror.read("README.md");
+
+            let finished = mirror.run("check");
+            let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+            assert_eq!(finished.status.code(), Some(1), "{case}: {stderr}");
+            assert!(stderr.contains("README.md"), "{case}: {stderr}");
+            assert!(stderr.contains(expected), "{case}: {stderr}");
+            // The gate reports; only `readme` repairs. A check that quietly
+            // rewrote the block would pass on its own second run and publish
+            // whatever the sources happened to say.
+            assert_eq!(mirror.read("README.md"), refused, "{case}");
+        }
+    }
+
+    /// The reviewed plan declares task IDs through heading prose alone, so a
+    /// reworded heading silently stops declaring them. The gate is what turns
+    /// that silence into a failure.
+    #[test]
+    fn check_refuses_progress_task_ids_the_reviewed_plan_no_longer_declares() {
+        let mirror = Mirror::new("plan-heading");
+        let plan = mirror.read("docs/implementation-plan.md");
+        mirror.write(
+            "docs/implementation-plan.md",
+            &plan.replace(
+                "Task 9: Add CI and publish the reproducible POC baseline",
+                "Task 9: Add CI and publish the POC baseline",
+            ),
+        );
+        mirror.regenerate_readme();
+
+        let finished = mirror.run("check");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("task id is not in the reviewed plan: ci-baseline"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_reference_asset_that_no_longer_matches_the_manifest() {
+        let mirror = Mirror::new("reference-drift");
+        let key_art = mirror.path().join("docs/reference/cel-shift-key-art.png");
+        let mut bytes = fs::read(&key_art).unwrap();
+        bytes.push(0);
+        fs::write(&key_art, bytes).unwrap();
+
+        let finished = mirror.run("check");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("cel-shift-key-art.png"), "{stderr}");
+    }
+
+    /// Nothing above this reaches the generator: progress, references, and the
+    /// README are all judged from the sources alone. This is the failure only
+    /// a real build finds — two reviewed headings declaring one task ID
+    /// publish the same anchor twice — so it is the proof that `check` really
+    /// generates and validates a site rather than only reading documents.
+    #[test]
+    fn check_refuses_a_plan_that_generates_a_page_the_site_rules_reject() {
+        let mirror = Mirror::new("duplicate-anchor");
+        let plan = mirror.read("docs/implementation-plan.md");
+        mirror.write(
+            "docs/implementation-plan.md",
+            &format!("{plan}\n### Task 5: Add clamped four-way camera orbit\n"),
+        );
+        mirror.regenerate_readme();
+
+        let finished = mirror.run("check");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("duplicate id"), "{stderr}");
+        assert!(stderr.contains("plan-camera-orbit"), "{stderr}");
+    }
+
+    // -----------------------------------------------------------------------
+    // `sitegen readme`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regenerating_the_readme_rewrites_only_the_block_and_restores_the_gate() {
+        let mirror = Mirror::new("regenerate");
+        let before = mirror.read("README.md");
+        let progress = mirror.read("docs/progress.json");
+        mirror.write("docs/progress.json", &format!("{progress}\n"));
+        assert_eq!(mirror.run("check").status.code(), Some(1));
+
+        let regenerated = mirror.run("readme");
+        assert_eq!(
+            regenerated.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&regenerated.stderr)
+        );
+
+        let after = mirror.read("README.md");
+        assert_ne!(after, before);
+        assert_eq!(outside_block(&after), outside_block(&before));
+        assert_eq!(
+            mirror.run("check").status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&mirror.run("check").stderr)
+        );
+    }
+
+    /// A README with two opening delimiters has no single span the generator
+    /// owns. Rewriting one of them would silently rewrite bytes a person
+    /// wrote, so the command refuses and leaves the file exactly as it found
+    /// it.
+    #[test]
+    fn regenerating_a_malformed_readme_refuses_and_writes_nothing() {
+        let mirror = Mirror::new("malformed-regenerate");
+        let readme = mirror.read("README.md");
+        let block = readme_status_block(&readme).unwrap().to_owned();
+        let malformed = format!("{readme}\n{block}\n");
+        mirror.write("README.md", &malformed);
+
+        let finished = mirror.run("readme");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("appears 2 times"), "{stderr}");
+        assert_eq!(mirror.read("README.md"), malformed);
+        assert!(
+            fs::read_dir(mirror.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "a refused regeneration must leave no partial file behind"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Stored bytes that say nothing about the document beside them, so a
+    /// digest row can only come from the bytes it was handed.
+    const PROGRESS_BYTES: &str = "{\"canonical\":\"bytes\"}";
+
+    /// A plan declaring exactly one reviewed task ID.
+    const PLAN_BYTES: &str = "# Reviewed plan\n\n## Task 5: Add clamped four-way camera orbit\n";
+
+    fn sample_progress() -> ProgressDocument {
+        ProgressDocument {
+            schema_version: 1,
+            project: "Cell Shift Data Center POC".to_owned(),
+            tasks: vec![
+                task(
+                    "foundation-contracts",
+                    "Establish reviewed contracts",
+                    ProgressStatus::Done,
+                ),
+                task(
+                    "pages-foundation",
+                    "Publish the status-only hub",
+                    ProgressStatus::Done,
+                ),
+                task(
+                    "camera-orbit",
+                    "Add clamped four-way camera orbit",
+                    ProgressStatus::InProgress,
+                ),
+                task(
+                    "ci-baseline",
+                    "Publish the reproducible baseline",
+                    ProgressStatus::Future,
+                ),
+            ],
+            challenges: vec![
+                challenge("open-one", ChallengeStatus::Open),
+                challenge("resolved-one", ChallengeStatus::Resolved),
+                challenge("resolved-two", ChallengeStatus::Resolved),
+            ],
+        }
+    }
+
+    fn task(id: &str, title: &str, status: ProgressStatus) -> ProgressTask {
+        ProgressTask {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            status,
+            depends_on: Vec::new(),
+            summary: "Summary.".to_owned(),
+            completed_commit: (status == ProgressStatus::Done).then(|| "1".repeat(40)),
+        }
+    }
+
+    fn challenge(id: &str, status: ChallengeStatus) -> Challenge {
+        Challenge {
+            id: id.to_owned(),
+            title: "A challenge".to_owned(),
+            status,
+            impact: "Impact.".to_owned(),
+            approach: "Approach.".to_owned(),
+            resolution: (status == ChallengeStatus::Resolved).then(|| "Resolved.".to_owned()),
+            resolved_commit: (status == ChallengeStatus::Resolved).then(|| "1".repeat(40)),
+        }
+    }
+
+    /// A README that carries exactly one generated block.
+    fn stored(block: &str) -> String {
+        format!("# Title\n\n{block}\n\nProse.\n")
+    }
+
+    /// Everything a README says outside its generated block.
+    fn outside_block(readme: &str) -> String {
+        let block = readme_status_block(readme).expect("the README should carry one block");
+        readme.replace(block, "")
+    }
+
+    fn repository() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn sitegen(arguments: &[&str], working_directory: &Path) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(working_directory)
+            .args(arguments)
+            .output()
+            .expect("sitegen should launch")
+    }
+
+    /// A second checkout of this repository holding only the documents
+    /// `sitegen check` reads.
+    ///
+    /// The object database is shared with the real checkout, so every commit
+    /// `docs/progress.json` names still resolves and `HEAD` is this branch's
+    /// head. The documents themselves are copied from the working tree rather
+    /// than checked out of `HEAD`, so a mirror judges the sources as they are
+    /// right now and the only thing wrong with one is the thing a test put
+    /// there.
+    struct Mirror(PathBuf);
+
+    impl Mirror {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = repository()
+                .join("target/check-mirrors")
+                .join(format!("{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            git(&[
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                repository().to_str().unwrap(),
+                root.to_str().unwrap(),
+            ]);
+            copy_tree(&repository().join("docs"), &root.join("docs"));
+            fs::copy(repository().join("README.md"), root.join("README.md")).unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn read(&self, relative: &str) -> String {
+            read(self.0.join(relative))
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            fs::write(self.0.join(relative), contents).unwrap();
+        }
+
+        fn run(&self, command: &str) -> Output {
+            sitegen(
+                &[command, "--repository", self.0.to_str().unwrap()],
+                &std::env::temp_dir(),
+            )
+        }
+
+        fn regenerate_readme(&self) {
+            let finished = self.run("readme");
+            assert_eq!(
+                finished.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&finished.stderr)
+            );
+        }
+    }
+
+    impl Drop for Mirror {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(arguments: &[&str]) {
+        let finished = Command::new("git")
+            .args(arguments)
+            .output()
+            .expect("git should launch");
+        assert!(
+            finished.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
         }
     }
 }

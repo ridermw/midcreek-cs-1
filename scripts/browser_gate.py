@@ -489,9 +489,10 @@ def wait_for_ready(session: DevTools, diagnostics: Path) -> float:
     state = "missing"
     while time.monotonic() < deadline:
         state = session.evaluate("document.body ? document.body.dataset.gameState : 'missing'")
-        if state == "ready":
-            return READY_TIMEOUT_SECONDS - (deadline - time.monotonic())
-        if state == "error":
+        observed_at = time.monotonic()
+        if state == "ready" and observed_at <= deadline:
+            return READY_TIMEOUT_SECONDS - (deadline - observed_at)
+        if state in ("ready", "error"):
             break
         time.sleep(0.25)
     errors = session.evaluate(
