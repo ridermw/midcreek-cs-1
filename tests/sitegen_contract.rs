@@ -16,6 +16,30 @@ use support::{
     plan_ids, read, repo_facts, sha256, site_inputs, validate_fixture,
 };
 
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+fn link_privilege_missing(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(50 | 1314))
+}
+
 mod generated_site_contract {
     use super::*;
 
@@ -1766,7 +1790,14 @@ mod playable_publication_contract {
         let outside = untrusted_package("symlink-escape-target", PACKAGE_FILES);
         let holder = package("symlink-escape-holder", &[]);
         let link = holder.path().join("web");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        if let Err(error) = symlink_dir(outside.path(), &link) {
+            assert!(link_privilege_missing(&error), "{error}");
+            eprintln!(
+                "skipping the symbolic-link package contract: this Windows session may not create \
+                 symbolic links ({error}). The contract is exercised on every Unix run and in CI."
+            );
+            return;
+        }
         assert!(link.join("game_bg.wasm").is_file());
 
         let result = resolve_playable_package(&link, &trusted_playable_roots());
@@ -2463,6 +2494,7 @@ process.exit(0);
         assert_eq!(read(sandbox.path().join("keep-me.txt")), "not ours");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_browser_gate_refuses_source_root_and_symlink_diagnostics_paths() {
         let sandbox = Sandbox::new_in(repository().join("target"), "web-smoke-links");
@@ -2522,6 +2554,7 @@ process.exit(0);
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_web_scripts_are_executable() {
         for relative in ["scripts/build-web.sh", "scripts/web-smoke.sh"] {
@@ -2889,7 +2922,14 @@ mod verification_publication_contract {
         copy_verification_fixture(root.path());
         let name = FrameName::HealthyCenterNorthEast.file_name();
         fs::remove_file(root.path().join(name)).unwrap();
-        std::os::unix::fs::symlink(verification_root().join(name), root.path().join(name)).unwrap();
+        if let Err(error) = symlink_file(&verification_root().join(name), &root.path().join(name)) {
+            assert!(link_privilege_missing(&error), "{error}");
+            eprintln!(
+                "skipping the symbolic-link artifact contract: this Windows session may not create \
+                 symbolic links ({error}). The contract is exercised on every Unix run and in CI."
+            );
+            return;
+        }
 
         let result = VerificationEvidence::project(&raw_report("report.json"), root.path(), None);
 
@@ -2913,7 +2953,14 @@ mod verification_publication_contract {
         let frames = outside.path().join("frames");
         fs::create_dir_all(&frames).unwrap();
         fs::copy(verification_root().join(name), frames.join(name)).unwrap();
-        std::os::unix::fs::symlink(&frames, root.path().join("frames")).unwrap();
+        if let Err(error) = symlink_dir(&frames, &root.path().join("frames")) {
+            assert!(link_privilege_missing(&error), "{error}");
+            eprintln!(
+                "skipping the symbolic-link ancestor contract: this Windows session may not create \
+                 symbolic links ({error}). The contract is exercised on every Unix run and in CI."
+            );
+            return;
+        }
 
         let declared = format!("frames/{name}");
         let mut report = raw_report("report.json");

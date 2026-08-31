@@ -1190,12 +1190,12 @@ git push origin main
 Nothing is pushed that has not passed the largest gate the machine can run.
 
 The first gate `scripts/check.sh` runs is `scripts/actionlint.sh`, which is
-pinned to actionlint v1.7.7 and looks for it at
-`target/tools/actionlint/1.7.7/actionlint`. When no such binary is cached it
-installs one with `go install`, so **Go is a prerequisite of the local clean
-gate on any machine with no cached actionlint**. With neither Go nor a cached
-binary the gate exits 2 and prints where to place the pinned one; it never
-skips.
+pinned to actionlint v1.7.7 and caches it under
+`target/tools/actionlint/1.7.7`. An uncached Windows run downloads the official
+release archive, verifies its SHA256 digest, and installs `actionlint.exe`.
+Other platforms install through `go install`, so they require Go when no
+binary is cached. An unsupported platform without Go exits 2 and prints where
+to place the pinned binary; the lint never skips.
 
 The gate ends with `cargo build --release`, and `[profile.release]` sets
 `panic = "abort"`. A release build therefore does not unwind: a panic aborts

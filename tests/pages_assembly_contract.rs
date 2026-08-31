@@ -14,6 +14,20 @@ use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+fn link_privilege_missing(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(50 | 1314))
+}
+
 #[test]
 fn first_run_without_game_publishes_status_only() {
     let current = fixture_site("status-only", &[("index.html", "CURRENT SOURCE: GREEN")]);
@@ -1131,7 +1145,14 @@ fn a_nested_symlink_inside_the_current_tree_is_refused_rather_than_followed() {
         ],
     );
     let link = current.path().join("evidence/deep/secret.txt");
-    std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+    if let Err(error) = symlink_file(&outside.path().join("secret.txt"), &link) {
+        assert!(link_privilege_missing(&error), "{error}");
+        eprintln!(
+            "skipping the nested symbolic-link contract: this Windows session may not create \
+             symbolic links ({error}). The contract is exercised on every Unix run and in CI."
+        );
+        return;
+    }
     assert_eq!(
         fs::read_to_string(&link).unwrap(),
         "not ours",
@@ -2061,6 +2082,14 @@ mod workflow_contract {
         assert!(
             script.contains(r#"this gate is pinned to v$ACTIONLINT_VERSION"#),
             "the binary should be verified before it is trusted: {script}"
+        );
+        assert!(
+            script.contains("sed 's/^v//'"),
+            "official release binaries omit the optional version prefix: {script}"
+        );
+        assert!(
+            script.contains(r#"-ignore 'unknown permission scope "copilot-requests"'"#),
+            "only the valid permission missing from actionlint may be ignored: {script}"
         );
 
         let check = fs::read_to_string(repository().join("scripts/check.sh"))

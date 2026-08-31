@@ -4800,14 +4800,7 @@ fn contains_path_at_boundary(text: &str, path: &str) -> bool {
         let ends_component = match following.next() {
             None => true,
             Some(value) if matches!(value, '/' | '\\') || value.is_ascii_whitespace() => true,
-            Some(value)
-                if matches!(
-                    value,
-                    '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | ';' | ':' | '?' | '#'
-                ) =>
-            {
-                true
-            }
+            Some('"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | ';' | ':' | '?' | '#') => true,
             Some('.') => following.next().is_none_or(|value| {
                 value.is_ascii_whitespace()
                     || matches!(value, '"' | '\'' | '<' | '>' | ')' | ']' | '}')

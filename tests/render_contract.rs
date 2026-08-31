@@ -195,11 +195,7 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
 /// must fail the test, because a skipped safety contract is indistinguishable
 /// from a passing one.
 fn link_privilege_missing(error: &std::io::Error) -> bool {
-    cfg!(windows)
-        && matches!(
-            error.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-        )
+    cfg!(windows) && matches!(error.raw_os_error(), Some(50 | 1314))
 }
 
 #[test]

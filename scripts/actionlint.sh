@@ -39,7 +39,11 @@ fi
 
 tools="$repository/target/tools"
 cache="$tools/actionlint/$ACTIONLINT_VERSION"
-binary="$cache/actionlint"
+binary_name="actionlint"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) binary_name="actionlint.exe" ;;
+esac
+binary="$cache/$binary_name"
 
 # The cache lives inside the repository's own build output, and every
 # directory on the way down to it has to really be one. A symbolic link, or a
@@ -75,26 +79,51 @@ fi
 # behind by an earlier pin is replaced instead of being used.
 installed_version() {
   [[ -x "$binary" ]] || return 1
-  "$binary" -version 2>/dev/null | head -n 1 | tr -d '[:space:]'
+  "$binary" -version 2>/dev/null \
+    | head -n 1 \
+    | tr -d '[:space:]' \
+    | sed 's/^v//'
 }
 
-if [[ "$(installed_version || true)" != "v$ACTIONLINT_VERSION" ]]; then
-  if ! command -v go >/dev/null 2>&1; then
-    echo "actionlint v$ACTIONLINT_VERSION is not cached and Go is not installed" >&2
-    echo "Go is a prerequisite of the local clean gate (scripts/check.sh), which" >&2
-    echo "lints the workflows before it runs anything expensive." >&2
-    echo "install Go, or place the pinned binary at $binary" >&2
-    exit 2
-  fi
+if [[ "$(installed_version || true)" != "$ACTIONLINT_VERSION" ]]; then
   echo "installing actionlint v$ACTIONLINT_VERSION into $cache"
   rm -rf "$cache"
   mkdir -p "$cache"
-  GOBIN="$cache" go install \
-    "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"
+  if command -v go >/dev/null 2>&1; then
+    GOBIN="$cache" go install \
+      "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"
+  else
+    platform="$(uname -s)"
+    machine="$(uname -m)"
+    case "$platform:$machine" in
+      MINGW*:x86_64|MSYS*:x86_64|CYGWIN*:x86_64)
+        archive="actionlint_${ACTIONLINT_VERSION}_windows_amd64.zip"
+        checksum="7f12f1801bca3d480d67aaf7774f4c2a6359a3ca8eebe382c95c10c9704aa731"
+        ;;
+      MINGW*:aarch64|MSYS*:aarch64|CYGWIN*:aarch64)
+        archive="actionlint_${ACTIONLINT_VERSION}_windows_arm64.zip"
+        checksum="76e9514cfac18e5677aa04f3a89873c981f16a2f2353bb97372a86cd09b1f5a8"
+        ;;
+      MINGW*:i686|MSYS*:i686|CYGWIN*:i686)
+        archive="actionlint_${ACTIONLINT_VERSION}_windows_386.zip"
+        checksum="66de2b65bcee17de1866287a513cadf47d812229e976e99024e9757645258adb"
+        ;;
+      *)
+        echo "actionlint v$ACTIONLINT_VERSION is not cached and Go is not installed" >&2
+        echo "install Go, or place the pinned binary at $binary" >&2
+        exit 2
+        ;;
+    esac
+    url="https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/$archive"
+    curl --fail --location --silent --show-error "$url" --output "$cache/$archive"
+    printf '%s  %s\n' "$checksum" "$cache/$archive" | sha256sum --check --status
+    unzip -q "$cache/$archive" -d "$cache"
+    rm "$cache/$archive"
+  fi
 fi
 
 actual="$(installed_version || true)"
-if [[ "$actual" != "v$ACTIONLINT_VERSION" ]]; then
+if [[ "$actual" != "$ACTIONLINT_VERSION" ]]; then
   echo "refusing actionlint ${actual:-<unreadable>}: this gate is pinned to v$ACTIONLINT_VERSION" >&2
   exit 2
 fi
@@ -112,4 +141,9 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   exit 2
 fi
 
-"$binary" -no-color -shellcheck= -pyflakes= "${targets[@]}"
+"$binary" \
+  -no-color \
+  -shellcheck= \
+  -pyflakes= \
+  -ignore 'unknown permission scope "copilot-requests"' \
+  "${targets[@]}"
