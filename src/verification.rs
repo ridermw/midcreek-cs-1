@@ -3980,7 +3980,7 @@ impl PixelRect {
 }
 
 /// Everything one named region of a frame measured.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RegionMetrics {
     /// How many pixels the region covered.
     pub pixels: u64,
@@ -4006,7 +4006,7 @@ pub const PALETTE_TOLERANCE: f64 = 24.0;
 pub const STRONG_EDGE: f64 = 0.10;
 
 /// Everything one frame measured, computed in a single traversal.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FrameMetrics {
     /// Frame width, in pixels.
     pub width: u32,
