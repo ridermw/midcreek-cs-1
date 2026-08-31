@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use midcreek_cs_1::{
     design::KEY_ART_REFERENCE_PATH,
-    metrics::{FrameMetrics, load_frame},
+    metrics::{FrameMetrics, dominant_row_angle, elevation_from_row_angle, load_frame},
 };
 
 fn repo_root() -> PathBuf {
@@ -91,4 +91,90 @@ fn the_golden_fixture_pins_the_numbers_that_gates_are_derived_from() {
 
     assert_eq!(metrics.width, 1536, "the approved key art is 1536 wide");
     assert_eq!(metrics.height, 1024, "the approved key art is 1024 tall");
+}
+
+// ---------------------------------------------------------------------------
+// Row angle and implied elevation
+// ---------------------------------------------------------------------------
+
+/// A frame of one flat colour, which has no edges at all.
+fn flat_frame(width: u32, height: u32) -> image::RgbImage {
+    image::RgbImage::from_pixel(width, height, image::Rgb([222, 230, 235]))
+}
+
+#[test]
+fn elevation_follows_from_the_row_angle() {
+    // The one pair this can be checked against independently: the POC's camera
+    // basis puts its ground axes on screen at 40 degrees, and its elevation is
+    // 57. Any formula that does not reproduce that pair is wrong.
+    let elevation = elevation_from_row_angle(40.0).expect("40 degrees implies an elevation");
+    assert!(
+        (elevation - 57.0).abs() < 0.05,
+        "a 40 degree row angle must imply 57 degrees of elevation, got {elevation}"
+    );
+}
+
+#[test]
+fn a_row_angle_of_45_degrees_or_more_implies_no_elevation() {
+    // sin(elevation) = tan(row angle), so a row angle at or beyond 45 degrees
+    // asks for a sine above one. It means the measurement is wrong, not that
+    // the camera is steep.
+    assert_eq!(elevation_from_row_angle(45.0), None);
+    assert_eq!(elevation_from_row_angle(60.0), None);
+}
+
+#[test]
+fn a_flat_frame_has_no_measurable_row_angle() {
+    assert!(
+        dominant_row_angle(&flat_frame(256, 256)).is_none(),
+        "a frame with no edges must report no angle rather than the first bin"
+    );
+}
+
+#[test]
+fn the_approved_key_art_measures_a_shallow_isometric_row_angle() {
+    let path = repo_root().join(KEY_ART_REFERENCE_PATH);
+    let image = load_frame(&path).expect("the approved key art is vendored");
+    let angle = dominant_row_angle(&image).expect("the key art is full of rack rows");
+
+    assert!(
+        (25.0..35.0).contains(&angle.low_degrees),
+        "the key art's shallow diagonal family should sit near 30 degrees, got {}",
+        angle.low_degrees
+    );
+    assert!(
+        (145.0..155.0).contains(&angle.high_degrees),
+        "and its mirror near 150, got {}",
+        angle.high_degrees
+    );
+    assert!(
+        angle.elevation_degrees() < 45.0,
+        "the implied elevation must be shallower than the 57 degrees the POC ships"
+    );
+}
+
+#[test]
+fn the_two_diagonal_families_of_the_key_art_mirror_each_other() {
+    let image = load_frame(&repo_root().join(KEY_ART_REFERENCE_PATH)).expect("key art");
+    let angle = dominant_row_angle(&image).expect("rack rows");
+
+    // A 45-degree azimuth orthographic camera places the two ground axes
+    // symmetrically about the vertical. That the measured families mirror each
+    // other this closely is the evidence that a real projection is being
+    // recovered rather than incidental texture.
+    assert!(
+        angle.spread_degrees() < 0.5,
+        "the families should mirror to well under half a degree, got {:.3}",
+        angle.spread_degrees()
+    );
+    assert!(
+        angle.mass > 0.4,
+        "rack rows and floor markings should dominate the edge mass, got {:.3}",
+        angle.mass
+    );
+    assert!(
+        (34.0..38.0).contains(&angle.elevation_degrees()),
+        "the approved art measures a shallow isometric camera, got {:.2}",
+        angle.elevation_degrees()
+    );
 }

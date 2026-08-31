@@ -444,3 +444,177 @@ pub const OUTSIDE_CROP_MAX: f64 = 0.01;
 
 /// The stable region name of the projected worker crop.
 pub const WORKER_REGION: &str = "worker";
+
+// ---------------------------------------------------------------------------
+// Row angle and implied elevation
+// ---------------------------------------------------------------------------
+
+/// Smallest share of strong-edge mass the two diagonal families must hold
+/// together before a measured row angle means anything.
+///
+/// Without this, a frame with no diagonals at all still produces a peak: the
+/// largest bin of an empty histogram is the first one, and the tool would
+/// report a confident zero degrees. Refusing to answer is the only honest
+/// result for an image that does not contain the thing being measured.
+pub const ROW_ANGLE_MIN_MASS: f64 = 0.15;
+
+/// Half-width, in one-degree bins, of the window averaged around each peak.
+///
+/// Argmax alone quantises to whole degrees, which is coarse enough to move the
+/// implied elevation by more than a degree. Taking the magnitude-weighted
+/// centroid of a small window around the peak recovers the sub-degree
+/// precision the projection relation deserves.
+const ROW_ANGLE_WINDOW: usize = 3;
+
+/// The two diagonal edge families a diamond ground grid draws on screen.
+///
+/// ```text
+///        low family                high family
+///          ~30 deg                   ~150 deg
+///             \                         /
+///              \                       /
+///   -------------\-------------------/-----------  screen
+///                 \                 /
+///
+///   A 45-degree azimuth camera puts both ground axes on screen
+///   symmetrically about the vertical, so the two peaks should mirror
+///   each other. How far they miss is the measurement's own error bar.
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct RowAngle {
+    /// Peak of the shallow family, in degrees from the horizontal.
+    pub low_degrees: f64,
+    /// Peak of the steep family, in degrees.
+    pub high_degrees: f64,
+    /// Share of all strong-edge mass the two families hold together.
+    pub mass: f64,
+}
+
+impl RowAngle {
+    /// The single row angle the two families agree on.
+    ///
+    /// The high family is folded onto the low one before averaging, so a
+    /// perfectly symmetric pair returns exactly its own angle.
+    pub fn row_degrees(&self) -> f64 {
+        (self.low_degrees + (180.0 - self.high_degrees)) / 2.0
+    }
+
+    /// How far the two families disagree, in degrees.
+    ///
+    /// This is an error bar, not a defect: a real render never places the two
+    /// families perfectly. A large spread means the measurement should not be
+    /// trusted to a fraction of a degree.
+    pub fn spread_degrees(&self) -> f64 {
+        (self.low_degrees - (180.0 - self.high_degrees)).abs()
+    }
+
+    /// Elevation implied by the measured angle.
+    ///
+    /// Always present: [`dominant_row_angle`] only returns an angle whose
+    /// elevation is derivable.
+    pub fn elevation_degrees(&self) -> f64 {
+        elevation_from_row_angle(self.row_degrees())
+            .expect("dominant_row_angle only yields a derivable angle")
+    }
+}
+
+/// Elevation implied by a row angle, under orthographic projection at a
+/// 45-degree azimuth.
+///
+/// A ground axis lands on screen at `arctan(sin(elevation))`, so inverting
+/// gives `elevation = arcsin(tan(row angle))`. The relation is checkable: the
+/// POC's camera basis is 57 degrees and puts its axes at 40.
+///
+/// Returns nothing at or beyond 45 degrees, where the relation asks for a sine
+/// above one. That is a measurement error rather than a very steep camera.
+pub fn elevation_from_row_angle(row_angle_degrees: f64) -> Option<f64> {
+    if !row_angle_degrees.is_finite() || row_angle_degrees <= 0.0 || row_angle_degrees >= 45.0 {
+        return None;
+    }
+    let sine = row_angle_degrees.to_radians().tan();
+    if !(0.0..1.0).contains(&sine) {
+        return None;
+    }
+    Some(sine.asin().to_degrees())
+}
+
+/// Measures the dominant diagonal edge families of one frame.
+///
+/// Valid on reference art. **Not** valid on captured frames: the game renders
+/// without multisampling, so aliased near-diagonals produce local gradients
+/// biased toward 45 degrees, and the measured angle drifts away from the one
+/// the camera basis actually uses. Ask the camera, not the pixels.
+pub fn dominant_row_angle(image: &RgbImage) -> Option<RowAngle> {
+    let (width, height) = image.dimensions();
+    if width < 3 || height < 3 {
+        return None;
+    }
+    let raw = image.as_raw();
+    let stride = width as usize * 3;
+
+    let mut histogram = [0.0f64; 180];
+    let mut total = 0.0f64;
+
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            let grey = |dx: i32, dy: i32| -> f64 {
+                let sx = (x as i32 + dx) as usize;
+                let sy = (y as i32 + dy) as usize;
+                let at = sy * stride + sx * 3;
+                (0.299 * f64::from(raw[at])
+                    + 0.587 * f64::from(raw[at + 1])
+                    + 0.114 * f64::from(raw[at + 2]))
+                    / 255.0
+            };
+            let gradient_x = (grey(1, -1) + 2.0 * grey(1, 0) + grey(1, 1))
+                - (grey(-1, -1) + 2.0 * grey(-1, 0) + grey(-1, 1));
+            let gradient_y = (grey(-1, 1) + 2.0 * grey(0, 1) + grey(1, 1))
+                - (grey(-1, -1) + 2.0 * grey(0, -1) + grey(1, -1));
+            let magnitude = (gradient_x * gradient_x + gradient_y * gradient_y).sqrt() / 4.0;
+            if magnitude < STRONG_EDGE {
+                continue;
+            }
+            let direction = (gradient_x.atan2(-gradient_y).to_degrees() + 180.0).rem_euclid(180.0);
+            let bin = (direction as usize).min(179);
+            histogram[bin] += magnitude;
+            total += magnitude;
+        }
+    }
+
+    if total <= 0.0 {
+        return None;
+    }
+
+    let low = refine_peak(&histogram, 15, 75)?;
+    let high = refine_peak(&histogram, 105, 165)?;
+    let mass =
+        (histogram[15..75].iter().sum::<f64>() + histogram[105..165].iter().sum::<f64>()) / total;
+    if mass < ROW_ANGLE_MIN_MASS {
+        return None;
+    }
+
+    let angle = RowAngle {
+        low_degrees: low,
+        high_degrees: high,
+        mass,
+    };
+    elevation_from_row_angle(angle.row_degrees())?;
+    Some(angle)
+}
+
+/// The magnitude-weighted centre of the tallest peak within one band.
+fn refine_peak(histogram: &[f64; 180], from: usize, to: usize) -> Option<f64> {
+    let peak = (from..to)
+        .max_by(|left, right| histogram[*left].total_cmp(&histogram[*right]))
+        .filter(|bin| histogram[*bin] > 0.0)?;
+    let first = peak.saturating_sub(ROW_ANGLE_WINDOW);
+    let last = (peak + ROW_ANGLE_WINDOW).min(179);
+
+    let mut weight = 0.0;
+    let mut moment = 0.0;
+    for (bin, mass) in histogram.iter().enumerate().take(last + 1).skip(first) {
+        weight += mass;
+        moment += mass * (bin as f64 + 0.5);
+    }
+    (weight > 0.0).then(|| moment / weight)
+}
