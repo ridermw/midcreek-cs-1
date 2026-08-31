@@ -12,8 +12,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use support::{
-    assert_has_element_id, assert_text, build_fixture_site, build_site_from_inputs, fixture,
-    plan_ids, read, repo_facts, sha256, site_inputs, validate_fixture,
+    assert_has_element_id, assert_text, bash_command, build_fixture_site, build_site_from_inputs,
+    fixture, plan_ids, python_command, read, relative_url, repo_facts, sha256, sha256_text,
+    site_inputs, symlink_dir, symlink_file, validate_fixture,
 };
 
 mod generated_site_contract {
@@ -430,7 +431,12 @@ mod output_validation_contract {
     /// it names the machine that built it.
     #[test]
     fn a_shallow_declared_repository_is_still_the_checkout_it_names() {
-        for root in ["/srv", "/srv/hub"] {
+        let roots: &[&str] = if cfg!(windows) {
+            &[r"Z:\srv", r"Z:\srv\hub"]
+        } else {
+            &["/srv", "/srv/hub"]
+        };
+        for root in roots {
             let site = build_fixture_site("green").unwrap();
             mutate_index(&site, |html| {
                 html.replace(
@@ -506,11 +512,16 @@ mod output_validation_contract {
     /// was handed, so none of them decides anything.
     #[test]
     fn the_hosts_environment_never_decides_whether_a_page_is_publishable() {
-        let foreign_checkout = "/home/runner/work/other-project/other-project";
+        let foreign_checkout = if cfg!(windows) {
+            std::path::PathBuf::from(r"Z:\home\runner\work\other-project\other-project")
+        } else {
+            std::path::PathBuf::from("/home/runner/work/other-project/other-project")
+        };
+        let foreign_checkout_text = foreign_checkout.display().to_string();
         let mut ambient = vec![
             std::env::temp_dir().display().to_string(),
             std::env::current_dir().unwrap().display().to_string(),
-            foreign_checkout.to_owned(),
+            foreign_checkout_text.clone(),
             "/home/runner/_temp/other-project".to_owned(),
         ];
         ambient.extend(
@@ -546,7 +557,7 @@ mod output_validation_contract {
         // The very same bytes are refused the moment the caller declares the
         // checkout they name: the verdict follows the declaration.
         let result = midcreek_cs_1::sitegen::validate_site_output_in(
-            Path::new(foreign_checkout),
+            &foreign_checkout,
             site.root(),
             &fixture("green/progress.json"),
         );
@@ -1242,7 +1253,7 @@ mod progress_contract {
         fn published_plan_matches_the_approved_master_plan() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             assert_eq!(
-                sha256(root.join("docs/implementation-plan.md")),
+                sha256_text(root.join("docs/implementation-plan.md")),
                 "bc948da3974c990b42f5bdd77ebeb347c9e70d1b37a951c26dac1969a8b475f4"
             );
         }
@@ -1766,7 +1777,8 @@ mod playable_publication_contract {
         let outside = untrusted_package("symlink-escape-target", PACKAGE_FILES);
         let holder = package("symlink-escape-holder", &[]);
         let link = holder.path().join("web");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        symlink_dir(outside.path(), &link)
+            .expect("symbolic link support is required for containment contracts");
         assert!(link.join("game_bg.wasm").is_file());
 
         let result = resolve_playable_package(&link, &trusted_playable_roots());
@@ -2377,10 +2389,10 @@ process.exit(0);
             );
         }
 
-        let run = Command::new("python3")
+        let run = Command::new(python_command())
             .arg(repository().join("scripts/browser_gate_test.py"))
             .output()
-            .expect("python3 should run the browser gate unit tests");
+            .expect("Python should run the browser gate unit tests");
 
         assert!(
             run.status.success(),
@@ -2419,7 +2431,8 @@ process.exit(0);
         fs::create_dir(sandbox.path().join("nested")).unwrap();
         fs::write(sandbox.path().join("nested/keep-me.txt"), "caller owned").unwrap();
 
-        let run = Command::new(repository().join("scripts/web-smoke.sh"))
+        let run = Command::new(bash_command())
+            .arg(repository().join("scripts/web-smoke.sh"))
             .arg(repository().join("target"))
             .arg(".")
             .current_dir(sandbox.path())
@@ -2451,7 +2464,8 @@ process.exit(0);
         let sandbox = Sandbox::new_in(repository().join("target"), "web-smoke-foreign");
         fs::write(sandbox.path().join("keep-me.txt"), "not ours").unwrap();
 
-        let run = Command::new(repository().join("scripts/web-smoke.sh"))
+        let run = Command::new(bash_command())
+            .arg(repository().join("scripts/web-smoke.sh"))
             .arg(repository().join("target"))
             .arg(sandbox.path())
             .output()
@@ -2467,15 +2481,21 @@ process.exit(0);
     fn the_browser_gate_refuses_source_root_and_symlink_diagnostics_paths() {
         let sandbox = Sandbox::new_in(repository().join("target"), "web-smoke-links");
         let link = sandbox.path().join("link");
-        std::os::unix::fs::symlink(sandbox.path(), &link).unwrap();
+        symlink_dir(sandbox.path(), &link)
+            .expect("symbolic link support is required for containment contracts");
 
         for candidate in [
             repository().join("src"),
             repository().to_path_buf(),
-            Path::new("/").to_path_buf(),
+            repository()
+                .ancestors()
+                .last()
+                .expect("repository path has a root")
+                .to_path_buf(),
             link,
         ] {
-            let run = Command::new(repository().join("scripts/web-smoke.sh"))
+            let run = Command::new(bash_command())
+                .arg(repository().join("scripts/web-smoke.sh"))
                 .arg(repository().join("target"))
                 .arg(&candidate)
                 .output()
@@ -2522,6 +2542,7 @@ process.exit(0);
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_web_scripts_are_executable() {
         for relative in ["scripts/build-web.sh", "scripts/web-smoke.sh"] {
@@ -2533,13 +2554,21 @@ process.exit(0);
 
     fn locked_version(package: &str) -> String {
         let lock = source("Cargo.lock");
-        let marker = format!("name = \"{package}\"\nversion = \"");
-        let start = lock.find(&marker).expect("package should be locked") + marker.len();
-        lock[start..]
-            .split('"')
-            .next()
-            .expect("locked version should terminate")
-            .to_owned()
+        let mut lines = lock.lines();
+        while let Some(line) = lines.next() {
+            if line.trim() != format!("name = \"{package}\"") {
+                continue;
+            }
+            let version = lines
+                .find(|candidate| candidate.trim_start().starts_with("version = \""))
+                .expect("locked package should carry a version");
+            return version
+                .trim()
+                .trim_start_matches("version = \"")
+                .trim_end_matches('"')
+                .to_owned();
+        }
+        panic!("{package} should be locked");
     }
 }
 
@@ -2889,7 +2918,8 @@ mod verification_publication_contract {
         copy_verification_fixture(root.path());
         let name = FrameName::HealthyCenterNorthEast.file_name();
         fs::remove_file(root.path().join(name)).unwrap();
-        std::os::unix::fs::symlink(verification_root().join(name), root.path().join(name)).unwrap();
+        symlink_file(&verification_root().join(name), &root.path().join(name))
+            .expect("symbolic link support is required for containment contracts");
 
         let result = VerificationEvidence::project(&raw_report("report.json"), root.path(), None);
 
@@ -2913,7 +2943,8 @@ mod verification_publication_contract {
         let frames = outside.path().join("frames");
         fs::create_dir_all(&frames).unwrap();
         fs::copy(verification_root().join(name), frames.join(name)).unwrap();
-        std::os::unix::fs::symlink(&frames, root.path().join("frames")).unwrap();
+        symlink_dir(&frames, &root.path().join("frames"))
+            .expect("symbolic link support is required for containment contracts");
 
         let declared = format!("frames/{name}");
         let mut report = raw_report("report.json");
@@ -3587,7 +3618,7 @@ mod verification_publication_contract {
             "this fixture promotes every captured frame: {promoted:?}"
         );
         for file in &promoted {
-            let target = file.to_string_lossy().into_owned();
+            let target = relative_url(file);
             assert!(
                 linked.contains(&target),
                 "{target} was promoted but the page links nothing to it"
@@ -3624,7 +3655,7 @@ mod verification_publication_contract {
         // run, so the strip is the whole of the rest.
         let captured = published
             .iter()
-            .map(|file| file.to_string_lossy().into_owned())
+            .map(relative_url)
             .filter(|file| !file.ends_with(WORKER_CROP_FILE) && !file.ends_with(BROWSER_FRAME_FILE))
             .collect::<BTreeSet<_>>();
 

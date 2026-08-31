@@ -69,7 +69,7 @@ fn key_art_metrics_match_the_golden_fixture() {
 
     assert_eq!(
         measured.trim(),
-        golden.trim(),
+        golden.replace("\r\n", "\n").replace('\r', "\n").trim(),
         "measuring the approved key art must produce the same numbers it did \
          before the metrics engine moved"
     );

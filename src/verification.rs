@@ -5488,13 +5488,13 @@ mod tests {
         clear_scratch(&root).expect("a real scratch tree clears");
         assert!(!root.exists());
 
-        // A path whose parent is a regular file cannot be a directory, and the
-        // operating system says so with something other than `NotFound`.
+        // A regular file cannot be removed as a directory, and every operating
+        // system reports that as something other than `NotFound`.
         let blocker = root.with_extension("file");
         let _ = fs::remove_file(&blocker);
         fs::write(&blocker, b"not a directory").expect("the test owns this file");
-        let error = clear_scratch(&blocker.join("under-a-file"))
-            .expect_err("a path under a regular file is not a clearable directory");
+        let error = clear_scratch(&blocker)
+            .expect_err("a regular file is not a clearable scratch directory");
         assert_ne!(
             error.kind(),
             io::ErrorKind::NotFound,

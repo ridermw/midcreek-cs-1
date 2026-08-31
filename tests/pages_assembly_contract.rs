@@ -14,6 +14,35 @@ use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+fn bash_command() -> PathBuf {
+    if cfg!(windows) {
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+            if let Some(root) = std::env::var_os(variable) {
+                let candidate = PathBuf::from(root).join(if variable == "LocalAppData" {
+                    "Programs/Git/bin/bash.exe"
+                } else {
+                    "Git/bin/bash.exe"
+                });
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        panic!("Git Bash should be installed on Windows");
+    }
+    PathBuf::from("bash")
+}
+
 #[test]
 fn first_run_without_game_publishes_status_only() {
     let current = fixture_site("status-only", &[("index.html", "CURRENT SOURCE: GREEN")]);
@@ -1131,7 +1160,8 @@ fn a_nested_symlink_inside_the_current_tree_is_refused_rather_than_followed() {
         ],
     );
     let link = current.path().join("evidence/deep/secret.txt");
-    std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+    symlink_file(&outside.path().join("secret.txt"), &link)
+        .expect("symbolic link support is required for containment contracts");
     assert_eq!(
         fs::read_to_string(&link).unwrap(),
         "not ours",
@@ -2062,6 +2092,14 @@ mod workflow_contract {
             script.contains(r#"this gate is pinned to v$ACTIONLINT_VERSION"#),
             "the binary should be verified before it is trusted: {script}"
         );
+        assert!(
+            script.contains("sed 's/^v//'"),
+            "official release binaries omit the optional version prefix: {script}"
+        );
+        assert!(
+            script.contains(r#"-ignore 'unknown permission scope "copilot-requests"'"#),
+            "only the valid permission missing from actionlint may be ignored: {script}"
+        );
 
         let check = fs::read_to_string(repository().join("scripts/check.sh"))
             .expect("the clean-push gate should be checked in");
@@ -2106,7 +2144,8 @@ mod workflow_contract {
     }
 
     fn run_actionlint(targets: &[String]) -> std::process::Output {
-        Command::new(repository().join("scripts/actionlint.sh"))
+        Command::new(bash_command())
+            .arg(repository().join("scripts/actionlint.sh"))
             .args(targets)
             .current_dir(repository())
             .output()
@@ -2133,6 +2172,8 @@ mod workflow_contract {
     fn workflow_source() -> String {
         fs::read_to_string(repository().join(".github/workflows/pages.yml"))
             .expect("Pages workflow should be checked in")
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
     }
 
     fn repository() -> PathBuf {
@@ -3647,7 +3688,7 @@ mod gate_runner {
     }
 
     fn run_gate(results: &Path, name: &str, command: &[&str]) -> std::process::Output {
-        Command::new("bash")
+        Command::new(bash_command())
             .arg(repository().join("scripts/run-gate.sh"))
             .arg(results)
             .arg(name)
