@@ -545,3 +545,180 @@ Milestone analyzer activation is cumulative: M1 uses scene-composition, equipmen
 - `README.md` documents the PowerShell continuous and milestone commands, WARP and ReFS preflights, browser verification build, artifact locations, failure behavior, and Linux milestone command.
 - GitHub Pages content changes only after M3 passes.
 - The final diff contains no stale generated asset, baseline-era capture, ignored fidelity test, temporary output, or abandoned implementation path.
+
+---
+
+## Review Amendments (plan-exit-review, 2026-08-31)
+
+These amendments were agreed during a plan-exit review. They preserve the
+Product Contract and every R, A, F, and AE identifier. Scope was **not**
+reduced; U8 and U10 ship in full. Where an amendment changes ordering, the work
+is moved, not removed.
+
+### New unit U0. Stabilize the render gate and bind the Phase 1 baseline
+
+- **Goal:** Produce a green, reproducible Phase 1 baseline before G0 freezes
+  anything against it.
+- **Rationale:** `main` fails `cargo clippy --all-targets --all-features --
+  -D warnings` at `src/sitegen.rs:4804` (`redundant guard`), and
+  `tests/render_contract.rs` is red and flaky on `main` itself. The plan anchors
+  M1 on being "measurably closer than the Phase 1 baseline" and freezes contract
+  hashes at G0; neither is meaningful without a green baseline.
+- **Dependencies:** None. Runs before G0.
+- **Approach:** Fix the clippy error. Root-cause the `render_contract`
+  failures. Quarantine what cannot be fixed with named tracked issues rather
+  than blanket ignores. Capture and commit the signed Phase 1 baseline captures
+  and composition vector.
+- **Done signal:** `scripts/check.sh` passes locally, and the baseline artifact
+  is committed with its hash.
+
+### New milestone M0.5. First correct frame
+
+- **Accepted output:** A rendered healthy scene with the corrected camera,
+  composition, topology, Cel fill, ink, defining equipment, and technician
+  scale.
+- **Required units:** U3-U7.
+- **Gate:** Continuous gate plus Linux headless checks only. No adapter
+  calibration, browser parity, injected-failure, or reproducibility stage.
+- **Rollback point:** Return to G0.
+- **Rationale:** The original table gated M1 — the first visible milestone — on
+  U8's tri-adapter calibration, browser parity, and injected-failure work. That
+  inverts R4 and R23 and reproduces the prior hill climb's failure mode. M1 is
+  retained unchanged as the hardened milestone; M0.5 is where the first visual
+  win is accepted.
+
+### Amendments by unit
+
+**U1 (reference authority)**
+
+- Migrate all fifteen policy constants from `src/metrics.rs:395-443`
+  (`LUMINANCE_RANGE`, `LUMINANCE_REFERENCE_TOLERANCE`, `PALETTE_MIN`,
+  `FLOOR_MIN`, `RACK_MIN`, `YELLOW_MIN`, `INK_RANGE`, `DIAGONAL_BAND_MIN`,
+  `HISTOGRAM_MAX`, `EDGE_DENSITY_RANGE`, `WORKER_ROLE_MIN`, `BADGE_ROLE_MIN`,
+  `HUD_STATE_MIN`, `CLIP_DIFFERENCE_RANGE`, `OUTSIDE_CROP_MAX`) into
+  `docs/reference/fidelity.json`, and rewire their use sites in
+  `src/verification.rs:4347-4448`. The plan states the "metrics is policy-free"
+  principle twice but never booked this migration.
+- Remove the duplicated `KEY_ART_SHA256` at `src/design.rs:152`; the manifest is
+  the single source.
+- Widen `reference_metrics()` (`src/metrics.rs:377-382`) to accept the union of
+  all contract regions. It currently caches with `&BTreeMap::new()`, so
+  role-specific analyzers would each recompute the authority image, defeating
+  the `&'static` cache and the module's own "one traversal, per pixel" contract.
+- Specify `build.rs`: output path, whether generated code is checked in and how
+  that interacts with `assetgen -- --check` byte-stability, whether the frozen
+  G0 hash is verified at build time or test time, behavior for the
+  `wasm32-unknown-unknown` target and out-of-tree builds, and conformance to
+  `cargo fmt --check` and `clippy -D warnings`. No `build.rs` exists today.
+- **New test scenarios:** the migrated constants round-trip and agree with the
+  frozen contract; generated constants match `fidelity.json` and drift fails a
+  gate; `reference_metrics()` computes every contract region in one traversal.
+
+**U2 (continuous loop)**
+
+- Extract `VerificationStage` and the journey profiles from
+  `src/verification.rs` (6,141 lines, modified by six of ten units) into a new
+  `src/journey.rs`, leaving analysis and reporting behind.
+- Weaken KTD2: require **semantic equivalence and per-frame determinism** for
+  shared frames in the continuous profile. Assert pixel-hash equality only in a
+  milestone-scope cross-profile test. Rationale: `VerificationStage::ALL` is a
+  strict twenty-five-step stateful machine, so pixel-identical shared frames
+  require replaying every intervening transition; the continuous profile
+  therefore retains roughly seventeen of twenty-five stages and every
+  wall-clock-bound one. The original KTD2 clauses cannot both hold.
+- Record shared-frame pixel hashes in the continuous report so the next
+  milestone diffs them against canonical and names the first divergent unit.
+  This is the tripwire for the drift window the weakened invariant opens.
+- Split the `CornerProbes` stage, which currently emits four frames from one
+  stage, so the continuous profile can take `CornerNorthEast` alone.
+- Delete the ReFS-detection feature and its two test scenarios **or** make them
+  live: `.cargo/config.toml` (commit `4a7c1c5`) already sets
+  `incremental = false` unconditionally for every platform and profile, so a
+  runtime detector setting `CARGO_INCREMENTAL=0` can never observe or change
+  anything.
+- Add `[profile.dev.package."*"] opt-level = 3`, scope `incremental = false` to
+  ReFS paths only, and **measure the compile-versus-capture split before
+  fixing the 2-3 minute target**. The continuous gate's dominant cost is a full
+  non-incremental rebuild of a 24,217-line crate against debug-built Bevy, not
+  the nine dropped readbacks. The mandated real-time simulation floor alone is
+  roughly 35 seconds (`FAULT_INTERVAL_SECONDS` 4.0 x 3, `REPAIR_DURATION_SECONDS`
+  3.0, `RESOLVED_DISPLAY_SECONDS` 2.0, `RACK_COOLDOWN_SECONDS` 8.0).
+- **New test scenarios:** `src/journey.rs` profile-plan unit tests; the
+  compile-versus-capture measurement is recorded and reported.
+
+**U3 (camera and composition)**
+
+- The approach must **call** the existing measurement API rather than deriving
+  afresh: `src/metrics.rs:475-500` already provides `RowAngle` with sub-degree
+  magnitude-weighted centroid precision and `elevation_from_row_angle`, shipped
+  in #5 and already cross-referenced from `src/design.rs:106`. A second
+  derivation is forbidden.
+- Make `OVERHEAD_TRAY_HEIGHT` (currently the hand-derived literal `6.54`) and
+  `CAMERA_OFFSET_DIRECTION.y` (the hand-typed `2.177_697_9`, carrying
+  `#[allow(clippy::excessive_precision)]`) **computed** from elevation and rack
+  row spacing under the generated-constant mechanism. Both are derived from 57
+  degrees and the current 6.0 m spacing; U3 changes the elevation and U4 changes
+  `RACK_ROW_X`, and no test re-derives either value today. The failure is
+  silent: per `src/design.rs:61-66`, a wrong tray height hides the technician at
+  two of the four headings.
+- Refresh the ASCII diagram at `src/design.rs:119-125` in the same commit.
+- **New test scenario:** the projection relation is asserted, re-deriving both
+  constants from the frozen elevation and the current row spacing.
+
+**U4 (topology)**
+
+- Compute reachability once over the shared walkable grid with a multi-source
+  BFS from the spawn point and assert that every operation target lands in the
+  spawn component, instead of running a per-target flood fill. `ROOM_SIZE` is
+  40 x 40 m at `WALKABLE_CELL_SIZE` 0.25, i.e. 25,600 cells, and this validation
+  runs at every game launch, inside every continuous capture's boot.
+
+**U5 (Cel fill and ink)**
+
+- Add a headless CPU reference implementation of the two-band decision plus a
+  golden-image unit test on a small offscreen wgpu target, so the two central
+  claims — two-band classification and an orbit-invariant world-space
+  terminator — are proven **outside** `tests/render_contract.rs`. This is the
+  most novel code in Phase 2 and its only proof otherwise lives in the least
+  trustworthy suite.
+- Add a geometry and overdraw budget to the fidelity contract: triangle count,
+  outline-hull ratio, and per-frame software-raster time. Assert it headlessly
+  in `tests/asset_contract.rs` and report it from every gate. Every gate target
+  is a CPU rasteriser, where cost scales with triangles and overdraw;
+  `OutlineHull` roughly doubles triangle count and is pure overdraw by
+  construction, while U4 and U6 densify the hall and U2 demands a faster gate.
+  R24 correctly forbids a game frame-rate target, which removes the only other
+  signal for this class of regression.
+
+**U7 (technician)**
+
+- Update `h_t = 1.80 m` to `1.73 m` in the `src/design.rs:119-125` diagram in
+  the same commit that changes the technician height, per R10.
+
+**U9 (HUD)**
+
+- Extract badge placement into a pure function over badge list, viewport, and
+  priorities, and table-test it headlessly across collision, overflow, leader
+  line, and resize cases. The behavior is combinatorial — priority sort x
+  ordered offset set x leader lines x `+N` overflow x four headings x resize —
+  and the plan covers it with a single render scenario.
+
+**Verification Contract**
+
+- Set an explicit **milestone gate budget** with per-stage elapsed reporting,
+  and treat a breach as a gate failure exactly as the continuous five-minute
+  rule does. Suggested starting values: 25 minutes local, 45 minutes CI. The
+  plan budgets the continuous gate precisely and the milestone gate not at all,
+  yet CI's `Verify` job already fails in 43 minutes inside a 1h39m Pages run,
+  and U8 and U10 add tri-adapter calibration, reproducibility, delayed
+  readback, injected failures, and a fourteen-checkpoint SwiftShader journey to
+  exactly that gate — now run at M0.5, M1, M2, and M3.
+
+### Open items
+
+Recorded in `TODOS.md`: `OutlineHull` scoping fallback, the `verification.rs`
+unwrap audit, and a macOS/Linux continuous-gate path.
+
+Unresolved and deliberately not defaulted: WARP adapter-name version tolerance,
+the G0 frozen-contract recalibration procedure, and CI's workflow-lint and
+browser-gate 600 s budget failures, which fall outside U0's scope.
