@@ -947,10 +947,10 @@ The fallback copies nothing. Assembly is the single place a previous domain is
 carried forward, and it carries it once. All the fallback decides is whether
 the page may link the retained build, and it earns that by provenance rather
 than existence: the previous `last-green.json` has to parse as the manifest
-this generator writes, name `play/index.html`, and name only plain files really
-inside `play/`, within an explicit manifest size and file-count limit. A
-previous tree that is corrupt, forged, symlinked, truncated, or absent costs
-the page that one sentence and costs the run nothing.
+this generator writes, name a valid source commit, and exactly list the plain
+files inside `play/`, within explicit manifest and package limits. An unsafe
+previous tree costs the fallback page that one sentence. The assembler checks
+the retained tree independently and can refuse the final publication.
 
 `last-green.json` describes the assembled tree rather than the plan that
 produced it. The generator writes it after promotion completes, enumerating

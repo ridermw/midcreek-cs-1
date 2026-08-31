@@ -32,12 +32,20 @@ PREVIOUS_COMMIT = "a" * 40
 #: Every file a fixture previous publication publishes under `play/`, exactly
 #: as `sitegen` records them in `last-green.json`: relative to the site root.
 GAME_FILES = (
+    "play/assets/rack.glb",
+    "play/game.js",
+    "play/game_bg.wasm",
+    "play/index.html",
+    "play/play.css",
+    "play/play.js",
+)
+
+REQUIRED_GAME_FILES = (
     "play/index.html",
     "play/play.js",
     "play/play.css",
     "play/game.js",
     "play/game_bg.wasm",
-    "play/assets/rack.glb",
 )
 
 
@@ -654,6 +662,19 @@ class HistoryFailureSiteTest(unittest.TestCase):
         self.assert_status_only(result)
         self.assertIn("is not a publication manifest", result.stderr)
 
+    def test_a_manifest_with_a_non_commit_source_is_not_claimed(self) -> None:
+        previous = write_previous_publication(self.root / "previous")
+        manifest = last_green_manifest()
+        manifest["source_commit"] = "old"
+        (previous / "last-green.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        result = self.run_fallback(previous)
+
+        self.assert_status_only(result)
+        self.assertIn("40 hexadecimal characters", result.stderr)
+
     def test_an_oversized_manifest_is_refused_before_it_is_parsed(self) -> None:
         previous = write_previous_publication(self.root / "previous")
         (previous / "last-green.json").write_text(
@@ -686,6 +707,17 @@ class HistoryFailureSiteTest(unittest.TestCase):
 
         self.assert_status_only(result)
         self.assertIn("play/game_bg.wasm is not published", result.stderr)
+
+    def test_a_manifest_that_omits_a_published_file_is_not_claimed(self) -> None:
+        previous = write_previous_publication(self.root / "previous")
+        (previous / "play" / "assets" / "unlisted.txt").write_text(
+            "not vouched for", encoding="utf-8"
+        )
+
+        result = self.run_fallback(previous)
+
+        self.assert_status_only(result)
+        self.assertIn("does not list every plain file below play/", result.stderr)
 
     def test_a_manifest_naming_a_symlink_is_not_claimed(self) -> None:
         previous = write_previous_publication(self.root / "previous")
@@ -732,7 +764,7 @@ class HistoryFailureSiteTest(unittest.TestCase):
         self.assertIn("does not name play/index.html", result.stderr)
 
     def test_a_manifest_must_name_every_required_playable_file(self) -> None:
-        for required in GAME_FILES[:5]:
+        for required in REQUIRED_GAME_FILES:
             with self.subTest(required=required):
                 shutil.rmtree(self.output, ignore_errors=True)
                 previous = write_previous_publication(self.root / "previous")

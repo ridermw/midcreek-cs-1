@@ -11,9 +11,9 @@ treating this page as the replacement for them.
 So the only decision left here is what the page may say. It may link the
 retained game when the previous publication's own `last-green.json` parses,
 names that tree, and names a complete playable package — and otherwise it says
-nothing about a game at all. A previous tree that is corrupt, symlinked,
-truncated, forged, or simply absent costs this page a sentence; it never costs
-the run its publication.
+nothing about a game at all. An unsafe previous tree does not stop this script
+from writing the status page. The assembler validates the tree independently
+and can still refuse the final publication.
 """
 
 from __future__ import annotations
@@ -63,6 +63,10 @@ MAX_MANIFEST_BYTES = 1 << 20
 #: file exactly once, so this is the hard ceiling on the work a previous
 #: publication can ask of this generator.
 MAX_GAME_FILES = 4096
+
+#: Bound the complete package inventory, including directories, before the
+#: fallback can claim that the manifest describes the complete tree.
+MAX_PACKAGE_ENTRIES = MAX_GAME_FILES * 2
 
 #: The one file the status page would link, if it linked anything.
 PLAYABLE_ENTRY = "play/index.html"
@@ -227,19 +231,55 @@ def named_game_file(previous: Path, root: str, entry: object) -> str | None:
     return None
 
 
+def published_game_files(previous: Path, package: Path) -> list[str] | str:
+    """The sorted plain-file inventory, or the reason it cannot be trusted."""
+    files: list[str] = []
+    pending = [package]
+    entry_count = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError as failure:
+            return f"{directory} could not be inventoried: {failure}"
+        with entries:
+            try:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > MAX_PACKAGE_ENTRIES:
+                        return (
+                            f"{PLAYABLE_ROOT}/ contains over the "
+                            f"{MAX_PACKAGE_ENTRIES} entry limit"
+                        )
+                    path = Path(entry.path)
+                    relative = path.relative_to(previous).as_posix()
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                    if stat.S_ISLNK(mode):
+                        return f"{relative} is a symbolic link"
+                    if stat.S_ISDIR(mode):
+                        pending.append(path)
+                    elif stat.S_ISREG(mode):
+                        files.append(relative)
+                    else:
+                        return f"{relative} is not a plain file"
+            except OSError as failure:
+                return f"{directory} could not be inventoried: {failure}"
+    files.sort()
+    return files
+
+
 def playable_refusal(previous: Path | None) -> str | None:
     """Why the previous playable domain may not be claimed, or ``None``.
 
-    Nothing here can stop the degraded publication. Every answer but ``None``
-    is a reason for the page to say less, never a reason to publish nothing:
-    an unreadable, symlinked, truncated, or forged previous tree costs this run
-    a sentence, not its status.
+    Nothing here stops this script from writing the degraded current tree.
+    Every answer but ``None`` is a reason for the page to say less. The
+    assembler applies its own safety checks and can still refuse the final
+    publication.
 
     A claim is earned by provenance, never by existence. The manifest the
-    generator wrote has to parse, name this exact tree, and name every required
-    file plus an asset; the files it names have to be plain files really inside
-    the package. Anything short of that leaves the domain unclaimed and
-    untouched, for assembly to retain or refuse on its own terms.
+    generator wrote has to parse, name a valid source commit, and name every
+    plain file in this exact tree. Anything short of that leaves the domain
+    unclaimed and untouched, for assembly to retain or refuse on its own terms.
     """
     if previous is None:
         return "no previous publication was checked out"
@@ -255,8 +295,10 @@ def playable_refusal(previous: Path | None) -> str | None:
         return manifest
 
     source_commit = manifest["source_commit"]
-    if not isinstance(source_commit, str) or not source_commit.strip():
-        return f"{LAST_GREEN_FILE} names no source commit"
+    if not isinstance(source_commit, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}", source_commit
+    ) is None:
+        return f"{LAST_GREEN_FILE} source_commit must be 40 hexadecimal characters"
     game_files = manifest["game_files"]
     if not isinstance(game_files, list) or not game_files:
         return f"{LAST_GREEN_FILE} names no game files"
@@ -283,6 +325,12 @@ def playable_refusal(previous: Path | None) -> str | None:
             return f"{LAST_GREEN_FILE} does not name {required}"
     if not any(entry.startswith(PLAYABLE_ASSETS) for entry in named):
         return f"{LAST_GREEN_FILE} does not name a file below {PLAYABLE_ASSETS}"
+
+    published = published_game_files(previous, package)
+    if isinstance(published, str):
+        return published
+    if game_files != published:
+        return f"{LAST_GREEN_FILE} does not list every plain file below {PLAYABLE_ROOT}/"
     return None
 
 
