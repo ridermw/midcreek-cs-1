@@ -11,12 +11,14 @@
 #   4. Clippy over every target and feature with warnings denied;
 #   5. the autonomous asset generator in --check mode;
 #   6. sitegen validation of the published progress data;
-#   7. every pure, integration, and site test;
-#   8. the rendered verification contract, which launches the real game and
+#   7. the history suite, including the degraded publication fallback composed
+#      with the real assembler;
+#   8. every pure, integration, and site test;
+#   9. the rendered verification contract, which launches the real game and
 #      analyses its fourteen real frames;
-#   9. the packaged WebAssembly build and its headless browser gate, when a
+#  10. the packaged WebAssembly build and its headless browser gate, when a
 #      browser and the pinned wasm-bindgen toolchain are available;
-#  10. the release build.
+#  11. the release build.
 #
 # The rendered contract needs a real renderer. On a headless Linux machine that
 # means Xvfb: a missing display or a missing renderer is a hard failure here,
@@ -63,13 +65,17 @@ cargo run --quiet --bin assetgen -- --check
 # against a short clone would end the gate before it could.
 step "published history bound"
 ./scripts/ensure-history.sh
-python3 scripts/ensure_history_test.py
 
 step "published progress data is consistent"
 cargo run --quiet --bin sitegen -- validate \
   --progress docs/progress.json \
   --plan docs/implementation-plan.md \
   --repository .
+
+# The history suite composes the degraded publication fallback with the real
+# assembler, so it runs once the step above has built `sitegen` for it.
+step "history bound tests"
+python3 scripts/ensure_history_test.py
 
 step "pure and integration tests"
 cargo test --lib --bins

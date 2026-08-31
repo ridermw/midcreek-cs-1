@@ -900,6 +900,26 @@ So `RetainLastGreen` keeps the last verified game while publishing the native
 evidence this run really produced, and `FailedRetainLastGreen` publishes the
 current failure status beside the last green screenshots.
 
+When Publish cannot prove its checkout reaches every commit
+`docs/progress.json` names, the strict generator is not run at all;
+`scripts/history_failure_site.py` writes a degraded current tree instead — one
+`index.html` carrying the sanitized workflow result, and nothing else. That
+tree is assembled with `--publication degraded`, which is how a page that built
+no game says it is not the replacement for one: a green run that would
+otherwise be a `GreenReplacement` becomes a retention, so the last verified
+game survives a publication the generator could not produce. Without the flag
+the assembler refuses the whole publication rather than dropping a verified
+game for a page that never had one.
+
+The fallback copies nothing. Assembly is the single place a previous domain is
+carried forward, and it carries it once. All the fallback decides is whether
+the page may link the retained build, and it earns that by provenance rather
+than existence: the previous `last-green.json` has to parse as the manifest
+this generator writes, name `play/index.html`, and name only plain files really
+inside `play/`, within an explicit manifest size and file-count limit. A
+previous tree that is corrupt, forged, symlinked, truncated, or absent costs
+the page that one sentence and costs the run nothing.
+
 `last-green.json` describes the assembled tree rather than the plan that
 produced it. The generator writes it after promotion completes, enumerating
 `play/` and `screenshots/current/` from the output it wrote, and assembly

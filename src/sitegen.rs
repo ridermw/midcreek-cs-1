@@ -815,6 +815,46 @@ pub const REQUIRED_PLAYABLE_FILES: [&str; 5] = [
 /// The directory holding the generated models the packaged game loads.
 pub const REQUIRED_PLAYABLE_ASSETS: &str = "assets";
 
+/// How the current tree handed to assembly was produced.
+///
+/// Only this generator can publish a game, so only a tree it wrote can stand
+/// in for the last verified one. A publication path that could not run the
+/// generator says so here instead of dressing a copied directory up as this
+/// run's replacement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CurrentPublication {
+    /// Built by `sitegen build` from validated inputs.
+    #[default]
+    Generated,
+    /// A status-only page published because the generator could not run. It
+    /// carries no game and no evidence of its own, so assembly retains the
+    /// last verified domains beneath it rather than replacing them.
+    Degraded,
+}
+
+impl CurrentPublication {
+    pub const GENERATED: &'static str = "generated";
+    pub const DEGRADED: &'static str = "degraded";
+
+    /// Reads the publication kind a caller named, refusing anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            Self::GENERATED => Some(Self::Generated),
+            Self::DEGRADED => Some(Self::Degraded),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CurrentPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Generated => Self::GENERATED,
+            Self::Degraded => Self::DEGRADED,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildDisposition {
     GreenReplacement,
@@ -2302,12 +2342,21 @@ pub fn assemble_site(
     previous: Option<&Path>,
     current: &Path,
     workflow: &WorkflowSummary,
+    publication: CurrentPublication,
     output: &Path,
 ) -> Result<BuildDisposition, SitegenError> {
     require_directory(current)?;
 
+    // A green run whose current tree is a degraded status page published no
+    // game, so it cannot be a replacement for one. Retention below is the only
+    // honest outcome left: the last verified domains stay exactly as they were
+    // published, and nothing in this tree claims to be them.
     let disposition = match (workflow.native, workflow.web, previous) {
-        (GateStatus::Passed, GateStatus::Passed, _) => BuildDisposition::GreenReplacement,
+        (GateStatus::Passed, GateStatus::Passed, _)
+            if publication == CurrentPublication::Generated =>
+        {
+            BuildDisposition::GreenReplacement
+        }
         (GateStatus::Failed, _, Some(_)) | (_, GateStatus::Failed, Some(_)) => {
             BuildDisposition::FailedRetainLastGreen
         }

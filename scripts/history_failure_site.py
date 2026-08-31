@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Render an honest status-only site when Publish cannot verify git history."""
+"""Render an honest status-only site when Publish cannot verify git history.
+
+This writes the *current* tree and nothing else. It never copies a previous
+publication forward: `sitegen assemble` is the one place a verified game or a
+verified frame is carried, and it does that exactly once, from the previous
+tree straight into the assembled output. Run with `--publication degraded`,
+that assembly retains the last verified domains under this page instead of
+treating this page as the replacement for them.
+
+So the only decision left here is what the page may say. It may link the
+retained game when the previous publication's own `last-green.json` parses,
+names that tree, and names the file the link points at — and otherwise it says
+nothing about a game at all. A previous tree that is corrupt, symlinked,
+truncated, forged, or simply absent costs this page a sentence; it never costs
+the run its publication.
+"""
 
 from __future__ import annotations
 
@@ -9,9 +24,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 STATUSES = {
     "passed": ("Passed", "passed"),
@@ -27,6 +43,35 @@ GATE_FIELDS = {
     "duration_ms",
     "artifact_url",
 }
+
+#: Every field `sitegen` writes into the manifest that vouches for a published
+#: game. A document shaped like anything else was not written by the generator,
+#: so it proves nothing about the directory beside it.
+LAST_GREEN_FIELDS = {
+    "source_commit",
+    "semantic_visual_hash",
+    "game_files",
+    "screenshot_files",
+}
+
+#: The manifest is a small JSON document. Anything larger is not read at all,
+#: so a hostile or truncated previous publication cannot be streamed into this
+#: process before it is refused.
+MAX_MANIFEST_BYTES = 1 << 20
+
+#: The most game files a manifest may name. The check below stats each named
+#: file exactly once, so this is the hard ceiling on the work a previous
+#: publication can ask of this generator.
+MAX_GAME_FILES = 4096
+
+#: The one file the status page would link, if it linked anything.
+PLAYABLE_ENTRY = "play/index.html"
+
+#: The directory the previous publication keeps its game in.
+PLAYABLE_ROOT = "play"
+
+#: The manifest that names it.
+LAST_GREEN_FILE = "last-green.json"
 
 
 class FallbackError(Exception):
@@ -110,36 +155,120 @@ def read_workflow(path: Path) -> dict[str, object]:
     return workflow
 
 
-def reject_symlinks(path: Path) -> None:
-    if path.is_symlink():
-        raise FallbackError(f"{path} is a symbolic link")
-    if not path.is_dir():
-        return
-    for directory, names, files in os.walk(path, followlinks=False):
-        root = Path(directory)
-        for name in [*names, *files]:
-            candidate = root / name
-            if candidate.is_symlink():
-                raise FallbackError(f"{candidate} is a symbolic link")
+def read_manifest(path: Path) -> dict[str, object] | str:
+    """The parsed last-green manifest, or the reason it cannot be trusted."""
+    if path.is_symlink() or not path.is_file():
+        return f"{path.name} is missing or is not a plain file"
+    try:
+        size = path.stat().st_size
+        if size > MAX_MANIFEST_BYTES:
+            return f"{path.name} is {size} bytes, over the {MAX_MANIFEST_BYTES} byte limit"
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_MANIFEST_BYTES + 1)
+    except OSError as failure:
+        return f"{path.name} could not be read: {failure}"
+    if len(raw) > MAX_MANIFEST_BYTES:
+        return f"{path.name} grew past the {MAX_MANIFEST_BYTES} byte limit while it was read"
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as failure:
+        return f"{path.name} is not the JSON this generator writes: {failure}"
+    if not isinstance(manifest, dict) or set(manifest) != LAST_GREEN_FIELDS:
+        return f"{path.name} is not a publication manifest"
+    return manifest
 
 
-def retained_game(previous: Path | None) -> tuple[Path | None, Path | None]:
+def named_game_file(previous: Path, root: str, entry: object) -> str | None:
+    """The reason one manifest entry cannot be trusted, or ``None``."""
+    if not isinstance(entry, str) or not entry:
+        return f"{entry!r} is not a published path"
+    if "\x00" in entry or "\\" in entry:
+        return f"{entry!r} is not a published path"
+    relative = PurePosixPath(entry)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) < 2
+        or relative.parts[0] != PLAYABLE_ROOT
+        or ".." in relative.parts
+        or "." in relative.parts
+    ):
+        return f"{entry!r} is not inside {PLAYABLE_ROOT}/"
+    candidate = previous.joinpath(*relative.parts)
+    if candidate.is_symlink():
+        return f"{entry} is a symbolic link"
+    try:
+        status = os.lstat(candidate)
+    except OSError as failure:
+        return f"{entry} is not published: {failure}"
+    if not stat.S_ISREG(status.st_mode):
+        return f"{entry} is not a plain file"
+    try:
+        resolved = os.path.realpath(candidate)
+    except OSError as failure:
+        return f"{entry} could not be resolved: {failure}"
+    try:
+        contained = os.path.commonpath([root, resolved]) == root
+    except ValueError:
+        contained = False
+    if not contained:
+        return f"{entry} resolves outside {PLAYABLE_ROOT}/"
+    return None
+
+
+def playable_refusal(previous: Path | None) -> str | None:
+    """Why the previous playable domain may not be claimed, or ``None``.
+
+    Nothing here can stop the degraded publication. Every answer but ``None``
+    is a reason for the page to say less, never a reason to publish nothing:
+    an unreadable, symlinked, truncated, or forged previous tree costs this run
+    a sentence, not its status.
+
+    A claim is earned by provenance, never by existence. The manifest the
+    generator wrote has to parse, name this exact tree, and name the one file
+    the page would link; the files it names have to be plain files really
+    inside the package. Anything short of that leaves the domain unclaimed and
+    untouched, for assembly to retain or refuse on its own terms.
+    """
     if previous is None:
-        return None, None
+        return "no previous publication was checked out"
     if previous.is_symlink() or not previous.is_dir():
-        raise FallbackError(f"{previous} is not a directory")
+        return f"{previous} is not a directory"
 
-    package = previous / "play"
-    manifest = previous / "last-green.json"
-    reject_symlinks(package)
-    reject_symlinks(manifest)
-    package_exists = package.exists() or package.is_symlink()
-    manifest_exists = manifest.exists() or manifest.is_symlink()
-    if not package_exists and not manifest_exists:
-        return None, None
-    if not package.is_dir() or not manifest.is_file():
-        raise FallbackError(f"{previous} has an incomplete last-green playable domain")
-    return package, manifest
+    package = previous / PLAYABLE_ROOT
+    if package.is_symlink() or not package.is_dir():
+        return f"the previous publication has no plain {PLAYABLE_ROOT}/ directory"
+
+    manifest = read_manifest(previous / LAST_GREEN_FILE)
+    if isinstance(manifest, str):
+        return manifest
+
+    source_commit = manifest["source_commit"]
+    if not isinstance(source_commit, str) or not source_commit.strip():
+        return f"{LAST_GREEN_FILE} names no source commit"
+    game_files = manifest["game_files"]
+    if not isinstance(game_files, list) or not game_files:
+        return f"{LAST_GREEN_FILE} names no game files"
+    if len(game_files) > MAX_GAME_FILES:
+        return (
+            f"{LAST_GREEN_FILE} names {len(game_files)} game files, "
+            f"over the {MAX_GAME_FILES} file limit"
+        )
+
+    try:
+        root = os.path.realpath(package)
+    except OSError as failure:
+        return f"{PLAYABLE_ROOT}/ could not be resolved: {failure}"
+
+    named = set()
+    for entry in game_files:
+        refusal = named_game_file(previous, root, entry)
+        if refusal is not None:
+            return f"{LAST_GREEN_FILE} {refusal}"
+        named.add(PurePosixPath(entry).as_posix())
+
+    if PLAYABLE_ENTRY not in named:
+        return f"{LAST_GREEN_FILE} does not name {PLAYABLE_ENTRY}"
+    return None
 
 
 def render_status(workflow: dict[str, object], has_game: bool) -> str:
@@ -164,9 +293,10 @@ def render_status(workflow: dict[str, object], has_game: bool) -> str:
     )
     game = (
         '<p><a href="play/index.html">Open the last verified playable build</a>. '
-        "It was retained unchanged from the previous publication.</p>"
+        "Assembly retains it unchanged from the previous publication; this run "
+        "published no game of its own.</p>"
         if has_game
-        else "<p>No previous verified game was available; this is a status-only publication.</p>"
+        else "<p>This publication links no playable build.</p>"
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -222,24 +352,31 @@ def render_status(workflow: dict[str, object], has_game: bool) -> str:
 """
 
 
-def write_site(
-    workflow_path: Path, previous: Path | None, output: Path
-) -> None:
+def write_site(workflow_path: Path, previous: Path | None, output: Path) -> None:
+    """Writes the current degraded surface, and only that.
+
+    Not one byte of the previous publication is copied here. `sitegen assemble`
+    already lays a validated previous tree down under this one exactly once,
+    and a second copy through this script would double the transfer, duplicate
+    a trust boundary that is stricter than anything Python does here, and dress
+    the retained game up as this run's own.
+    """
     workflow = read_workflow(workflow_path)
-    package, manifest = retained_game(previous)
-    if output.exists():
+    refusal = playable_refusal(previous)
+    if refusal is not None:
+        print(
+            f"the retained playable build is not claimed: {refusal}",
+            file=sys.stderr,
+        )
+    if output.exists() or output.is_symlink():
         raise FallbackError(f"{output} already exists")
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
         tempfile.mkdtemp(prefix=f".{output.name}-history-failure-", dir=output.parent)
     )
     try:
-        upstream_passed = workflow["native"] == "passed" and workflow["web"] == "passed"
-        if upstream_passed and package is not None and manifest is not None:
-            shutil.copytree(package, staging / "play", symlinks=True)
-            shutil.copy2(manifest, staging / "last-green.json")
         (staging / "index.html").write_text(
-            render_status(workflow, package is not None),
+            render_status(workflow, refusal is None),
             encoding="utf-8",
         )
         staging.replace(output)

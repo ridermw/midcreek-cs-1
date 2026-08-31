@@ -59,15 +59,18 @@ jobs:
       # renderer discovery can fail. The history bound is measured rather than
       # treated as a precondition: a short clone is a fact this run publishes,
       # and the browser client tests exercise loopback and fake sockets only.
+      #
+      # The history *tests* are not here with them. They compose the degraded
+      # publication fallback with the real assembler, so they need a built
+      # `sitegen`, and this runner cannot build one until the prerequisites
+      # below are installed. They run as their own named gate further down,
+      # recorded exactly like every other row.
       - name: Run the early non-browser gates
         run: |
           set -uo pipefail
 
           ./scripts/run-gate.sh "$GATES" "Published history bound" -- \
             ./scripts/ensure-history.sh
-
-          ./scripts/run-gate.sh "$GATES" "History bound tests" -- \
-            python3 scripts/ensure_history_test.py
 
           ./scripts/run-gate.sh "$GATES" "Browser gate unit tests" -- \
             python3 scripts/browser_gate_test.py
@@ -144,6 +147,12 @@ jobs:
               --progress docs/progress.json \
               --plan docs/implementation-plan.md \
               --repository .
+
+          # Runs here rather than with the other cheap gates: its composed
+          # cases drive the real `sitegen assemble` over a real degraded
+          # fallback tree, and the step above is what leaves that binary built.
+          ./scripts/run-gate.sh "$GATES" "History bound tests" -- \
+            python3 scripts/ensure_history_test.py
 
           ./scripts/run-gate.sh "$GATES" "Rust formatting" -- \
             cargo fmt --all --check
@@ -582,6 +591,7 @@ jobs:
             mv "$pages_root/workflow.retry.json" "$pages_root/workflow.json"
           fi
 
+          publication_args=()
           if [[ "$PUBLISH_HISTORY" == "success" ]]; then
             cargo run --quiet --bin sitegen -- build \
               --inputs "$pages_root/inputs.json" \
@@ -590,17 +600,23 @@ jobs:
             # The strict generator must not be handed an incomplete repository
             # and told those missing commits are valid. Publish a deliberately
             # reduced current page instead, carrying only the sanitized
-            # workflow result and the previous verified playable domain.
+            # workflow result. It copies nothing: the assembly below is the one
+            # place a previously verified domain is carried forward, and
+            # `--publication degraded` is how this page says it is not the
+            # replacement for one. Without it a green run would be told to
+            # publish a game this page never built, and would refuse.
             python3 scripts/history_failure_site.py \
               --workflow "$pages_root/workflow.json" \
               "${previous_args[@]}" \
               --output "$current"
+            publication_args=(--publication degraded)
           fi
 
           cargo run --quiet --bin sitegen -- assemble \
             "${previous_args[@]}" \
             --current "$current" \
             --result "$pages_root/workflow.json" \
+            "${publication_args[@]}" \
             --output "$output"
 
           touch "$output/.nojekyll"
