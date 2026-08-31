@@ -95,6 +95,40 @@ pub const WALKWAY_MARKING_LENGTH: f32 = 32.0;
 pub const ORTHOGRAPHIC_WIDTH: f32 = 26.0;
 pub const ORTHOGRAPHIC_HEIGHT: f32 = 14.625;
 pub const INITIAL_CAMERA_YAW_DEGREES: f32 = 45.0;
+/// Camera elevation above the horizon, in degrees.
+///
+/// This one number decides three others, and the relations are easy to get
+/// backwards, so they are drawn rather than described.
+///
+/// **On screen.** A ground axis lands at `arctan(sin(elevation))`. At 57
+/// degrees that is 40, which is why the two diagonal edge families of a
+/// captured frame sit at 40 and 140. Inverting it recovers the camera an image
+/// was drawn at — see [`crate::metrics::elevation_from_row_angle`].
+///
+/// **Overhead.** Anything at height `h` projects onto the ground
+/// `cot(elevation) / sqrt(2) * h` away along each axis, which is what fixes
+/// [`OVERHEAD_TRAY_HEIGHT`].
+///
+/// **Occlusion.** A rack row hides less than its distance suggests, because
+/// the camera looks *across* the rows at 45 degrees of azimuth: crossing a
+/// perpendicular gap `dx` costs `dx * sqrt(2)` along the sightline.
+///
+/// ```text
+///        camera
+///          \  elevation
+///           \                     rack top --+
+///            \                               | h_r = 2.10 m
+///   ----------o---------------------------+--+----
+///          technician    dx * sqrt(2)    dx
+///          h_t = 1.80 m  along sightline
+///
+///   visible  iff  h_t + dx * sqrt(2) * tan(elevation) >= h_r
+/// ```
+///
+/// At 57 degrees a technician is clear at aisle centre and hidden while
+/// working at a rack the camera is on the same side of. Orbiting 180 degrees
+/// puts the opposite row in front instead and clears them. That is why orbit,
+/// not camera height, is the answer to occlusion here.
 pub const CAMERA_ELEVATION_DEGREES: f32 = 57.0;
 /// Normalized camera offset proportions. The vertical component is
 /// `sqrt(2) * tan(57 degrees)`, so normalization produces the reviewed

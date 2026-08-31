@@ -30,22 +30,24 @@ use midcreek_cs_1::{
         AssetKind, CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, FLOOR_LIGHT,
         KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, PaletteRole, SceneBlueprint,
     },
+    metrics::{
+        CLIP_DIFFERENCE_RANGE, FrameMetrics, OUTSIDE_CROP_MAX, PALETTE_TOLERANCE, PixelRect,
+        SENTINEL_MAX, WORKER_REGION, reference_metrics,
+    },
     player::required_player_parts,
     verification::{
         APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CAPTURE_DELAY_LIMIT,
-        CAPTURE_TIMEOUT, CLIP_DIFFERENCE_RANGE, CameraRenderFacts, DROP_CAPTURE_TIMEOUT,
-        EQUIPMENT_REGION_MIN_PIXELS, EQUIPMENT_ROLE_MIN, EquipmentCategory, EquipmentFacts,
-        FrameFacts, FrameMetrics, FrameName, GameplayFacts, HudRowFacts, LAUNCH_MARGIN,
-        OUTSIDE_CROP_MAX, OWNED_NAMES, PALETTE_TOLERANCE, PARENT_WATCHDOG, PROBE_FILE_NAME,
-        PixelRect, REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, SENTINEL_MAX, STALL_WATCHDOG,
-        StageError, StageMachine, VERIFICATION_MSAA, VerificationFault, VerificationReport,
-        VerificationRequest, VerificationStage, VerifyOutput, VerifyOutputError, WORKER_REGION,
-        axis_aligned_fixture, badge_region, black_fixture, blank_hud_fixture, canonical_f64,
-        canonical_float, canonical_json, clip_difference, equipment_region, evaluate_frame,
-        flood_bytes, frame_regions, gradient_noise_fixture, hud_region, magenta_border_fixture,
-        missing_badge_fixture, missing_worker_fixture, outside_crop_change,
-        parse_verification_args, reference_metrics, semantic_hash, synthetic_badges,
-        synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
+        CAPTURE_TIMEOUT, CameraRenderFacts, DROP_CAPTURE_TIMEOUT, EQUIPMENT_REGION_MIN_PIXELS,
+        EQUIPMENT_ROLE_MIN, EquipmentCategory, EquipmentFacts, FrameFacts, FrameName,
+        GameplayFacts, HudRowFacts, LAUNCH_MARGIN, OWNED_NAMES, PARENT_WATCHDOG, PROBE_FILE_NAME,
+        REPORT_FILE_NAME, RectFacts, SENTINEL_CLEAR, STALL_WATCHDOG, StageError, StageMachine,
+        VERIFICATION_MSAA, VerificationFault, VerificationReport, VerificationRequest,
+        VerificationStage, VerifyOutput, VerifyOutputError, axis_aligned_fixture, badge_region,
+        black_fixture, blank_hud_fixture, canonical_f64, canonical_float, canonical_json,
+        clip_difference, equipment_region, evaluate_frame, flood_bytes, frame_regions,
+        gradient_noise_fixture, hud_region, magenta_border_fixture, missing_badge_fixture,
+        missing_worker_fixture, outside_crop_change, parse_verification_args, semantic_hash,
+        synthetic_badges, synthetic_frame, synthetic_hud_panel, synthetic_worker_crop,
     },
 };
 use sha2::{Digest, Sha256};
@@ -1308,6 +1310,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: None,
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1317,6 +1320,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: Some(VerificationFault::Stall),
             capture_delay: None,
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1326,6 +1330,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: Some(30),
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1335,6 +1340,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: Some(0),
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1344,6 +1350,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: None,
             flood: Some(4096),
+            ..VerificationRequest::default()
         })
     );
 }
@@ -1815,7 +1822,7 @@ fn rendered_run_pins_every_source_asset_and_reference_hash() {
     assert_eq!(run.report.assets.len(), 5);
     assert_eq!(run.report.asset_sources.len(), 5);
     assert_eq!(run.report.references.len(), 2);
-    assert!(!run.report.sources.is_empty());
+    assert_eq!(run.report.sources.len(), 8);
     for map in [
         &run.report.assets,
         &run.report.asset_sources,

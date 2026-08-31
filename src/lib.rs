@@ -3,6 +3,7 @@ pub mod assets;
 pub mod camera;
 pub mod design;
 pub mod hud;
+pub mod metrics;
 pub mod operations;
 pub mod player;
 /// The site generator is a native publication tool: it reads the repository,

@@ -7,6 +7,11 @@
 //! An unusable output path is a usage error, not a crash: it exits with code 2
 //! and one line on stderr naming the path and the reason.
 //!
+//! `midcreek-cs-1 --measure <image.png>` reads one PNG and prints what it
+//! measures as JSON, without opening a window. Add `--reference` to declare the
+//! image is drawn art rather than a captured frame, which is what allows the
+//! camera it was drawn at to be reported.
+//!
 //! `midcreek-cs-1 --verify-flood <bytes>` is the pipe fixture: it writes that
 //! many bytes to each of stdout and stderr and exits successfully, so the
 //! parent watchdog's concurrent drain can be proven against a child that
@@ -37,6 +42,25 @@ fn main() -> ExitCode {
 
     if let Some(bytes) = request.flood {
         return run_flood(bytes);
+    }
+
+    if let Some(image) = request.measure {
+        return match midcreek_cs_1::metrics::measure(&image, request.measure_source) {
+            Ok(report) => match serde_json::to_string_pretty(&report) {
+                Ok(json) => {
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("the measurement could not be written: {error}");
+                    ExitCode::from(2)
+                }
+            },
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        };
     }
 
     let Some(path) = request.output else {
