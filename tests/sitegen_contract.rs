@@ -452,6 +452,26 @@ mod output_validation_contract {
         }
     }
 
+    #[test]
+    fn a_path_prefix_sibling_is_not_the_declared_repository() {
+        let site = build_fixture_site("green").unwrap();
+        mutate_index(&site, |html| {
+            html.replace(
+                "Render the progress hub",
+                "Published from /srv/hubris/docs/reference",
+            )
+        });
+
+        assert_eq!(
+            midcreek_cs_1::sitegen::validate_site_output_in(
+                Path::new("/srv/hub"),
+                site.root(),
+                &fixture("green/progress.json"),
+            ),
+            Ok(())
+        );
+    }
+
     /// The same bytes, checked against the same declared repository and
     /// output, must reach the same verdict on every machine and from every
     /// working directory. A gate that consulted the environment publishes a
@@ -3064,6 +3084,37 @@ mod verification_publication_contract {
         let entry = reverted.entries.last().unwrap();
         assert_eq!(entry.semantic_visual_hash, first_hash);
         assert_eq!(entry.source_commit, "4".repeat(40));
+
+        let mut inputs = site_inputs("verified-game");
+        inputs.gallery = Some(moved_on);
+        inputs
+            .verification
+            .as_mut()
+            .unwrap()
+            .summary
+            .semantic_visual_hash = first_hash;
+        let source_commit = inputs.workflow.source_commit.clone();
+        let html = build_site_from_inputs("rendered-revert", &inputs)
+            .unwrap()
+            .index_html();
+        let document = scraper::Html::parse_document(&html);
+        let entries = scraper::Selector::parse("#screenshots .screenshot-entry").unwrap();
+        let new_entries = document
+            .select(&entries)
+            .filter(|entry| entry.text().any(|text| text.contains("New this build")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            new_entries.len(),
+            1,
+            "only the appended history point may carry the badge: {html}"
+        );
+        assert!(
+            new_entries[0]
+                .text()
+                .any(|text| text.contains(&source_commit[..8])),
+            "the badge must identify the appended commit: {html}"
+        );
     }
 
     #[test]

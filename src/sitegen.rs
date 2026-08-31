@@ -409,6 +409,17 @@ pub fn validate_job_result(result: &JobResult) -> Result<(), SitegenError> {
     for gate in &result.gates {
         validate_gate(gate)?;
     }
+    if result.status == GateStatus::Passed
+        && result
+            .gates
+            .iter()
+            .any(|gate| gate.status != GateStatus::Passed)
+    {
+        return Err(SitegenError::UnsafeResultValue {
+            field: "status".to_owned(),
+            message: "passed job result contains a gate that did not pass".to_owned(),
+        });
+    }
     if let Some(evidence) = &result.evidence {
         validate_relative_directory("evidence", evidence)?;
     }
@@ -3821,10 +3832,7 @@ fn current_evidence_succeeded(current: &Path) -> bool {
     let Ok(json) = fs::read_to_string(current.join(VERIFICATION_FILE)) else {
         return false;
     };
-    serde_json::from_str::<serde_json::Value>(&json)
-        .ok()
-        .and_then(|value| value.get("succeeded")?.as_bool())
-        .unwrap_or(false)
+    serde_json::from_str::<VerificationSummary>(&json).is_ok_and(|summary| summary.succeeded)
 }
 
 /// Brings the assembled homepage into agreement with the playable build the
@@ -4111,15 +4119,13 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
     // accepted points are retained by assembly, and the manifest published
     // beside this page is what vouches for them.
     let published = evidence.is_some();
-    let latest_hash = gallery
-        .entries
-        .last()
-        .map_or("", |entry| entry.semantic_visual_hash.as_str());
+    let latest_index = gallery.entries.len() - 1;
     let history = gallery
         .entries
         .iter()
+        .enumerate()
         .rev()
-        .map(|entry| {
+        .map(|(index, entry)| {
             let images = if published {
                 entry
                     .frames
@@ -4142,8 +4148,7 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
             } else {
                 r#"<p class="history-note">Screenshots for this point are retained from the last green publication.</p>"#.to_owned()
             };
-            let newest = evidence.is_some_and(|value| value.appended)
-                && entry.semantic_visual_hash == latest_hash;
+            let newest = evidence.is_some_and(|value| value.appended) && index == latest_index;
             let chip = if newest {
                 r#"<span class="pending-chip">New this build</span>"#
             } else {
@@ -4647,7 +4652,8 @@ fn validate_local_target(
 /// built it never belongs in one. The rule is stated over exactly the two
 /// locations this publication was handed — the repository it published from
 /// and the directory it published into — each as it was given and as it
-/// canonicalizes, matched raw and HTML-escaped, anywhere in the document.
+/// canonicalizes, matched raw and HTML-escaped at path-component boundaries
+/// anywhere in the document.
 ///
 /// Nothing ambient decides the verdict: not `HOME`, not the system temporary
 /// directory, not the working directory, not `RUNNER_TEMP` or
@@ -4684,7 +4690,9 @@ fn validate_local_target(
 /// this scan or `resolve_artifact` checked them.
 fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<String> {
     for root in publication_paths(repository, output) {
-        if html.contains(&root) || html.contains(&escape_html(&root)) {
+        if contains_path_at_boundary(html, &root)
+            || contains_path_at_boundary(html, &escape_html(&root))
+        {
             return Some(root);
         }
     }
@@ -4692,6 +4700,36 @@ fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<S
     // path follows it, the page is telling a visitor to read the builder's
     // disk.
     html.contains("file://").then(|| "file://".to_owned())
+}
+
+fn contains_path_at_boundary(text: &str, path: &str) -> bool {
+    text.match_indices(path).any(|(start, _)| {
+        let preceding = text[..start].chars().next_back();
+        let mut following = text[start + path.len()..].chars();
+        let starts_component = path.starts_with('/')
+            || path.starts_with('\\')
+            || preceding.is_none_or(|value| {
+                !value.is_ascii_alphanumeric() && !matches!(value, '_' | '-' | '.')
+            });
+        let ends_component = match following.next() {
+            None => true,
+            Some(value) if matches!(value, '/' | '\\') || value.is_ascii_whitespace() => true,
+            Some(value)
+                if matches!(
+                    value,
+                    '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | ';' | ':' | '?' | '#'
+                ) =>
+            {
+                true
+            }
+            Some('.') => following.next().is_none_or(|value| {
+                value.is_ascii_whitespace()
+                    || matches!(value, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            }),
+            Some(_) => false,
+        };
+        starts_component && ends_component
+    })
 }
 
 /// The two locations of this publication, in every form a leak could carry.
@@ -4753,9 +4791,6 @@ fn history_frames(output: &Path) -> (BTreeSet<String>, Vec<String>) {
     for entry in gallery.entries {
         let root = format!("{HISTORY_SCREENSHOTS}/{}/", short_sha(&entry.source_commit));
         for path in entry.frames.into_values() {
-            if !path.starts_with(HISTORY_SCREENSHOTS) {
-                continue;
-            }
             let owned = path
                 .strip_prefix(&root)
                 .is_some_and(|file| !file.is_empty() && !file.contains('/'));

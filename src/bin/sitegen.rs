@@ -464,27 +464,28 @@ mod native {
     /// relocated binary's is not on the machine at all, and a run that can name
     /// no source tree refuses to publish rather than publishing anywhere. The
     /// workflow declares nothing extra for this: a job that checked the
-    /// repository out either exported `GITHUB_WORKSPACE` or is running inside
-    /// the checkout.
+    /// repository out runs inside the checkout, or exports `GITHUB_WORKSPACE`
+    /// when its working directory is elsewhere.
     ///
     /// `GITHUB_WORKSPACE` is a hint, not an assertion, so an unusable one
-    /// falls through to discovery instead of replacing it. The empty string is
-    /// why that matters: it names no directory at all, yet `"".join(".git")`
-    /// is `.git`, which resolves against the working directory — so an empty
-    /// export used to "find" a workspace of `""`, stop the search, and leave a
-    /// run standing inside a checkout with no protected root but the
-    /// compiled-in one. A hint is therefore only taken when it is absolute,
-    /// is a directory, and really holds a `.git` entry, and a discovered
-    /// checkout is reported canonically, so the protected root is the same
-    /// path whichever route found it and however the run was launched.
+    /// falls through to discovery instead of replacing it. Discovery from the
+    /// working directory runs first, because a valid but stale exported hint
+    /// must not override the checkout that contains the command. The empty
+    /// string is another unsafe hint: it names no directory at all, yet
+    /// `"".join(".git")` is `.git`, which resolves against the working
+    /// directory. A hint is therefore only taken when it is absolute, is a
+    /// directory, and really holds a `.git` entry. Every accepted checkout is
+    /// reported canonically.
     fn runtime_repository() -> PathBuf {
-        env::var_os("GITHUB_WORKSPACE")
-            .map(PathBuf::from)
-            .filter(|workspace| workspace.is_absolute() && workspace.is_dir())
-            .and_then(|workspace| checkout_root(&workspace))
+        env::current_dir()
+            .ok()
+            .and_then(|working| fs::canonicalize(working).ok())
+            .and_then(|working| working.ancestors().find_map(checkout_root))
             .or_else(|| {
-                let working = fs::canonicalize(env::current_dir().ok()?).ok()?;
-                working.ancestors().find_map(checkout_root)
+                env::var_os("GITHUB_WORKSPACE")
+                    .map(PathBuf::from)
+                    .filter(|workspace| workspace.is_absolute() && workspace.is_dir())
+                    .and_then(|workspace| checkout_root(&workspace))
             })
             .unwrap_or_else(default_repository)
     }

@@ -618,6 +618,31 @@ fn current_evidence_is_never_credited_from_a_run_that_attempted_no_verification_
 }
 
 #[test]
+fn malformed_current_evidence_cannot_claim_separate_verification() {
+    let previous = previous_retained_playable("previous-retained-playable-malformed-evidence");
+    let current = fixture_site(
+        "current-malformed-verification-summary",
+        &[
+            ("index.html", PENDING_CURRENT_PAGE),
+            ("verification.json", r#"{"succeeded":true}"#),
+        ],
+    );
+    let output = TempDirectory::new("malformed-current-evidence-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .unwrap();
+
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(index.contains("current run did not verify"), "{index}");
+    assert!(!index.contains("verified separately"), "{index}");
+}
+
+#[test]
 fn a_missing_mode_marker_leaves_the_play_panel_unreconciled_too() {
     let previous = previous_retained_playable("previous-retained-playable-for-atomicity");
     // The play marker is present and reconcilable, but the mode marker is
@@ -899,6 +924,57 @@ fn an_unusable_workspace_hint_cannot_suppress_checkout_discovery() {
 }
 
 #[test]
+fn a_stale_workspace_hint_cannot_override_the_checkout_containing_the_command() {
+    let active = fixture_site(
+        "active-workspace-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+        ],
+    );
+    let stale = fixture_site(
+        "stale-workspace-checkout",
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("docs/plan.md", "#"),
+        ],
+    );
+    let current = fixture_site(
+        "stale-workspace-current",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let output = active.path().join("docs/site");
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+        .current_dir(active.path())
+        .env("GITHUB_WORKSPACE", stale.path())
+        .args([
+            "assemble",
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("sitegen should launch");
+
+    assert_eq!(
+        finished.status.code(),
+        Some(1),
+        "the active checkout must take precedence over a stale workspace hint: {} {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        !output.exists(),
+        "nothing may be published into the active checkout"
+    );
+}
+
+#[test]
 fn assemble_cli_reports_status_only_retention_without_failure_label() {
     let previous = fixture_site(
         "previous-green-cli",
@@ -1024,6 +1100,38 @@ fn a_history_frame_that_points_into_another_entrys_directory_is_refused() {
         other => panic!("expected a misscoped-history failure, got {other}"),
     }
     assert!(error.to_string().contains(OLD_HISTORY), "{error}");
+}
+
+#[test]
+fn a_history_frame_that_points_outside_history_is_refused() {
+    let gallery = PRIOR_GALLERY.replace(OLD_HISTORY, CURRENT_FRAME);
+    let current = fixture_site(
+        "current-history-pointing-at-current",
+        &[
+            ("index.html", &index_linking(&[CURRENT_FRAME])),
+            ("gallery.json", &gallery),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "current frame"),
+        ],
+    );
+    let output = TempDirectory::new("history-pointing-at-current-output");
+
+    let error = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    )
+    .expect_err("a history entry may not publish current pixels as its own");
+
+    assert!(
+        matches!(
+            &error,
+            SitegenError::HistoryFrameOutsideEntry { frames }
+                if frames == &vec![CURRENT_FRAME.to_owned()]
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -4037,6 +4145,23 @@ mod result_manifest_safety {
             assert_eq!(report.status(), GateStatus::Failed, "{report:?}");
             assert_eq!(report.evidence(), None, "{report:?}");
         }
+    }
+
+    #[test]
+    fn a_passed_manifest_cannot_contain_a_failed_gate() {
+        let mut result = manifest(
+            "verify",
+            Some("verification"),
+            &[("Rendered image contracts", None)],
+        );
+        result.gates[0].status = GateStatus::Failed;
+        result.gates[0].passed = 0;
+        result.gates[0].failed = 1;
+
+        assert!(
+            validate_job_result(&result).is_err(),
+            "a passed manifest must not contain a failed gate: {result:?}"
+        );
     }
 
     /// A job that fell over before its first gate still uploads a manifest,
