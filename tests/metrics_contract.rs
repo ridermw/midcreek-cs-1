@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use midcreek_cs_1::{
     design::KEY_ART_REFERENCE_PATH,
-    verification::{FrameMetrics, load_frame},
+    metrics::{FrameMetrics, load_frame},
 };
 
 fn repo_root() -> PathBuf {

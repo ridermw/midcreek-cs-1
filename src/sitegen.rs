@@ -15,9 +15,8 @@ use crate::{
         CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, KEY_ART_REFERENCE_PATH,
         KEY_ART_SHA256,
     },
-    verification::{
-        FrameFacts, FrameName, PixelRect, VerificationReport, canonical_json, semantic_hash,
-    },
+    metrics::PixelRect,
+    verification::{FrameFacts, FrameName, VerificationReport, canonical_json, semantic_hash},
 };
 
 /// The published directory holding every screenshot the hub serves.
