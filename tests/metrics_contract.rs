@@ -14,6 +14,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use midcreek_cs_1::{
@@ -48,7 +49,7 @@ fn key_art_metrics_match_the_golden_fixture() {
     // Capturing the golden is deliberately explicit and deliberately rare. It
     // is done once, before the metrics engine moves out of `verification.rs`,
     // and again only if the approved reference art itself is replaced. A test
-    // that silently rewrote its own expectation would proved nothing.
+    // that silently rewrote its own expectation would prove nothing.
     if std::env::var_os("BLESS_GOLDEN").is_some() {
         fs::create_dir_all(
             golden_path()
@@ -156,7 +157,7 @@ fn the_approved_key_art_measures_a_shallow_isometric_row_angle() {
         angle.high_degrees
     );
     assert!(
-        angle.elevation_degrees() < 45.0,
+        angle.elevation_degrees().expect("angle implies elevation") < 45.0,
         "the implied elevation must be shallower than the 57 degrees the POC ships"
     );
 }
@@ -181,10 +182,21 @@ fn the_two_diagonal_families_of_the_key_art_mirror_each_other() {
         angle.mass
     );
     assert!(
-        (34.0..38.0).contains(&angle.elevation_degrees()),
+        (34.0..38.0).contains(&angle.elevation_degrees().expect("angle implies elevation")),
         "the approved art measures a shallow isometric camera, got {:.2}",
-        angle.elevation_degrees()
+        angle.elevation_degrees().expect("angle implies elevation")
     );
+}
+
+#[test]
+fn row_angle_public_construction_reports_invalid_elevation_as_absent() {
+    let angle = midcreek_cs_1::metrics::RowAngle {
+        low_degrees: 50.0,
+        high_degrees: 120.0,
+        mass: 1.0,
+    };
+
+    assert_eq!(angle.elevation_degrees(), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,11 +255,23 @@ fn every_measurement_reports_the_mass_ratio_the_gates_care_about() {
     .expect("key art measures");
 
     assert!(
-        (1.4..1.6).contains(&report.rack_to_floor),
+        (1.4..1.6).contains(&report.rack_to_floor.expect("floor mass gives a ratio")),
         "the approved art holds roughly three parts rack to two parts floor, got {:.3}",
-        report.rack_to_floor
+        report.rack_to_floor.expect("floor mass gives a ratio")
     );
     assert!(report.rack_mass > 0.0 && report.floor_mass > 0.0);
+    assert!(
+        report
+            .nearest_role_ratio
+            .contains_key(&midcreek_cs_1::design::PaletteRole::SignatureYellow),
+        "measurements must expose the per-role nearest histogram"
+    );
+    assert!(
+        report
+            .near_role_ratio
+            .contains_key(&midcreek_cs_1::design::PaletteRole::Ink),
+        "measurements must expose the per-role tolerance histogram"
+    );
 }
 
 #[test]
@@ -266,8 +290,8 @@ fn a_floorless_frame_reports_no_ratio_rather_than_infinity() {
     std::fs::remove_file(&flat).ok();
 
     assert!(
-        report.rack_to_floor.is_finite(),
-        "a frame with no floor must not divide by zero"
+        report.rack_to_floor.is_none(),
+        "a frame with no floor has no defined rack-to-floor ratio"
     );
 }
 
@@ -305,6 +329,17 @@ fn measure_without_a_path_is_a_usage_error() {
 }
 
 #[test]
+fn measure_does_not_consume_a_known_flag_as_its_path() {
+    let error = parse_verification_args(args(&["--measure", "--reference"]))
+        .expect_err("a known flag is not a measurement path");
+
+    assert!(
+        error.contains("--measure requires an image path"),
+        "the missing path should be reported before source mode, got {error}"
+    );
+}
+
+#[test]
 fn measure_given_twice_is_a_usage_error() {
     assert!(parse_verification_args(args(&["--measure", "a.png", "--measure", "b.png"])).is_err());
 }
@@ -314,4 +349,51 @@ fn reference_without_measure_is_a_usage_error() {
     // Silently ignoring a flag that changes what gets reported would let a
     // mistyped command look like it worked.
     assert!(parse_verification_args(args(&["--reference"])).is_err());
+}
+
+#[test]
+fn measure_binary_prints_reference_json() {
+    let output = Command::new(env!("CARGO_BIN_EXE_midcreek-cs-1"))
+        .current_dir(repo_root())
+        .args(["--measure", KEY_ART_REFERENCE_PATH, "--reference"])
+        .output()
+        .expect("measurement binary launches");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "a successful measurement must not write stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("measurement stdout is json");
+    assert_eq!(json["source"], "reference");
+    assert!(json["row_angle"].is_object());
+    assert!(json["implied_elevation_degrees"].as_f64().is_some());
+    assert!(
+        json["nearest_role_ratio"]["SignatureYellow"]
+            .as_f64()
+            .is_some()
+    );
+    assert!(json["near_role_ratio"]["Ink"].as_f64().is_some());
+}
+
+#[test]
+fn measure_binary_reports_decode_errors_on_stderr_only() {
+    let output = Command::new(env!("CARGO_BIN_EXE_midcreek-cs-1"))
+        .current_dir(repo_root())
+        .args(["--measure", "docs/reference/missing.png", "--reference"])
+        .output()
+        .expect("measurement binary launches");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "failed measurements must leave stdout empty"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not be decoded"),
+        "stderr must explain the decode failure, got {stderr}"
+    );
 }

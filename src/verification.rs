@@ -3460,6 +3460,7 @@ fn report_inputs() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     ];
     let code = [
         "src/verification.rs",
+        "src/metrics.rs",
         "src/design.rs",
         "src/camera.rs",
         "src/hud.rs",
@@ -3871,7 +3872,8 @@ pub fn parse_verification_args(
     const FLOOD: &str = "--verify-flood";
     const MEASURE: &str = "--measure";
     const REFERENCE: &str = "--reference";
-    let mut arguments = arguments.into_iter();
+    const FLAGS: [&str; 6] = [OUTPUT, FAULT, DELAY, FLOOD, MEASURE, REFERENCE];
+    let mut arguments = arguments.into_iter().peekable();
     let mut request = VerificationRequest::default();
     while let Some(argument) = arguments.next() {
         let (flag, value) = match argument.split_once('=') {
@@ -3880,18 +3882,15 @@ pub fn parse_verification_args(
         };
         match flag.as_str() {
             OUTPUT => {
-                let Some(value) = value.or_else(|| arguments.next()) else {
-                    return Err(format!("{OUTPUT} requires a directory path"));
-                };
+                let value =
+                    option_value(&mut arguments, value, OUTPUT, "a directory path", &FLAGS)?;
                 if request.output.is_some() {
                     return Err(format!("{OUTPUT} was given more than once"));
                 }
                 request.output = Some(PathBuf::from(value));
             }
             MEASURE => {
-                let Some(value) = value.or_else(|| arguments.next()) else {
-                    return Err(format!("{MEASURE} requires an image path"));
-                };
+                let value = option_value(&mut arguments, value, MEASURE, "an image path", &FLAGS)?;
                 if request.measure.is_some() {
                     return Err(format!("{MEASURE} was given more than once"));
                 }
@@ -3907,18 +3906,14 @@ pub fn parse_verification_args(
                 request.measure_source = MeasureSource::Reference;
             }
             FAULT => {
-                let Some(value) = value.or_else(|| arguments.next()) else {
-                    return Err(format!("{FAULT} requires a fault name"));
-                };
+                let value = option_value(&mut arguments, value, FAULT, "a fault name", &FLAGS)?;
                 if request.fault.is_some() {
                     return Err(format!("{FAULT} was given more than once"));
                 }
                 request.fault = Some(VerificationFault::parse(&value)?);
             }
             DELAY => {
-                let Some(value) = value.or_else(|| arguments.next()) else {
-                    return Err(format!("{DELAY} requires a pump count"));
-                };
+                let value = option_value(&mut arguments, value, DELAY, "a pump count", &FLAGS)?;
                 if request.capture_delay.is_some() {
                     return Err(format!("{DELAY} was given more than once"));
                 }
@@ -3933,9 +3928,7 @@ pub fn parse_verification_args(
                 request.capture_delay = Some(pumps);
             }
             FLOOD => {
-                let Some(value) = value.or_else(|| arguments.next()) else {
-                    return Err(format!("{FLOOD} requires a byte count"));
-                };
+                let value = option_value(&mut arguments, value, FLOOD, "a byte count", &FLAGS)?;
                 if request.flood.is_some() {
                     return Err(format!("{FLOOD} was given more than once"));
                 }
@@ -3987,6 +3980,27 @@ pub fn parse_verification_args(
         return Err(format!("{MEASURE} reads one image and runs on its own"));
     }
     Ok(request)
+}
+
+fn option_value(
+    arguments: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    inline: Option<String>,
+    flag: &str,
+    value_name: &str,
+    flags: &[&str],
+) -> Result<String, String> {
+    if let Some(value) = inline {
+        return Ok(value);
+    }
+    let Some(next) = arguments.peek() else {
+        return Err(format!("{flag} requires {value_name}"));
+    };
+    if flags.contains(&next.as_str()) {
+        return Err(format!("{flag} requires {value_name}"));
+    }
+    Ok(arguments
+        .next()
+        .expect("peek confirmed a positional value is present"))
 }
 
 /// Largest readback delay the harness will inject.

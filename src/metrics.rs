@@ -458,6 +458,12 @@ pub const WORKER_REGION: &str = "worker";
 /// result for an image that does not contain the thing being measured.
 pub const ROW_ANGLE_MIN_MASS: f64 = 0.15;
 
+/// Smallest share of strong-edge mass either diagonal family must hold.
+pub const ROW_ANGLE_BAND_MIN_MASS: f64 = 0.04;
+
+/// Largest disagreement between the mirrored diagonal families.
+pub const ROW_ANGLE_MAX_SPREAD_DEGREES: f64 = 2.5;
+
 /// Half-width, in one-degree bins, of the window averaged around each peak.
 ///
 /// Argmax alone quantises to whole degrees, which is coarse enough to move the
@@ -508,13 +514,13 @@ impl RowAngle {
         (self.low_degrees - (180.0 - self.high_degrees)).abs()
     }
 
-    /// Elevation implied by the measured angle.
+    /// Elevation implied by the measured angle, when the public fields still
+    /// describe a physically derivable row angle.
     ///
-    /// Always present: [`dominant_row_angle`] only returns an angle whose
-    /// elevation is derivable.
-    pub fn elevation_degrees(&self) -> f64 {
+    /// [`dominant_row_angle`] enforces that invariant, but callers can also
+    /// construct this public type directly.
+    pub fn elevation_degrees(&self) -> Option<f64> {
         elevation_from_row_angle(self.row_degrees())
-            .expect("dominant_row_angle only yields a derivable angle")
     }
 }
 
@@ -585,10 +591,15 @@ pub fn dominant_row_angle(image: &RgbImage) -> Option<RowAngle> {
         return None;
     }
 
+    let low_mass = histogram[15..75].iter().sum::<f64>() / total;
+    let high_mass = histogram[105..165].iter().sum::<f64>() / total;
+    if low_mass < ROW_ANGLE_BAND_MIN_MASS || high_mass < ROW_ANGLE_BAND_MIN_MASS {
+        return None;
+    }
+
     let low = refine_peak(&histogram, 15, 75)?;
     let high = refine_peak(&histogram, 105, 165)?;
-    let mass =
-        (histogram[15..75].iter().sum::<f64>() + histogram[105..165].iter().sum::<f64>()) / total;
+    let mass = low_mass + high_mass;
     if mass < ROW_ANGLE_MIN_MASS {
         return None;
     }
@@ -598,6 +609,9 @@ pub fn dominant_row_angle(image: &RgbImage) -> Option<RowAngle> {
         high_degrees: high,
         mass,
     };
+    if angle.spread_degrees() > ROW_ANGLE_MAX_SPREAD_DEGREES {
+        return None;
+    }
     elevation_from_row_angle(angle.row_degrees())?;
     Some(angle)
 }
@@ -662,14 +676,18 @@ pub struct MeasureReport {
     pub rack_mass: f64,
     /// Share of the frame nearest a floor tone.
     pub floor_mass: f64,
-    /// Rack mass over floor mass. The single number the direction turns on.
-    pub rack_to_floor: f64,
+    /// Rack mass over floor mass. Absent when no floor mass was measured.
+    pub rack_to_floor: Option<f64>,
     /// Mean linear luminance over the whole frame.
     pub mean_linear_luminance: f64,
     /// Fraction of pixels carrying a strong edge.
     pub edge_density: f64,
     /// Fraction of the frame within tolerance of the approved palette.
     pub palette_ratio: f64,
+    /// Nearest-role histogram, normalized; sums to one.
+    pub nearest_role_ratio: BTreeMap<PaletteRole, f64>,
+    /// Fraction of the frame within tolerance of each role.
+    pub near_role_ratio: BTreeMap<PaletteRole, f64>,
     /// The measured diagonal families, for reference art only.
     pub row_angle: Option<RowAngle>,
     /// Elevation implied by that angle, for reference art only.
@@ -689,12 +707,10 @@ pub fn measure(path: &Path, source: MeasureSource) -> Result<MeasureReport, Stri
 
     let rack_mass = metrics.nearest_of(&[PaletteRole::RackWhite, PaletteRole::RackShadow]);
     let floor_mass = metrics.nearest_of(&[PaletteRole::FloorLight, PaletteRole::FloorShadow]);
-    // A frame with no floor at all would otherwise divide by zero and report an
-    // infinity that serialises as null, which reads as "not measured".
     let rack_to_floor = if floor_mass > 0.0 {
-        rack_mass / floor_mass
+        Some(rack_mass / floor_mass)
     } else {
-        0.0
+        None
     };
 
     let angle = match source {
@@ -713,12 +729,14 @@ pub fn measure(path: &Path, source: MeasureSource) -> Result<MeasureReport, Stri
         mean_linear_luminance: metrics.mean_linear_luminance,
         edge_density: metrics.edge_density,
         palette_ratio: metrics.palette_ratio,
+        nearest_role_ratio: metrics.nearest_role_ratio,
+        near_role_ratio: metrics.near_role_ratio,
         row_angle: angle,
-        implied_elevation_degrees: angle.map(|angle| angle.elevation_degrees()),
+        implied_elevation_degrees: angle.and_then(|angle| angle.elevation_degrees()),
         note: match source {
             MeasureSource::Capture => Some(CAPTURE_NOTE.to_owned()),
             MeasureSource::Reference if angle.is_none() => {
-                Some("row angle withheld: too little diagonal edge mass to measure".to_owned())
+                Some("row angle withheld: the diagonal edge families were not strong, symmetric, and physically derivable".to_owned())
             }
             MeasureSource::Reference => None,
         },

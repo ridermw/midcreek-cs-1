@@ -1822,7 +1822,7 @@ fn rendered_run_pins_every_source_asset_and_reference_hash() {
     assert_eq!(run.report.assets.len(), 5);
     assert_eq!(run.report.asset_sources.len(), 5);
     assert_eq!(run.report.references.len(), 2);
-    assert!(!run.report.sources.is_empty());
+    assert_eq!(run.report.sources.len(), 8);
     for map in [
         &run.report.assets,
         &run.report.asset_sources,

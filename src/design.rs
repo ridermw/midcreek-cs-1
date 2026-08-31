@@ -122,7 +122,7 @@ pub const INITIAL_CAMERA_YAW_DEGREES: f32 = 45.0;
 ///          technician    dx * sqrt(2)    dx
 ///          h_t = 1.80 m  along sightline
 ///
-///   visible  iff  dx * sqrt(2) * tan(elevation) >= h_r
+///   visible  iff  h_t + dx * sqrt(2) * tan(elevation) >= h_r
 /// ```
 ///
 /// At 57 degrees a technician is clear at aisle centre and hidden while
