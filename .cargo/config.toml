@@ -1,2 +1,7 @@
+# Rust 1.98 cannot finalize incremental sessions on Windows ReFS Dev Drives.
+# CI does not cache target artifacts, and release builds are already nonincremental.
+[build]
+incremental = false
+
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", "getrandom_backend=\"wasm_js\"", "-Copt-level=s"]
