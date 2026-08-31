@@ -911,6 +911,51 @@ mod progress_contract {
             );
         }
 
+        /// The reviewed plan declares task IDs through heading prose and
+        /// nothing else, so the coupling is total: a heading reworded by one
+        /// article stops declaring its IDs, and every progress task naming one
+        /// stops validating. Anybody loosening the match to a prefix, a case
+        /// fold, or a task number would break that contract silently.
+        #[test]
+        fn renaming_a_reviewed_plan_heading_drops_the_task_ids_it_declared() {
+            let declared = plan_task_ids_from_markdown(
+                "## Task 9: Add CI and publish the reproducible POC baseline\n",
+            );
+            assert_eq!(
+                declared,
+                ["ci-baseline"].into_iter().map(str::to_owned).collect()
+            );
+
+            for reworded in [
+                "## Task 9: Add CI and publish a reproducible POC baseline\n",
+                "## Task 9: add CI and publish the reproducible POC baseline\n",
+                "## Task 9\n",
+                "## Task 9: Add CI and publish the reproducible POC baseline (revised)\n",
+            ] {
+                assert!(
+                    plan_task_ids_from_markdown(reworded).is_empty(),
+                    "{reworded}"
+                );
+            }
+        }
+
+        /// Heading depth is editorial, so the same reviewed text declares the
+        /// same IDs wherever the plan nests it.
+        #[test]
+        fn a_reviewed_heading_declares_its_task_ids_at_every_depth() {
+            for depth in 1..=6 {
+                let heading = format!(
+                    "{} Task 5: Add clamped four-way camera orbit\n",
+                    "#".repeat(depth)
+                );
+                assert_eq!(
+                    plan_task_ids_from_markdown(&heading),
+                    ["camera-orbit"].into_iter().map(str::to_owned).collect(),
+                    "{heading}"
+                );
+            }
+        }
+
         #[test]
         fn invalid_arguments_exit_with_code_two() {
             let output = Command::new(env!("CARGO_BIN_EXE_sitegen"))
@@ -2992,6 +3037,35 @@ mod verification_publication_contract {
         );
     }
 
+    /// Only the *latest* entry's hash suppresses a new point, so a revert to
+    /// pixels the history already recorded earlier opens a new point rather
+    /// than reusing the old one. That is the documented behaviour: the history
+    /// is a timeline of what was published when, not a set of distinct
+    /// appearances, and a revert really is a later moment at which the project
+    /// looked that way.
+    #[test]
+    fn reverting_to_an_older_visual_hash_opens_a_new_history_point() {
+        let original = prior_gallery();
+        let first_hash = original.entries[0].semantic_visual_hash.clone();
+        let moved_on = update_gallery(
+            &original,
+            &report_with_hash(&"b".repeat(64)),
+            &commit_summary("3333333333333333333333333333333333333333"),
+        );
+        assert_eq!(moved_on.entries.len(), 2);
+
+        let reverted = update_gallery(
+            &moved_on,
+            &report_with_hash(&first_hash),
+            &commit_summary("4444444444444444444444444444444444444444"),
+        );
+
+        assert_eq!(reverted.entries.len(), 3);
+        let entry = reverted.entries.last().unwrap();
+        assert_eq!(entry.semantic_visual_hash, first_hash);
+        assert_eq!(entry.source_commit, "4".repeat(40));
+    }
+
     #[test]
     fn a_repeated_source_commit_never_duplicates_a_gallery_entry() {
         let existing = prior_gallery();
@@ -3806,6 +3880,666 @@ mod verification_publication_contract {
         for entry in fs::read_dir(verification_root()).unwrap() {
             let entry = entry.unwrap();
             fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+/// The generated README status block, the `check` gate that maintains it, and
+/// the `readme` command that regenerates it.
+mod readme_status_contract {
+    use std::{
+        path::PathBuf,
+        process::{Command, Output, Stdio},
+    };
+
+    use midcreek_cs_1::sitegen::{
+        Challenge, ChallengeStatus, ProgressDocument, ProgressStatus, ProgressTask,
+        README_STATUS_END, README_STATUS_START, ReadmeStatusError, check_readme_status,
+        readme_status_block, render_readme_status, replace_readme_status,
+    };
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // What the generated block says
+    // -----------------------------------------------------------------------
+
+    /// The published facts are read from the parsed progress document and the
+    /// plan; the identity rows are digests of the stored source bytes. The two
+    /// are deliberately independent, so this test hands over sources whose
+    /// bytes say nothing about the document, and hand-computed digests of
+    /// exactly those bytes.
+    #[test]
+    fn the_generated_block_publishes_the_current_task_counts_and_source_digests() {
+        let block = render_readme_status(&sample_progress(), PROGRESS_BYTES, PLAN_BYTES);
+
+        assert_eq!(
+            block,
+            "<!-- sitegen:status:start -->\n\
+             <!-- Generated by `sitegen readme --repository .`; never edit this block by hand. -->\n\
+             \n\
+             | Generated status | Value |\n\
+             | --- | --- |\n\
+             | Working now | `camera-orbit` — Add clamped four-way camera orbit |\n\
+             | Tasks | 2 done, 1 in progress, 1 future, 4 total |\n\
+             | Challenges | 1 open, 2 resolved, 3 total |\n\
+             | Reviewed plan tasks | 1 |\n\
+             | `docs/progress.json` | sha256 `2da8132c318debfb` |\n\
+             | `docs/implementation-plan.md` | sha256 `2d4cd172d74e4d1b` |\n\
+             <!-- sitegen:status:end -->"
+        );
+    }
+
+    #[test]
+    fn a_project_with_nothing_in_progress_publishes_that_instead_of_a_task() {
+        let mut progress = sample_progress();
+        progress
+            .tasks
+            .retain(|task| task.status == ProgressStatus::Done);
+
+        let block = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        assert!(
+            block.contains("| Working now | all planned work complete |"),
+            "{block}"
+        );
+        assert!(
+            block.contains("| Tasks | 2 done, 0 in progress, 0 future, 2 total |"),
+            "{block}"
+        );
+    }
+
+    /// The block is the README's promise that it still describes the sources.
+    /// A change either source can make that the published counts do not move —
+    /// a reworded summary, an added plan paragraph — must still make a stored
+    /// block stale, or the promise is only about the counts.
+    #[test]
+    fn a_source_change_the_counts_do_not_show_still_makes_a_stored_block_stale() {
+        let progress = sample_progress();
+        let baseline = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        // One trailing space: the same document, different stored bytes.
+        let reformatted = render_readme_status(&progress, "{\"canonical\":\"bytes\"} ", PLAN_BYTES);
+        // One added paragraph: the same declared plan tasks, different prose.
+        let annotated = render_readme_status(
+            &progress,
+            PROGRESS_BYTES,
+            "# Reviewed plan\n\n## Task 5: Add clamped four-way camera orbit\n\nA note.\n",
+        );
+
+        assert!(
+            reformatted.contains("sha256 `19483733685a28a5`"),
+            "{reformatted}"
+        );
+        assert!(
+            annotated.contains("sha256 `d3fa800b0dbe02a3`"),
+            "{annotated}"
+        );
+        assert!(check_readme_status(&stored(&baseline), &reformatted).is_err());
+        assert!(check_readme_status(&stored(&baseline), &annotated).is_err());
+        assert!(check_readme_status(&stored(&baseline), &baseline).is_ok());
+    }
+
+    /// Task titles are prose, and a `|` in prose closes a Markdown table cell.
+    /// A title that could open a column of its own would publish a row nobody
+    /// wrote into a block nobody is allowed to hand-edit.
+    #[test]
+    fn a_task_title_can_never_break_out_of_its_generated_table_cell() {
+        let mut progress = sample_progress();
+        progress
+            .tasks
+            .iter_mut()
+            .find(|task| task.status == ProgressStatus::InProgress)
+            .expect("the sample document has a current task")
+            .title = "Ship | now\nand later".to_owned();
+
+        let block = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        assert!(
+            block.contains("| Working now | `camera-orbit` — Ship \\| now and later |\n"),
+            "{block}"
+        );
+        assert_eq!(
+            block.lines().count(),
+            render_readme_status(&sample_progress(), PROGRESS_BYTES, PLAN_BYTES)
+                .lines()
+                .count()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading and replacing the block
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regenerating_the_block_preserves_every_byte_outside_it() {
+        let readme = format!(
+            "# Title\n\nProse before.\n\n{README_STATUS_START}\nold\n{README_STATUS_END}\n\nProse after.\n"
+        );
+
+        let updated = replace_readme_status(
+            &readme,
+            &format!("{README_STATUS_START}\nnew\n{README_STATUS_END}"),
+        )
+        .expect("a well formed block should be replaceable");
+
+        assert_eq!(
+            updated,
+            format!(
+                "# Title\n\nProse before.\n\n{README_STATUS_START}\nnew\n{README_STATUS_END}\n\nProse after.\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_block_a_readme_carries_is_read_back_with_its_delimiters() {
+        let block = format!("{README_STATUS_START}\nbody\n{README_STATUS_END}");
+        let readme = format!("before\n{block}\nafter\n");
+
+        assert_eq!(readme_status_block(&readme), Ok(block.as_str()));
+    }
+
+    /// Every one of these is a README a mutating command must refuse rather
+    /// than "repair": each has more than one, or fewer than one, plausible
+    /// span, and choosing any of them rewrites bytes the generator does not
+    /// own.
+    #[test]
+    fn a_missing_duplicated_or_inverted_block_is_refused_rather_than_repaired() {
+        let cases: [(&str, String, ReadmeStatusError); 6] = [
+            (
+                "neither delimiter",
+                "# Title\n\nProse only.\n".to_owned(),
+                ReadmeStatusError::Missing,
+            ),
+            (
+                "opened but never closed",
+                format!("before\n{README_STATUS_START}\nbody\n"),
+                ReadmeStatusError::MissingDelimiter {
+                    delimiter: README_STATUS_END,
+                },
+            ),
+            (
+                "closed but never opened",
+                format!("before\nbody\n{README_STATUS_END}\n"),
+                ReadmeStatusError::MissingDelimiter {
+                    delimiter: README_STATUS_START,
+                },
+            ),
+            (
+                "two openings",
+                format!("{README_STATUS_START}\na\n{README_STATUS_START}\nb\n{README_STATUS_END}"),
+                ReadmeStatusError::DuplicateDelimiter {
+                    delimiter: README_STATUS_START,
+                    count: 2,
+                },
+            ),
+            (
+                "two closings",
+                format!("{README_STATUS_START}\na\n{README_STATUS_END}\nb\n{README_STATUS_END}"),
+                ReadmeStatusError::DuplicateDelimiter {
+                    delimiter: README_STATUS_END,
+                    count: 2,
+                },
+            ),
+            (
+                "closed before it opens",
+                format!("{README_STATUS_END}\nbody\n{README_STATUS_START}"),
+                ReadmeStatusError::Inverted,
+            ),
+        ];
+
+        for (case, readme, expected) in cases {
+            assert_eq!(
+                readme_status_block(&readme),
+                Err(expected.clone()),
+                "{case}"
+            );
+            assert_eq!(
+                replace_readme_status(&readme, "anything"),
+                Err(expected),
+                "{case}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `sitegen check` against this repository
+    // -----------------------------------------------------------------------
+
+    /// The gate has to pass for the checkout it is committed in, and its
+    /// verdict may not depend on where it was launched from.
+    #[test]
+    fn check_passes_for_this_repository_from_an_unrelated_working_directory() {
+        let finished = sitegen(
+            &["check", "--repository", repository().to_str().unwrap()],
+            &std::env::temp_dir(),
+        );
+
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert_eq!(String::from_utf8(finished.stdout).unwrap(), "ci-baseline\n");
+        assert!(String::from_utf8_lossy(&finished.stderr).is_empty());
+    }
+
+    /// `check` builds a whole site to validate it. Leaving that build behind
+    /// would grow the temporary directory of every machine and every runner
+    /// that ever ran the gate.
+    #[test]
+    fn check_removes_the_site_it_builds_to_reach_its_verdict() {
+        let child = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(std::env::temp_dir())
+            .args(["check", "--repository", repository().to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sitegen should launch");
+        let prefix = format!("sitegen-check-{}-", child.id());
+        let finished = child.wait_with_output().expect("sitegen should finish");
+
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        let left_behind = fs::read_dir(std::env::temp_dir())
+            .expect("the temporary directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect::<Vec<_>>();
+
+        assert!(left_behind.is_empty(), "{left_behind:?}");
+    }
+
+    #[test]
+    fn check_and_readme_require_a_repository() {
+        for arguments in [
+            vec!["check"],
+            vec!["readme"],
+            vec!["check", "--progress", "docs/progress.json"],
+            vec!["readme", "--repository", ".", "--plan", "docs/x.md"],
+        ] {
+            let finished = sitegen(&arguments, repository());
+
+            assert_eq!(finished.status.code(), Some(2), "{arguments:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `sitegen check` against a mirror of this repository
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_refuses_a_readme_whose_generated_block_is_missing_duplicated_or_stale() {
+        for (case, mutate, expected) in [
+            (
+                "stale",
+                &(|mirror: &Mirror| {
+                    let readme = mirror.read("README.md");
+                    let block = readme_status_block(&readme).unwrap().replace(
+                        "| Reviewed plan tasks | 13 |",
+                        "| Reviewed plan tasks | 99 |",
+                    );
+                    mirror.write(
+                        "README.md",
+                        &replace_readme_status(&readme, &block).unwrap(),
+                    );
+                }) as &dyn Fn(&Mirror),
+                "the generated status block is stale",
+            ),
+            (
+                "missing",
+                &|mirror: &Mirror| {
+                    let readme = mirror.read("README.md");
+                    mirror.write("README.md", &replace_readme_status(&readme, "").unwrap());
+                },
+                "the generated status block is missing",
+            ),
+            (
+                "duplicated",
+                &|mirror: &Mirror| {
+                    let readme = mirror.read("README.md");
+                    let block = readme_status_block(&readme).unwrap().to_owned();
+                    mirror.write("README.md", &format!("{readme}\n{block}\n"));
+                },
+                "appears 2 times",
+            ),
+            (
+                "left behind by an edited progress document",
+                &|mirror: &Mirror| {
+                    let progress = mirror.read("docs/progress.json");
+                    mirror.write("docs/progress.json", &format!("{progress}\n"));
+                },
+                "the generated status block is stale",
+            ),
+        ] {
+            let mirror = Mirror::new(case);
+            mutate(&mirror);
+            let refused = mirror.read("README.md");
+
+            let finished = mirror.run("check");
+            let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+            assert_eq!(finished.status.code(), Some(1), "{case}: {stderr}");
+            assert!(stderr.contains("README.md"), "{case}: {stderr}");
+            assert!(stderr.contains(expected), "{case}: {stderr}");
+            // The gate reports; only `readme` repairs. A check that quietly
+            // rewrote the block would pass on its own second run and publish
+            // whatever the sources happened to say.
+            assert_eq!(mirror.read("README.md"), refused, "{case}");
+        }
+    }
+
+    /// The reviewed plan declares task IDs through heading prose alone, so a
+    /// reworded heading silently stops declaring them. The gate is what turns
+    /// that silence into a failure.
+    #[test]
+    fn check_refuses_progress_task_ids_the_reviewed_plan_no_longer_declares() {
+        let mirror = Mirror::new("plan-heading");
+        let plan = mirror.read("docs/implementation-plan.md");
+        mirror.write(
+            "docs/implementation-plan.md",
+            &plan.replace(
+                "Task 9: Add CI and publish the reproducible POC baseline",
+                "Task 9: Add CI and publish the POC baseline",
+            ),
+        );
+        mirror.regenerate_readme();
+
+        let finished = mirror.run("check");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("task id is not in the reviewed plan: ci-baseline"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_reference_asset_that_no_longer_matches_the_manifest() {
+        let mirror = Mirror::new("reference-drift");
+        let key_art = mirror.path().join("docs/reference/cel-shift-key-art.png");
+        let mut bytes = fs::read(&key_art).unwrap();
+        bytes.push(0);
+        fs::write(&key_art, bytes).unwrap();
+
+        let finished = mirror.run("check");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("cel-shift-key-art.png"), "{stderr}");
+    }
+
+    /// Nothing above this reaches the generator: progress, references, and the
+    /// README are all judged from the sources alone. This is the failure only
+    /// a real build finds — two reviewed headings declaring one task ID
+    /// publish the same anchor twice — so it is the proof that `check` really
+    /// generates and validates a site rather than only reading documents.
+    #[test]
+    fn check_refuses_a_plan_that_generates_a_page_the_site_rules_reject() {
+        let mirror = Mirror::new("duplicate-anchor");
+        let plan = mirror.read("docs/implementation-plan.md");
+        mirror.write(
+            "docs/implementation-plan.md",
+            &format!("{plan}\n### Task 5: Add clamped four-way camera orbit\n"),
+        );
+        mirror.regenerate_readme();
+
+        let finished = mirror.run("check");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("duplicate id"), "{stderr}");
+        assert!(stderr.contains("plan-camera-orbit"), "{stderr}");
+    }
+
+    // -----------------------------------------------------------------------
+    // `sitegen readme`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regenerating_the_readme_rewrites_only_the_block_and_restores_the_gate() {
+        let mirror = Mirror::new("regenerate");
+        let before = mirror.read("README.md");
+        let progress = mirror.read("docs/progress.json");
+        mirror.write("docs/progress.json", &format!("{progress}\n"));
+        assert_eq!(mirror.run("check").status.code(), Some(1));
+
+        let regenerated = mirror.run("readme");
+        assert_eq!(
+            regenerated.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&regenerated.stderr)
+        );
+
+        let after = mirror.read("README.md");
+        assert_ne!(after, before);
+        assert_eq!(outside_block(&after), outside_block(&before));
+        assert_eq!(
+            mirror.run("check").status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&mirror.run("check").stderr)
+        );
+    }
+
+    /// A README with two opening delimiters has no single span the generator
+    /// owns. Rewriting one of them would silently rewrite bytes a person
+    /// wrote, so the command refuses and leaves the file exactly as it found
+    /// it.
+    #[test]
+    fn regenerating_a_malformed_readme_refuses_and_writes_nothing() {
+        let mirror = Mirror::new("malformed-regenerate");
+        let readme = mirror.read("README.md");
+        let block = readme_status_block(&readme).unwrap().to_owned();
+        let malformed = format!("{readme}\n{block}\n");
+        mirror.write("README.md", &malformed);
+
+        let finished = mirror.run("readme");
+        let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+        assert_eq!(finished.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("appears 2 times"), "{stderr}");
+        assert_eq!(mirror.read("README.md"), malformed);
+        assert!(
+            fs::read_dir(mirror.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "a refused regeneration must leave no partial file behind"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Stored bytes that say nothing about the document beside them, so a
+    /// digest row can only come from the bytes it was handed.
+    const PROGRESS_BYTES: &str = "{\"canonical\":\"bytes\"}";
+
+    /// A plan declaring exactly one reviewed task ID.
+    const PLAN_BYTES: &str = "# Reviewed plan\n\n## Task 5: Add clamped four-way camera orbit\n";
+
+    fn sample_progress() -> ProgressDocument {
+        ProgressDocument {
+            schema_version: 1,
+            project: "Cell Shift Data Center POC".to_owned(),
+            tasks: vec![
+                task(
+                    "foundation-contracts",
+                    "Establish reviewed contracts",
+                    ProgressStatus::Done,
+                ),
+                task(
+                    "pages-foundation",
+                    "Publish the status-only hub",
+                    ProgressStatus::Done,
+                ),
+                task(
+                    "camera-orbit",
+                    "Add clamped four-way camera orbit",
+                    ProgressStatus::InProgress,
+                ),
+                task(
+                    "ci-baseline",
+                    "Publish the reproducible baseline",
+                    ProgressStatus::Future,
+                ),
+            ],
+            challenges: vec![
+                challenge("open-one", ChallengeStatus::Open),
+                challenge("resolved-one", ChallengeStatus::Resolved),
+                challenge("resolved-two", ChallengeStatus::Resolved),
+            ],
+        }
+    }
+
+    fn task(id: &str, title: &str, status: ProgressStatus) -> ProgressTask {
+        ProgressTask {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            status,
+            depends_on: Vec::new(),
+            summary: "Summary.".to_owned(),
+            completed_commit: (status == ProgressStatus::Done).then(|| "1".repeat(40)),
+        }
+    }
+
+    fn challenge(id: &str, status: ChallengeStatus) -> Challenge {
+        Challenge {
+            id: id.to_owned(),
+            title: "A challenge".to_owned(),
+            status,
+            impact: "Impact.".to_owned(),
+            approach: "Approach.".to_owned(),
+            resolution: (status == ChallengeStatus::Resolved).then(|| "Resolved.".to_owned()),
+            resolved_commit: (status == ChallengeStatus::Resolved).then(|| "1".repeat(40)),
+        }
+    }
+
+    /// A README that carries exactly one generated block.
+    fn stored(block: &str) -> String {
+        format!("# Title\n\n{block}\n\nProse.\n")
+    }
+
+    /// Everything a README says outside its generated block.
+    fn outside_block(readme: &str) -> String {
+        let block = readme_status_block(readme).expect("the README should carry one block");
+        readme.replace(block, "")
+    }
+
+    fn repository() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn sitegen(arguments: &[&str], working_directory: &Path) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_sitegen"))
+            .current_dir(working_directory)
+            .args(arguments)
+            .output()
+            .expect("sitegen should launch")
+    }
+
+    /// A second checkout of this repository holding only the documents
+    /// `sitegen check` reads.
+    ///
+    /// The object database is shared with the real checkout, so every commit
+    /// `docs/progress.json` names still resolves and `HEAD` is this branch's
+    /// head. The documents themselves are copied from the working tree rather
+    /// than checked out of `HEAD`, so a mirror judges the sources as they are
+    /// right now and the only thing wrong with one is the thing a test put
+    /// there.
+    struct Mirror(PathBuf);
+
+    impl Mirror {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = repository()
+                .join("target/check-mirrors")
+                .join(format!("{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            git(&[
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                repository().to_str().unwrap(),
+                root.to_str().unwrap(),
+            ]);
+            copy_tree(&repository().join("docs"), &root.join("docs"));
+            fs::copy(repository().join("README.md"), root.join("README.md")).unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn read(&self, relative: &str) -> String {
+            read(self.0.join(relative))
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            fs::write(self.0.join(relative), contents).unwrap();
+        }
+
+        fn run(&self, command: &str) -> Output {
+            sitegen(
+                &[command, "--repository", self.0.to_str().unwrap()],
+                &std::env::temp_dir(),
+            )
+        }
+
+        fn regenerate_readme(&self) {
+            let finished = self.run("readme");
+            assert_eq!(
+                finished.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&finished.stderr)
+            );
+        }
+    }
+
+    impl Drop for Mirror {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(arguments: &[&str]) {
+        let finished = Command::new("git")
+            .args(arguments)
+            .output()
+            .expect("git should launch");
+        assert!(
+            finished.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
         }
     }
 }

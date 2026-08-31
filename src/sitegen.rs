@@ -1430,6 +1430,21 @@ pub fn resolve_commit_ref(commit: &str, repo: &RepoFacts) -> Option<String> {
     .then(|| commit.to_owned())
 }
 
+/// Every progress task ID the reviewed implementation plan declares.
+///
+/// The plan declares nothing machine-readable of its own: a task ID is earned
+/// by a heading whose *text* is one of the exact strings
+/// [`task_ids_for_heading`] lists, so this extraction is coupled to the
+/// reviewed plan's heading prose and to nothing else. Rewording a reviewed
+/// heading — even by an article or a comma — silently drops that heading's
+/// task IDs, and every progress task naming one then fails validation with
+/// [`ProgressError::UnknownPlanTask`]. That is deliberate: the plan is
+/// reviewed prose, so a heading may only change together with the table below
+/// and with `docs/progress.json`, and the coupling is proved by
+/// `renaming_a_reviewed_plan_heading_drops_the_task_ids_it_declared`.
+///
+/// Heading level is not part of the key: the same heading text declares the
+/// same IDs at any depth, because the plan's own nesting is editorial.
 pub fn plan_task_ids_from_markdown(markdown: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let mut heading = None;
@@ -1484,6 +1499,226 @@ fn task_ids_for_heading(heading: &str) -> &'static [&'static str] {
         "Task 9: Add CI and publish the reproducible POC baseline" => &["ci-baseline"][..],
         _ => &[],
     }
+}
+
+// ---------------------------------------------------------------------------
+// The generated README status block
+// ---------------------------------------------------------------------------
+
+/// The exact opening delimiter of the one generated README status block.
+pub const README_STATUS_START: &str = "<!-- sitegen:status:start -->";
+
+/// The exact closing delimiter of the one generated README status block.
+pub const README_STATUS_END: &str = "<!-- sitegen:status:end -->";
+
+/// Why a README's generated status block cannot be read, or is no longer the
+/// block the canonical sources generate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadmeStatusError {
+    /// Neither delimiter appears, so there is no generated block to maintain.
+    Missing,
+    /// One delimiter appears without its partner.
+    MissingDelimiter { delimiter: &'static str },
+    /// A delimiter appears more than once, so no single span is the block.
+    DuplicateDelimiter {
+        delimiter: &'static str,
+        count: usize,
+    },
+    /// The closing delimiter precedes the opening one.
+    Inverted,
+    /// The block is well formed but is not what the canonical sources
+    /// generate.
+    Stale { expected: String, actual: String },
+}
+
+impl fmt::Display for ReadmeStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => write!(
+                formatter,
+                "the generated status block is missing: expected one \
+                 {README_STATUS_START} … {README_STATUS_END} pair"
+            ),
+            Self::MissingDelimiter { delimiter } => write!(
+                formatter,
+                "the generated status block is malformed: {delimiter} is absent"
+            ),
+            Self::DuplicateDelimiter { delimiter, count } => write!(
+                formatter,
+                "the generated status block is malformed: {delimiter} appears \
+                 {count} times, and exactly one is allowed"
+            ),
+            Self::Inverted => write!(
+                formatter,
+                "the generated status block is malformed: {README_STATUS_END} \
+                 precedes {README_STATUS_START}"
+            ),
+            Self::Stale { expected, actual } => write!(
+                formatter,
+                "the generated status block is stale; regenerate it with \
+                 `sitegen readme --repository .`\n--- expected\n{expected}\n--- found\n{actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadmeStatusError {}
+
+/// Renders the generated README status block from the canonical sources.
+///
+/// Two independent things go in. The published facts — the current task, the
+/// task and challenge counts, and how many task IDs the reviewed plan declares
+/// — are read from the parsed `progress` document and from `plan_markdown`, so
+/// the block states what the project actually claims. The identity rows are
+/// digests of the stored bytes of those same two files, so a change to either
+/// source that the facts happen not to move — a reworded summary, a new plan
+/// paragraph, reindented JSON — still makes a stored block stale. The result
+/// is a function of its three arguments alone: no clock, no host, no Git.
+pub fn render_readme_status(
+    progress: &ProgressDocument,
+    progress_json: &str,
+    plan_markdown: &str,
+) -> String {
+    let tasks = |status| {
+        progress
+            .tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .count()
+    };
+    let done = tasks(ProgressStatus::Done);
+    let in_progress = tasks(ProgressStatus::InProgress);
+    let future = tasks(ProgressStatus::Future);
+    let open = progress
+        .challenges
+        .iter()
+        .filter(|challenge| challenge.status == ChallengeStatus::Open)
+        .count();
+    let working_now = progress
+        .tasks
+        .iter()
+        .find(|task| task.status == ProgressStatus::InProgress)
+        .map_or_else(
+            || "all planned work complete".to_owned(),
+            |task| format!("`{}` — {}", table_cell(&task.id), table_cell(&task.title)),
+        );
+
+    format!(
+        "{README_STATUS_START}\n\
+         <!-- Generated by `sitegen readme --repository .`; never edit this block by hand. -->\n\
+         \n\
+         | Generated status | Value |\n\
+         | --- | --- |\n\
+         | Working now | {working_now} |\n\
+         | Tasks | {done} done, {in_progress} in progress, {future} future, {total} total |\n\
+         | Challenges | {open} open, {resolved} resolved, {challenges} total |\n\
+         | Reviewed plan tasks | {plan_tasks} |\n\
+         | `docs/progress.json` | sha256 `{progress_digest}` |\n\
+         | `docs/implementation-plan.md` | sha256 `{plan_digest}` |\n\
+         {README_STATUS_END}",
+        total = progress.tasks.len(),
+        resolved = progress.challenges.len() - open,
+        challenges = progress.challenges.len(),
+        plan_tasks = plan_task_ids_from_markdown(plan_markdown).len(),
+        progress_digest = source_digest(progress_json),
+        plan_digest = source_digest(plan_markdown),
+    )
+}
+
+/// How many bytes of one source's SHA-256 the block publishes.
+///
+/// The rows exist to make a stale block detectable, not to authenticate a
+/// source, so a stable prefix is enough to fit on a README line while still
+/// moving for any edit anybody makes.
+const SOURCE_DIGEST_BYTES: usize = 8;
+
+fn source_digest(source: &str) -> String {
+    Sha256::digest(source.as_bytes())
+        .iter()
+        .take(SOURCE_DIGEST_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One published value, contained to the Markdown table cell that holds it.
+///
+/// Task IDs and titles are prose, and prose legitimately carries `|`, which
+/// closes a cell and would publish a column nobody wrote into a block nobody
+/// is allowed to hand-edit. Control characters are collapsed for the same
+/// reason: a newline in a title would end the row.
+fn table_cell(value: &str) -> String {
+    let mut cell = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '|' => cell.push_str("\\|"),
+            character if character.is_control() => cell.push(' '),
+            character => cell.push(character),
+        }
+    }
+    cell
+}
+
+/// The one generated status block a README carries, delimiters included.
+pub fn readme_status_block(readme: &str) -> Result<&str, ReadmeStatusError> {
+    let (start, end) = readme_status_span(readme)?;
+    Ok(&readme[start..end])
+}
+
+/// The byte range of the one generated status block, delimiters included.
+///
+/// Exactly one of each delimiter, in the right order, is the only structure
+/// this accepts. A duplicated, unmatched, or inverted delimiter leaves more
+/// than one — or no — plausible span, and every choice among them rewrites
+/// bytes the generator does not own, so the whole README is refused instead.
+fn readme_status_span(readme: &str) -> Result<(usize, usize), ReadmeStatusError> {
+    for (delimiter, count) in [
+        (
+            README_STATUS_START,
+            readme.matches(README_STATUS_START).count(),
+        ),
+        (README_STATUS_END, readme.matches(README_STATUS_END).count()),
+    ] {
+        if count > 1 {
+            return Err(ReadmeStatusError::DuplicateDelimiter { delimiter, count });
+        }
+    }
+
+    match (
+        readme.find(README_STATUS_START),
+        readme.find(README_STATUS_END),
+    ) {
+        (Some(start), Some(end)) if start < end => Ok((start, end + README_STATUS_END.len())),
+        (Some(_), Some(_)) => Err(ReadmeStatusError::Inverted),
+        (Some(_), None) => Err(ReadmeStatusError::MissingDelimiter {
+            delimiter: README_STATUS_END,
+        }),
+        (None, Some(_)) => Err(ReadmeStatusError::MissingDelimiter {
+            delimiter: README_STATUS_START,
+        }),
+        (None, None) => Err(ReadmeStatusError::Missing),
+    }
+}
+
+/// Proves a README carries exactly the block the canonical sources generate.
+pub fn check_readme_status(readme: &str, expected: &str) -> Result<(), ReadmeStatusError> {
+    let actual = readme_status_block(readme)?;
+    if actual == expected {
+        return Ok(());
+    }
+    Err(ReadmeStatusError::Stale {
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    })
+}
+
+/// Replaces the generated block, preserving every byte outside it.
+pub fn replace_readme_status(readme: &str, block: &str) -> Result<String, ReadmeStatusError> {
+    let (start, end) = readme_status_span(readme)?;
+    let mut updated = String::with_capacity(readme.len() - (end - start) + block.len());
+    updated.push_str(&readme[..start]);
+    updated.push_str(block);
+    updated.push_str(&readme[end..]);
+    Ok(updated)
 }
 
 pub fn validate_reference_manifest(
@@ -2042,6 +2277,15 @@ fn derive_gates(
 /// latest entry, and a rerun of a commit that is already recorded all return
 /// the previous history untouched, so a documentation-only push cannot
 /// duplicate a screenshot and a failure cannot erase one.
+///
+/// Only the *latest* entry's hash suppresses a new point, so a revert to pixels
+/// an older entry already recorded does open one. That is deliberate: the
+/// history is a timeline of what was published when, not a set of distinct
+/// appearances, and a revert really is a later moment at which the project
+/// looked that way. Deduplicating against the whole history instead would make
+/// a revert invisible and leave the timeline claiming the project still looked
+/// like the entry it had moved on to.
+/// `reverting_to_an_older_visual_hash_opens_a_new_history_point` pins it.
 pub fn update_gallery(
     previous: &GalleryManifest,
     summary: &VerificationSummary,

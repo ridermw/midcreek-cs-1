@@ -11,17 +11,19 @@ mod native {
         env, fs,
         path::{Path, PathBuf},
         process::{Command as ProcessCommand, ExitCode},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use midcreek_cs_1::{
         sitegen::{
             BrowserGateReport, CommitSummary, GalleryManifest, GateStatus, GateSummary, JobOutcome,
-            JobReport, JobResult, PlayableBuild, ProgressDocument, ProgressStatus, RESULT_FILE,
-            ReferenceManifest, RepoFacts, SiteInputs, VerificationEvidence, WorkflowSummary,
-            assemble_site_in, build_site_in, default_repository, gate_verdict, merge_job_results,
-            missing_playable_parts, plan_task_ids_from_markdown, read_gate_records,
-            validate_job_result, validate_progress, validate_reference_manifest,
-            validate_workflow_summary,
+            JobReport, JobResult, PlayableBuild, ProgressDocument, ProgressStatus, REPOSITORY_URL,
+            RESULT_FILE, ReferenceManifest, RepoFacts, SiteInputs, VerificationEvidence,
+            WorkflowSummary, assemble_site_in, build_site_in, check_readme_status,
+            default_repository, gate_verdict, merge_job_results, missing_playable_parts,
+            plan_task_ids_from_markdown, read_gate_records, render_readme_status,
+            replace_readme_status, validate_job_result, validate_progress,
+            validate_reference_manifest, validate_workflow_summary,
         },
         verification::VerificationReport,
     };
@@ -43,6 +45,12 @@ mod native {
         Validate {
             progress: PathBuf,
             plan: PathBuf,
+            repository: PathBuf,
+        },
+        Check {
+            repository: PathBuf,
+        },
+        Readme {
             repository: PathBuf,
         },
         Build {
@@ -78,7 +86,9 @@ mod native {
             Ok(command) => command,
             Err(message) => {
                 eprintln!("{message}");
-                eprintln!("usage: sitegen <validate|build|assemble|result|inputs> [options]");
+                eprintln!(
+                    "usage: sitegen <validate|check|readme|build|assemble|result|inputs> [options]"
+                );
                 return ExitCode::from(2);
             }
         };
@@ -89,6 +99,8 @@ mod native {
                 plan,
                 repository,
             } => validate(&progress, &plan, &repository),
+            Command::Check { repository } => check(&repository),
+            Command::Readme { repository } => readme(&repository),
             Command::Build { inputs, output } => build(&inputs, &output),
             Command::Assemble {
                 previous,
@@ -133,6 +145,18 @@ mod native {
                 Ok(Command::Validate {
                     progress: values.required_path("--progress")?,
                     plan: values.required_path("--plan")?,
+                    repository: values.required_path("--repository")?,
+                })
+            }
+            "check" => {
+                let values = parse_options(&remaining, &["--repository"], &[])?;
+                Ok(Command::Check {
+                    repository: values.required_path("--repository")?,
+                })
+            }
+            "readme" => {
+                let values = parse_options(&remaining, &["--repository"], &[])?;
+                Ok(Command::Readme {
                     repository: values.required_path("--repository")?,
                 })
             }
@@ -636,7 +660,7 @@ mod native {
         // one that cannot be read, or that does not match the schema, is a
         // failure of this run rather than a run with no references, because
         // publishing it is exactly what happens next.
-        let progress_path = repository.join("docs/progress.json");
+        let progress_path = repository.join(PROGRESS_DOCUMENT);
         let published_progress = match read_json::<ProgressDocument>(&progress_path) {
             Ok(progress) => referenced_commits(&progress),
             Err(message) => return content_error(message),
@@ -657,8 +681,8 @@ mod native {
         let paths = SiteInputPaths {
             repository: Some(repository.to_path_buf()),
             progress: progress_path,
-            plan: repository.join("docs/implementation-plan.md"),
-            reference_manifest: repository.join("docs/reference/manifest.json"),
+            plan: repository.join(PLAN_DOCUMENT),
+            reference_manifest: repository.join(REFERENCE_MANIFEST),
             workflow: PathBuf::from("workflow.json"),
             repo: PathBuf::from("repo.json"),
             verification,
@@ -835,7 +859,7 @@ mod native {
             Ok(repo) => repo,
             Err(message) => return content_error(message),
         };
-        let reference_manifest_path = repository.join("docs/reference/manifest.json");
+        let reference_manifest_path = repository.join(REFERENCE_MANIFEST);
         let reference_manifest = match read_json::<ReferenceManifest>(&reference_manifest_path) {
             Ok(manifest) => manifest,
             Err(message) => return content_error(message),
@@ -869,9 +893,257 @@ mod native {
         read_json(path)
     }
 
+    // -----------------------------------------------------------------------
+    // The whole-repository gate and the README block it maintains
+    // -----------------------------------------------------------------------
+
+    /// The canonical progress document every command reads.
+    const PROGRESS_DOCUMENT: &str = "docs/progress.json";
+
+    /// The reviewed implementation plan progress task IDs are declared in.
+    const PLAN_DOCUMENT: &str = "docs/implementation-plan.md";
+
+    /// The approved reference provenance the site publishes.
+    const REFERENCE_MANIFEST: &str = "docs/reference/manifest.json";
+
+    /// The README carrying the one generated status block.
+    const README_DOCUMENT: &str = "README.md";
+
+    /// Proves one checkout is publishable, from its own canonical sources
+    /// alone.
+    ///
+    /// Everything the gate judges is read from `repository`: the progress
+    /// document, the reviewed plan, the approved reference manifest, the
+    /// README, and the checkout's own Git facts. The path is canonicalized
+    /// first, so the verdict is the same from any working directory. Nothing
+    /// is written into the checkout — the site the gate has to generate to
+    /// judge it is built into a temporary directory that is removed however
+    /// the run ends — so `check` is safe to run on a tree somebody is editing.
+    ///
+    /// Every source-level failure is reported before the gate gives up, so one
+    /// run names everything that has to be fixed rather than one thing at a
+    /// time. The generated site is only attempted once the sources agree,
+    /// because `build_site_in` re-validates them and would otherwise repeat
+    /// the same failures in a less useful form.
+    fn check(repository: &Path) -> ExitCode {
+        let sources = match CanonicalSources::read(repository) {
+            Ok(sources) => sources,
+            Err(message) => return content_error(message),
+        };
+        let reference_path = sources.repository.join(REFERENCE_MANIFEST);
+        let reference_manifest = match read_json::<ReferenceManifest>(&reference_path) {
+            Ok(manifest) => manifest,
+            Err(message) => return content_error(message),
+        };
+        let repo =
+            match read_repo_facts(&sources.repository, &referenced_commits(&sources.progress)) {
+                Ok(repo) => repo,
+                Err(message) => return content_error(message),
+            };
+
+        let mut refused = false;
+        if let Err(errors) = validate_progress(
+            &sources.progress,
+            &plan_task_ids_from_markdown(&sources.plan_markdown),
+            &repo,
+        ) {
+            refused = true;
+            for error in errors {
+                eprintln!("{}: {error}", sources.progress_path.display());
+            }
+        }
+        if let Err(errors) = validate_reference_manifest(&reference_manifest, &sources.repository) {
+            refused = true;
+            for error in errors {
+                eprintln!("{}: {error}", reference_path.display());
+            }
+        }
+        if let Err(error) = check_readme_status(&sources.readme, &sources.readme_block()) {
+            refused = true;
+            eprintln!("{}: {error}", sources.readme_path.display());
+        }
+        if refused {
+            return ExitCode::from(1);
+        }
+
+        let scratch = match ScratchSite::new() {
+            Ok(scratch) => scratch,
+            Err(message) => return content_error(message),
+        };
+        let current = sources
+            .progress
+            .tasks
+            .iter()
+            .find(|task| task.status == ProgressStatus::InProgress)
+            .map_or("all-done", |task| task.id.as_str())
+            .to_owned();
+        let inputs = SiteInputs {
+            progress: sources.progress,
+            plan_markdown: sources.plan_markdown,
+            reference_manifest,
+            verification: None,
+            gallery: None,
+            // A local gate proves nothing about a workflow run, so it claims
+            // nothing about one: both jobs are published as not run, and the
+            // only URL the page carries is this repository's own run index.
+            workflow: WorkflowSummary {
+                source_commit: repo.head_sha.clone(),
+                run_url: format!("{REPOSITORY_URL}/actions"),
+                native: GateStatus::SkippedDependency,
+                web: GateStatus::SkippedDependency,
+                gates: Vec::new(),
+            },
+            repo,
+            playable: None,
+        };
+        if let Err(error) = build_site_in(&sources.repository, &inputs, scratch.path()) {
+            return content_error(error.to_string());
+        }
+
+        println!("{current}");
+        ExitCode::SUCCESS
+    }
+
+    /// Rewrites the one generated README status block and nothing else.
+    ///
+    /// This is the only command that edits a checkout, and it edits exactly
+    /// the bytes between the two delimiters. A README whose block is missing,
+    /// duplicated, unmatched, or inverted is refused rather than repaired,
+    /// because every way of choosing a span in such a file rewrites bytes a
+    /// person wrote. `check` stays read-only; this is what makes its verdict
+    /// actionable.
+    fn readme(repository: &Path) -> ExitCode {
+        let sources = match CanonicalSources::read(repository) {
+            Ok(sources) => sources,
+            Err(message) => return content_error(message),
+        };
+        let updated = match replace_readme_status(&sources.readme, &sources.readme_block()) {
+            Ok(updated) => updated,
+            Err(error) => {
+                return content_error(format!("{}: {error}", sources.readme_path.display()));
+            }
+        };
+        if updated == sources.readme {
+            println!("unchanged");
+            return ExitCode::SUCCESS;
+        }
+        if let Err(message) = replace_file(&sources.readme_path, &updated) {
+            return content_error(message);
+        }
+
+        println!("updated");
+        ExitCode::SUCCESS
+    }
+
+    /// The canonical documents both repository-wide commands read, together
+    /// with the stored bytes each was read from.
+    ///
+    /// The repository is canonicalized once, here, so every path below it is
+    /// absolute and the same wherever the command was launched from. The
+    /// progress document is kept both parsed and as stored, because the
+    /// generated README block is a function of both: what the document says,
+    /// and what its bytes are.
+    struct CanonicalSources {
+        repository: PathBuf,
+        progress_path: PathBuf,
+        progress_json: String,
+        progress: ProgressDocument,
+        plan_markdown: String,
+        readme_path: PathBuf,
+        readme: String,
+    }
+
+    impl CanonicalSources {
+        fn read(repository: &Path) -> Result<Self, String> {
+            let repository = fs::canonicalize(repository)
+                .map_err(|error| format!("{}: {error}", repository.display()))?;
+            let progress_path = repository.join(PROGRESS_DOCUMENT);
+            let progress_json = read_text(&progress_path)?;
+            let progress = serde_json::from_str::<ProgressDocument>(&progress_json)
+                .map_err(|error| format!("{}: {error}", progress_path.display()))?;
+            let plan_markdown = read_text(&repository.join(PLAN_DOCUMENT))?;
+            let readme_path = repository.join(README_DOCUMENT);
+            let readme = read_text(&readme_path)?;
+            Ok(Self {
+                repository,
+                progress_path,
+                progress_json,
+                progress,
+                plan_markdown,
+                readme_path,
+                readme,
+            })
+        }
+
+        /// The one generated status block these sources produce.
+        fn readme_block(&self) -> String {
+            render_readme_status(&self.progress, &self.progress_json, &self.plan_markdown)
+        }
+    }
+
+    fn read_text(path: &Path) -> Result<String, String> {
+        fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /// A directory outside every checkout that one `check` builds its site
+    /// into.
+    ///
+    /// The directory is removed however the run ends — a refused page, an
+    /// unreadable source, a panic — so a gate that has to generate a whole
+    /// site never grows the temporary directory of the machine that ran it.
+    struct ScratchSite(PathBuf);
+
+    impl ScratchSite {
+        fn new() -> Result<Self, String> {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos();
+            Ok(Self(env::temp_dir().join(format!(
+                "sitegen-check-{}-{unique}",
+                std::process::id()
+            ))))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchSite {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Replaces one file's contents in a single step.
+    ///
+    /// The new bytes are written to a sibling and renamed over the file, so a
+    /// run interrupted at any point leaves the original exactly as it was
+    /// rather than truncated or half written. A failed write removes its own
+    /// sibling, so a refused run leaves nothing behind either.
+    fn replace_file(path: &Path, contents: &str) -> Result<(), String> {
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{}: names no file to replace", path.display()))?;
+        let pending = directory.join(format!(".{name}.sitegen-{}.tmp", std::process::id()));
+        fs::write(&pending, contents.as_bytes()).map_err(|error| {
+            let _ = fs::remove_file(&pending);
+            format!("{}: {error}", pending.display())
+        })?;
+        fs::rename(&pending, path).map_err(|error| {
+            let _ = fs::remove_file(&pending);
+            format!("{}: {error}", path.display())
+        })
+    }
+
     fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
-        let json =
-            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let json = read_text(path)?;
         serde_json::from_str(&json).map_err(|error| format!("{}: {error}", path.display()))
     }
 
