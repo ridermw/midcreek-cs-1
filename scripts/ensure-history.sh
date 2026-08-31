@@ -28,6 +28,20 @@ if [[ ! -f "$progress" ]]; then
   exit 1
 fi
 
+python=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+    && "$candidate" -c 'import json, re, sys; raise SystemExit(sys.version_info < (3, 8))' \
+      >/dev/null 2>&1; then
+    python="$candidate"
+    break
+  fi
+done
+if [[ -z "$python" ]]; then
+  echo "Python is required to read the published progress document" >&2
+  exit 1
+fi
+
 # Exactly the fields the generator resolves as commits, and exactly the values
 # it accepts in them. `resolve_commit_ref` takes `HEAD`, or forty hexadecimal
 # digits naming a commit it can reach. Any other forty-hex string in the
@@ -35,7 +49,7 @@ fi
 # and is deliberately not looked for here, because deepening history for it
 # would be deepening for nothing.
 referenced_commits() {
-  python3 - "$progress" <<'PY'
+  "$python" - "$progress" <<'PY'
 import json
 import re
 import sys
@@ -44,7 +58,7 @@ COMMIT_FIELDS = ("completed_commit", "resolved_commit")
 SYMBOLIC = {"HEAD"}
 FULL_SHA = re.compile(r"[0-9a-fA-F]{40}")
 
-with open(sys.argv[1], encoding="utf-8") as handle:
+with open(sys.argv[1], encoding="utf-8-sig") as handle:
     document = json.load(handle)
 
 seen = set()
@@ -79,12 +93,16 @@ PY
 # resolves against. `rev-list` prints lower case, and the references above are
 # already folded to it.
 unreachable_commits() {
-  local known sha
-  known="$(git rev-list --all)"
+  local known referenced sha
+  known="$(git rev-list --all | tr -d '\r')"
+  if ! referenced="$(referenced_commits)"; then
+    echo "failed to read published commits from $progress" >&2
+    return 1
+  fi
   while IFS= read -r sha; do
     [[ -n "$sha" ]] || continue
     grep -qxF "$sha" <<<"$known" || printf '%s\n' "$sha"
-  done < <(referenced_commits)
+  done <<<"${referenced//$'\r'/}"
 }
 
 # Deepening pulls history for the branch this run is publishing and nothing
@@ -96,7 +114,7 @@ unreachable_commits() {
 source_branch() {
   local branch="${GITHUB_REF_NAME:-}"
   if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
-    branch="$(git rev-parse --abbrev-ref HEAD)"
+    branch="$(git rev-parse --abbrev-ref HEAD | tr -d '\r')"
   fi
   printf '%s' "$branch"
 }

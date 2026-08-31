@@ -75,7 +75,7 @@ def sitegen_binary() -> Path:
         check=True,
     )
     target = Path(json.loads(metadata.stdout)["target_directory"])
-    binary = target / "debug" / "sitegen"
+    binary = target / "debug" / ("sitegen.exe" if os.name == "nt" else "sitegen")
     if not binary.is_file():
         raise RuntimeError(f"{binary} was built but is not there")
     return binary
@@ -171,6 +171,40 @@ def write_progress(repository: Path, document: object) -> None:
     )
 
 
+def bash_command() -> Path:
+    """Find Git Bash on Windows instead of the Windows Subsystem launcher."""
+    if os.name != "nt":
+        binary = shutil.which("bash")
+        if binary:
+            return Path(binary)
+        raise RuntimeError("Bash is required to exercise ensure-history.sh")
+
+    candidates: list[Path] = []
+    path_bash = shutil.which("bash")
+    if path_bash and Path(path_bash).parent.name.lower() != "system32":
+        candidates.append(Path(path_bash))
+
+    git_binary = shutil.which("git")
+    if git_binary:
+        for ancestor in Path(git_binary).resolve().parents:
+            candidates.extend(
+                [ancestor / "bin" / "bash.exe", ancestor / "usr" / "bin" / "bash.exe"]
+            )
+
+    for variable, relative in [
+        ("ProgramFiles", Path("Git/bin/bash.exe")),
+        ("ProgramFiles(x86)", Path("Git/bin/bash.exe")),
+        ("LocalAppData", Path("Programs/Git/bin/bash.exe")),
+    ]:
+        if root := os.environ.get(variable):
+            candidates.append(Path(root) / relative)
+
+    for binary in candidates:
+        if binary.is_file():
+            return binary
+    raise RuntimeError("Git Bash was not found in PATH or a known Git installation")
+
+
 def run_script(repository: Path, **environment: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("GITHUB_REF_NAME", None)
@@ -179,7 +213,7 @@ def run_script(repository: Path, **environment: str) -> subprocess.CompletedProc
     env.setdefault("HISTORY_DEEPEN_ROUNDS", "0")
     env.update(environment)
     return subprocess.run(
-        ["bash", str(repository / "scripts" / SCRIPT.name)],
+        [str(bash_command()), str(repository / "scripts" / SCRIPT.name)],
         cwd=repository,
         capture_output=True,
         text=True,
@@ -237,6 +271,28 @@ class CommitFieldParsingTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("every published commit is reachable", result.stdout)
+
+    def test_a_utf8_bom_does_not_hide_referenced_commits(self) -> None:
+        progress = self.repository / "docs" / "progress.json"
+        progress.write_bytes(
+            b"\xef\xbb\xbf"
+            + json.dumps({"tasks": [{"completed_commit": ABSENT}]}).encode("utf-8")
+        )
+
+        result = run_script(self.repository)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(ABSENT, result.stderr)
+
+    def test_invalid_json_cannot_report_reachable_history(self) -> None:
+        progress = self.repository / "docs" / "progress.json"
+        progress.write_text('{"tasks": [', encoding="utf-8")
+
+        result = run_script(self.repository)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("every published commit is reachable", result.stdout)
+        self.assertIn("failed to read published commits", result.stderr)
 
     # -- negative fixtures -------------------------------------------------
 
@@ -308,23 +364,6 @@ class DeepeningTest(unittest.TestCase):
         (self.clone / "scripts").mkdir(exist_ok=True)
         shutil.copy2(SCRIPT, self.clone / "scripts" / SCRIPT.name)
 
-    def stub_git(self, log: Path) -> Path:
-        """A `git` that records every fetch and then runs the real one."""
-        directory = self.root / "stub"
-        directory.mkdir(exist_ok=True)
-        real = shutil.which("git")
-        stub = directory / "git"
-        stub.write_text(
-            "#!/usr/bin/env bash\n"
-            'if [[ "${1:-}" == "fetch" ]]; then\n'
-            f'  printf "%s\\n" "$*" >>"{log}"\n'
-            "fi\n"
-            f'exec "{real}" "$@"\n',
-            encoding="utf-8",
-        )
-        stub.chmod(0o755)
-        return directory
-
     def test_a_short_clone_is_deepened_until_the_commit_is_reachable(self) -> None:
         oldest = git(self.origin, "rev-list", "--max-parents=0", "HEAD")
         write_progress(self.clone, {"tasks": [{"completed_commit": oldest}]})
@@ -333,17 +372,20 @@ class DeepeningTest(unittest.TestCase):
         before = run_script(self.clone, HISTORY_DEEPEN_ROUNDS="0")
         self.assertEqual(before.returncode, 1, "the shallow clone should be short")
 
-        stub = self.stub_git(log)
         result = run_script(
             self.clone,
             HISTORY_DEPTH="4",
             HISTORY_DEEPEN_ROUNDS="4",
-            PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
+            GIT_TRACE=str(log),
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("every published commit is reachable", result.stdout)
-        self.fetches = log.read_text(encoding="utf-8").splitlines()
+        self.fetches = [
+            line
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if " fetch " in line
+        ]
         self.assertTrue(self.fetches, "the script should have deepened")
         for fetch in self.fetches:
             self.assertIn("--deepen=4", fetch)
@@ -376,18 +418,23 @@ class DeepeningTest(unittest.TestCase):
         write_progress(self.clone, {"tasks": [{"completed_commit": oldest}]})
         git(self.clone, "checkout", "--quiet", "--detach", "HEAD")
         log = self.root / "detached.log"
-        stub = self.stub_git(log)
 
         result = run_script(
             self.clone,
             GITHUB_REF_NAME="main",
             HISTORY_DEPTH="4",
             HISTORY_DEEPEN_ROUNDS="4",
-            PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
+            GIT_TRACE=str(log),
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        for fetch in log.read_text(encoding="utf-8").splitlines():
+        fetches = [
+            line
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if " fetch " in line
+        ]
+        self.assertTrue(fetches, "the script should have deepened")
+        for fetch in fetches:
             self.assertIn("+refs/heads/main:refs/remotes/origin/main", fetch)
 
     def test_a_detached_head_with_no_named_branch_is_refused(self) -> None:
@@ -437,6 +484,16 @@ class DeepeningSourceTest(unittest.TestCase):
         self.assertIn('SYMBOLIC = {"HEAD"}', self.SOURCE)
         self.assertIn("[0-9a-fA-F]{40}", self.SOURCE)
 
+    def test_a_working_python_interpreter_is_required_before_history_is_checked(self) -> None:
+        self.assertIn("for candidate in python3 python", self.SOURCE)
+        self.assertIn('"$candidate" -c', self.SOURCE)
+        self.assertIn('if [[ -z "$python" ]]', self.SOURCE)
+
+    def test_native_git_line_endings_are_normalized_before_comparison(self) -> None:
+        self.assertIn("git rev-list --all | tr -d '\\r'", self.SOURCE)
+        self.assertIn("git rev-parse --abbrev-ref HEAD | tr -d '\\r'", self.SOURCE)
+        self.assertIn("${referenced//$'\\r'/}", self.SOURCE)
+
 
 class CleanGateOrderTest(unittest.TestCase):
     """The local gate repairs history before anything validates against it."""
@@ -459,17 +516,17 @@ class CleanGateOrderTest(unittest.TestCase):
 
     def test_the_history_bound_and_its_tests_are_both_in_the_clean_gate(self) -> None:
         self.assertIn("./scripts/ensure-history.sh", self.CHECK)
-        self.assertIn("python3 scripts/ensure_history_test.py", self.CHECK)
+        self.assertIn('"$python" scripts/ensure_history_test.py', self.CHECK)
 
     def test_the_history_suite_runs_once_the_assembler_is_built(self) -> None:
         """Its composed cases drive the real `sitegen assemble`."""
         validate = self.CHECK.index("sitegen -- validate")
-        suite = self.CHECK.index("python3 scripts/ensure_history_test.py")
+        suite = self.CHECK.index('"$python" scripts/ensure_history_test.py')
 
         self.assertLess(validate, suite)
 
     def test_the_browser_gate_unit_suite_runs_before_any_browser_can_launch(self) -> None:
-        unit = self.CHECK.index("python3 scripts/browser_gate_test.py")
+        unit = self.CHECK.index('"$python" scripts/browser_gate_test.py')
         renderer_probe = self.CHECK.index('render_command=(')
         browser = self.CHECK.index('step "playable web build and browser gate"')
 

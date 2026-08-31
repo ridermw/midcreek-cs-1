@@ -12,4 +12,3 @@ jobs:
   attach:
     uses: github/agentic-knowledge-base/.github/workflows/attach-issue-artifact-on-open.yml@main
     # Guided setup maps KB_ISSUE_ARTIFACT_WRITE_PAT here.
-    secrets: {}
