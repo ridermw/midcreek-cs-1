@@ -597,31 +597,36 @@ mod progress_contract {
                     "the-overhead-trays-hid-the-technician-at-two-of-the-four-headings",
                     "history-images-arrive-after-the-build-that-links-them",
                     "a-job-that-stops-at-its-first-failure-publishes-nothing",
+                    "capture-waits-consume-the-active-work-watchdog",
+                    "retained-game-is-not-rendered-on-the-homepage",
                 ]
             );
             for challenge in &document.challenges {
                 assert!(!challenge.title.trim().is_empty());
                 assert!(!challenge.impact.trim().is_empty());
                 assert!(!challenge.approach.trim().is_empty());
-                assert!(
-                    challenge
-                        .resolution
-                        .as_deref()
-                        .is_some_and(|resolution| !resolution.trim().is_empty()),
-                    "{} must record what was actually done about it",
-                    challenge.id
-                );
                 // An open challenge still carries its full context, but it has
                 // no commit that closed it, because nothing has.
                 match challenge.status {
                     ChallengeStatus::Resolved => {
-                        assert_eq!(challenge.resolved_commit.as_deref(), Some("HEAD"))
+                        assert!(
+                            challenge
+                                .resolution
+                                .as_deref()
+                                .is_some_and(|resolution| !resolution.trim().is_empty()),
+                            "{} must record what was actually done about it",
+                            challenge.id
+                        );
+                        assert_eq!(challenge.resolved_commit.as_deref(), Some("HEAD"));
                     }
-                    _ => assert_eq!(
-                        challenge.resolved_commit, None,
-                        "{} is not resolved, so it must not claim a resolving commit",
-                        challenge.id
-                    ),
+                    ChallengeStatus::Open => {
+                        assert_eq!(challenge.resolution, None);
+                        assert_eq!(
+                            challenge.resolved_commit, None,
+                            "{} is not resolved, so it must not claim a resolving commit",
+                            challenge.id
+                        );
+                    }
                 }
             }
             assert_eq!(
@@ -631,8 +636,11 @@ mod progress_contract {
                     .filter(|challenge| challenge.status != ChallengeStatus::Resolved)
                     .map(|challenge| challenge.id.as_str())
                     .collect::<Vec<_>>(),
-                Vec::<&str>::new(),
-                "the corner-framing gap was resolved by the rendered-coverage apron, so no challenge is open"
+                vec![
+                    "capture-waits-consume-the-active-work-watchdog",
+                    "retained-game-is-not-rendered-on-the-homepage",
+                ],
+                "the canonical progress document must expose the two current baseline blockers"
             );
         }
 
