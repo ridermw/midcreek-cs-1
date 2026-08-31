@@ -921,11 +921,10 @@ mod native {
     /// judge it is built into a temporary directory that is removed however
     /// the run ends — so `check` is safe to run on a tree somebody is editing.
     ///
-    /// Every source-level failure is reported before the gate gives up, so one
-    /// run names everything that has to be fixed rather than one thing at a
-    /// time. The generated site is only attempted once the sources agree,
-    /// because `build_site_in` re-validates them and would otherwise repeat
-    /// the same failures in a less useful form.
+    /// After the canonical sources and Git facts can be read, every validation
+    /// failure is reported before the gate gives up. The generated site is only
+    /// attempted once the sources agree, because `build_site_in` re-validates
+    /// them and would otherwise repeat the same failures in a less useful form.
     fn check(repository: &Path) -> ExitCode {
         let sources = match CanonicalSources::read(repository) {
             Ok(sources) => sources,

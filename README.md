@@ -1134,8 +1134,8 @@ not depend on the directory it was launched from. It fails with exit 1 when
 progress data is stale against Git or against the reviewed plan, when a
 reference no longer matches its manifest, when the README status block is
 missing, duplicated, malformed, or stale, or when the generated page breaks a
-site rule. Every source-level failure is reported before it gives up, so one
-run names everything that has to be fixed.
+site rule. After the canonical sources and Git facts can be read, `check`
+reports every validation failure before it gives up.
 
 `readme` is the only `sitegen` command that edits the checkout, and it edits
 exactly the bytes between the two status delimiters. A README whose delimiters

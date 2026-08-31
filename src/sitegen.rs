@@ -1147,8 +1147,8 @@ pub enum SitegenError {
     HistoryFrameOutsideEntry {
         frames: Vec<String>,
     },
-    /// The current tree carries promoted frames without the gallery manifest
-    /// that always accompanies a real promotion.
+    /// The current tree carries a partial or inconsistent verification evidence
+    /// set.
     PartialEvidencePublication {
         path: PathBuf,
     },
@@ -1278,7 +1278,7 @@ impl fmt::Display for SitegenError {
             ),
             Self::PartialEvidencePublication { path } => write!(
                 formatter,
-                "{} is published without the gallery manifest that must accompany a promotion",
+                "the verification evidence set is partial or inconsistent at {}",
                 path.display()
             ),
             Self::UnknownRepository { candidates } => write!(
@@ -1661,6 +1661,7 @@ fn table_cell(value: &str) -> String {
     let mut cell = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
+            '\\' => cell.push_str("\\\\"),
             '|' => cell.push_str("\\|"),
             character if character.is_control() => cell.push(' '),
             character => cell.push(character),
@@ -2844,28 +2845,49 @@ enum EvidencePublication {
     Absent,
 }
 
-/// Classifies what the current tree publishes about verification, refusing
-/// to assume promoted frames and the gallery manifest are an atomic pair.
+/// Classifies what the current tree publishes about verification.
 ///
-/// A build that really promoted frames always writes both together, so a
-/// `screenshots/current` directory with no `gallery.json` beside it is not a
-/// promoted run at all: it is a partial or inconsistent tree that assembly
-/// must name rather than silently treat as a complete promotion.
+/// A successful build writes its projection, promoted frames, and gallery
+/// together. A failed build writes only its projection. Any other combination
+/// is partial or inconsistent and must not inherit artifacts from another run.
 fn evidence_publication(current: &Path) -> Result<EvidencePublication, SitegenError> {
     let has_current_frames = current.join(CURRENT_SCREENSHOTS).is_dir();
     let has_gallery = current.join(GALLERY_FILE).is_file();
-    if has_current_frames && !has_gallery {
-        return Err(SitegenError::PartialEvidencePublication {
-            path: current.join(CURRENT_SCREENSHOTS),
-        });
+    let verification_path = current.join(VERIFICATION_FILE);
+    let succeeded = verification_path
+        .is_file()
+        .then(|| {
+            fs::read_to_string(&verification_path)
+                .map_err(|error| SitegenError::Io {
+                    path: verification_path.clone(),
+                    message: error.to_string(),
+                })
+                .and_then(|json| {
+                    serde_json::from_str::<VerificationSummary>(&json).map_err(|error| {
+                        SitegenError::Json {
+                            path: verification_path.clone(),
+                            message: error.to_string(),
+                        }
+                    })
+                })
+        })
+        .transpose()?
+        .map(|verdict| verdict.succeeded);
+
+    match (has_current_frames, has_gallery, succeeded) {
+        (true, true, Some(true)) => Ok(EvidencePublication::Promoted),
+        (false, false, Some(false)) => Ok(EvidencePublication::ProjectionOnly),
+        (false, false, None) => Ok(EvidencePublication::Absent),
+        _ => Err(SitegenError::PartialEvidencePublication {
+            path: if succeeded.is_some() {
+                verification_path
+            } else if has_gallery {
+                current.join(GALLERY_FILE)
+            } else {
+                current.join(CURRENT_SCREENSHOTS)
+            },
+        }),
     }
-    Ok(if has_current_frames {
-        EvidencePublication::Promoted
-    } else if current.join(VERIFICATION_FILE).is_file() {
-        EvidencePublication::ProjectionOnly
-    } else {
-        EvidencePublication::Absent
-    })
 }
 
 /// Carries named artifacts of a previous publication forward.
@@ -4706,11 +4728,9 @@ fn contains_path_at_boundary(text: &str, path: &str) -> bool {
     text.match_indices(path).any(|(start, _)| {
         let preceding = text[..start].chars().next_back();
         let mut following = text[start + path.len()..].chars();
-        let starts_component = path.starts_with('/')
-            || path.starts_with('\\')
-            || preceding.is_none_or(|value| {
-                !value.is_ascii_alphanumeric() && !matches!(value, '_' | '-' | '.')
-            });
+        let starts_component = preceding.is_none_or(|value| {
+            !value.is_ascii_alphanumeric() && !matches!(value, '_' | '-' | '.' | '/' | '\\')
+        });
         let ends_component = match following.next() {
             None => true,
             Some(value) if matches!(value, '/' | '\\') || value.is_ascii_whitespace() => true,

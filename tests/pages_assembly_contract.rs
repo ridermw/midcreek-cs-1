@@ -618,7 +618,7 @@ fn current_evidence_is_never_credited_from_a_run_that_attempted_no_verification_
 }
 
 #[test]
-fn malformed_current_evidence_cannot_claim_separate_verification() {
+fn incomplete_successful_current_evidence_is_refused() {
     let previous = previous_retained_playable("previous-retained-playable-malformed-evidence");
     let current = fixture_site(
         "current-malformed-verification-summary",
@@ -629,17 +629,17 @@ fn malformed_current_evidence_cannot_claim_separate_verification() {
     );
     let output = TempDirectory::new("malformed-current-evidence-output");
 
-    assemble_site(
+    let result = assemble_site(
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
         output.path(),
-    )
-    .unwrap();
+    );
 
-    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
-    assert!(index.contains("current run did not verify"), "{index}");
-    assert!(!index.contains("verified separately"), "{index}");
+    assert!(
+        matches!(&result, Err(SitegenError::Json { .. })),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -756,6 +756,87 @@ fn promoted_frames_without_a_gallery_manifest_are_refused_as_partial_evidence() 
             &result,
             Err(SitegenError::PartialEvidencePublication { .. })
         ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn successful_projection_without_promoted_artifacts_is_refused_as_partial_evidence() {
+    let current = fixture_site(
+        "current-successful-projection-only",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("verification.json", GREEN_PROJECTION),
+        ],
+    );
+    let output = TempDirectory::new("successful-projection-only-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(
+            &result,
+            Err(SitegenError::PartialEvidencePublication { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn promoted_artifacts_without_a_projection_are_refused_as_partial_evidence() {
+    let current = fixture_site(
+        "current-promoted-artifacts-without-projection",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("gallery.json", PRIOR_GALLERY),
+            (CURRENT_FRAME, "frame"),
+        ],
+    );
+    let output = TempDirectory::new("promoted-artifacts-without-projection-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(
+            &result,
+            Err(SitegenError::PartialEvidencePublication { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn promoted_artifacts_with_an_incomplete_projection_are_refused() {
+    let current = fixture_site(
+        "current-promoted-artifacts-with-incomplete-projection",
+        &[
+            ("index.html", "CURRENT SOURCE: GREEN"),
+            ("gallery.json", r#"{"entries":[]}"#),
+            ("verification.json", r#"{"succeeded":true}"#),
+            (CURRENT_FRAME, "frame"),
+        ],
+    );
+    let output = TempDirectory::new("promoted-artifacts-with-incomplete-projection-output");
+
+    let result = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        output.path(),
+    );
+
+    assert!(
+        matches!(&result, Err(SitegenError::Json { .. })),
         "{result:?}"
     );
 }
@@ -2265,6 +2346,7 @@ fn a_green_replacement_keeps_the_previous_screenshot_history() {
     let mut current_files = vec![
         ("index.html", "CURRENT SOURCE: GREEN"),
         ("gallery.json", r#"{"entries":[{"source_commit":"new"}]}"#),
+        ("verification.json", GREEN_PROJECTION),
         (
             "screenshots/current/01-healthy-center-ne.png",
             "new current",
@@ -2384,6 +2466,11 @@ fn a_first_green_run_without_a_previous_site_publishes_its_own_history() {
     let mut files = vec![
         ("index.html", "CURRENT SOURCE: GREEN"),
         ("gallery.json", r#"{"entries":[]}"#),
+        ("verification.json", GREEN_PROJECTION),
+        (
+            "screenshots/current/01-healthy-center-ne.png",
+            "new current",
+        ),
         (
             "screenshots/history/11111111/01-healthy-center-ne.png",
             "new history",
@@ -2426,12 +2513,57 @@ const NEW_HISTORY: &str = "screenshots/history/11111111/01-healthy-center-ne.png
 const CURRENT_FRAME: &str = "screenshots/current/01-healthy-center-ne.png";
 
 /// A green projection, exactly as `verification.json` records one.
-const GREEN_PROJECTION: &str = r#"{"succeeded":true,"semantic_visual_hash":"bbbbbbbb"}"#;
+const GREEN_PROJECTION: &str = r##"{
+  "schema_version": 1,
+  "succeeded": true,
+  "failed_stage": null,
+  "stages": [],
+  "semantic_visual_hash": "bbbbbbbb",
+  "camera": {
+    "tonemapping": "TonyMcMapface",
+    "deband_dither": "Enabled",
+    "msaa_samples": 1,
+    "clear_color": "#000000"
+  },
+  "hashes": {
+    "assets": {},
+    "asset_sources": {},
+    "references": {},
+    "sources": {}
+  },
+  "frames": [],
+  "browser": null,
+  "metrics": {},
+  "metric_failures": [],
+  "gates": []
+}"##;
 
 /// A failed projection: the current status, with no pixels behind it. It still
 /// carries the run's semantic hash, exactly as `VerificationSummary` does.
-const FAILED_PROJECTION: &str =
-    r#"{"succeeded":false,"failed_stage":"repair","semantic_visual_hash":"cccccccc"}"#;
+const FAILED_PROJECTION: &str = r##"{
+  "schema_version": 1,
+  "succeeded": false,
+  "failed_stage": "repair",
+  "stages": [],
+  "semantic_visual_hash": "cccccccc",
+  "camera": {
+    "tonemapping": "TonyMcMapface",
+    "deband_dither": "Enabled",
+    "msaa_samples": 1,
+    "clear_color": "#000000"
+  },
+  "hashes": {
+    "assets": {},
+    "asset_sources": {},
+    "references": {},
+    "sources": {}
+  },
+  "frames": [],
+  "browser": null,
+  "metrics": {},
+  "metric_failures": [],
+  "gates": []
+}"##;
 
 /// An index that links exactly the given site-relative targets.
 fn index_linking(targets: &[&str]) -> String {

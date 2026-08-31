@@ -472,6 +472,27 @@ mod output_validation_contract {
         );
     }
 
+    #[test]
+    fn an_absolute_path_segment_is_not_the_declared_repository_root() {
+        for text in [
+            "Published from /mnt/srv/hub/docs/reference",
+            "Published from https://example.invalid/srv/hub/docs/reference",
+        ] {
+            let site = build_fixture_site("green").unwrap();
+            mutate_index(&site, |html| html.replace("Render the progress hub", text));
+
+            assert_eq!(
+                midcreek_cs_1::sitegen::validate_site_output_in(
+                    Path::new("/srv/hub"),
+                    site.root(),
+                    &fixture("green/progress.json"),
+                ),
+                Ok(()),
+                "{text} does not name the declared repository root"
+            );
+        }
+    }
+
     /// The same bytes, checked against the same declared repository and
     /// output, must reach the same verdict on every machine and from every
     /// working directory. A gate that consulted the environment publishes a
@@ -4055,6 +4076,27 @@ mod readme_status_contract {
             render_readme_status(&sample_progress(), PROGRESS_BYTES, PLAN_BYTES)
                 .lines()
                 .count()
+        );
+    }
+
+    #[test]
+    fn a_backslash_before_a_pipe_cannot_break_out_of_a_generated_table_cell() {
+        let mut progress = sample_progress();
+        progress
+            .tasks
+            .iter_mut()
+            .find(|task| task.status == ProgressStatus::InProgress)
+            .expect("the sample document has a current task")
+            .title = r"Ship \| now".to_owned();
+
+        let block = render_readme_status(&progress, PROGRESS_BYTES, PLAN_BYTES);
+
+        assert!(
+            block.contains(
+                r"| Working now | `camera-orbit` — Ship \\\| now |
+"
+            ),
+            "{block}"
         );
     }
 
