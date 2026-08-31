@@ -618,3 +618,109 @@ fn refine_peak(histogram: &[f64; 180], from: usize, to: usize) -> Option<f64> {
     }
     (weight > 0.0).then(|| moment / weight)
 }
+
+// ---------------------------------------------------------------------------
+// Measuring one image
+// ---------------------------------------------------------------------------
+
+/// What kind of image is being measured.
+///
+/// This is an assertion by the operator, not something the tool can detect,
+/// and it exists because one measurement is only meaningful for one of them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeasureSource {
+    /// Approved concept art. Drawn, not rendered, so its edges are clean and
+    /// the row angle recovers the camera it was drawn at.
+    Reference,
+    /// A frame captured from the running game. Rendered without multisampling,
+    /// so aliased near-diagonals bias the measured angle toward 45 degrees.
+    ///
+    /// The default, deliberately. Mistaking art for a capture loses a number;
+    /// mistaking a capture for art publishes a wrong one.
+    #[default]
+    Capture,
+}
+
+/// Why a capture's camera is withheld.
+const CAPTURE_NOTE: &str = "row angle withheld: captures render without multisampling, so \
+                            aliased diagonals bias the measurement. Derive the camera from \
+                            CAMERA_ELEVATION_DEGREES instead.";
+
+/// Everything one image reports.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MeasureReport {
+    /// The file measured.
+    pub path: String,
+    /// Frame width, in pixels.
+    pub width: u32,
+    /// Frame height, in pixels.
+    pub height: u32,
+    /// What the operator declared this image to be.
+    pub source: MeasureSource,
+    /// Share of the frame nearest a rack tone.
+    pub rack_mass: f64,
+    /// Share of the frame nearest a floor tone.
+    pub floor_mass: f64,
+    /// Rack mass over floor mass. The single number the direction turns on.
+    pub rack_to_floor: f64,
+    /// Mean linear luminance over the whole frame.
+    pub mean_linear_luminance: f64,
+    /// Fraction of pixels carrying a strong edge.
+    pub edge_density: f64,
+    /// Fraction of the frame within tolerance of the approved palette.
+    pub palette_ratio: f64,
+    /// The measured diagonal families, for reference art only.
+    pub row_angle: Option<RowAngle>,
+    /// Elevation implied by that angle, for reference art only.
+    pub implied_elevation_degrees: Option<f64>,
+    /// Why something was withheld, when it was.
+    pub note: Option<String>,
+}
+
+/// Measures one image.
+///
+/// The rack-to-floor ratio is the headline: the approved key art holds roughly
+/// 1.51 parts rack to one part floor, and a frame that inverts that reads as a
+/// floor with some equipment on it however correct its palette.
+pub fn measure(path: &Path, source: MeasureSource) -> Result<MeasureReport, String> {
+    let image = load_frame(path)?;
+    let metrics = FrameMetrics::compute(&image, &BTreeMap::new());
+
+    let rack_mass = metrics.nearest_of(&[PaletteRole::RackWhite, PaletteRole::RackShadow]);
+    let floor_mass = metrics.nearest_of(&[PaletteRole::FloorLight, PaletteRole::FloorShadow]);
+    // A frame with no floor at all would otherwise divide by zero and report an
+    // infinity that serialises as null, which reads as "not measured".
+    let rack_to_floor = if floor_mass > 0.0 {
+        rack_mass / floor_mass
+    } else {
+        0.0
+    };
+
+    let angle = match source {
+        MeasureSource::Reference => dominant_row_angle(&image),
+        MeasureSource::Capture => None,
+    };
+
+    Ok(MeasureReport {
+        path: path.display().to_string(),
+        width: metrics.width,
+        height: metrics.height,
+        source,
+        rack_mass,
+        floor_mass,
+        rack_to_floor,
+        mean_linear_luminance: metrics.mean_linear_luminance,
+        edge_density: metrics.edge_density,
+        palette_ratio: metrics.palette_ratio,
+        row_angle: angle,
+        implied_elevation_degrees: angle.map(|angle| angle.elevation_degrees()),
+        note: match source {
+            MeasureSource::Capture => Some(CAPTURE_NOTE.to_owned()),
+            MeasureSource::Reference if angle.is_none() => {
+                Some("row angle withheld: too little diagonal edge mass to measure".to_owned())
+            }
+            MeasureSource::Reference => None,
+        },
+    })
+}

@@ -10,11 +10,19 @@
 //! `verification.rs` and into `metrics.rs` does not change one measured
 //! number. Capture it before the move; assert it after.
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use midcreek_cs_1::{
     design::KEY_ART_REFERENCE_PATH,
-    metrics::{FrameMetrics, dominant_row_angle, elevation_from_row_angle, load_frame},
+    metrics::{
+        FrameMetrics, MeasureSource, dominant_row_angle, elevation_from_row_angle, load_frame,
+        measure,
+    },
+    verification::parse_verification_args,
 };
 
 fn repo_root() -> PathBuf {
@@ -177,4 +185,133 @@ fn the_two_diagonal_families_of_the_key_art_mirror_each_other() {
         "the approved art measures a shallow isometric camera, got {:.2}",
         angle.elevation_degrees()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The --measure subcommand
+// ---------------------------------------------------------------------------
+
+#[test]
+fn measuring_reference_art_reports_the_camera_it_was_drawn_at() {
+    let report = measure(
+        &repo_root().join(KEY_ART_REFERENCE_PATH),
+        MeasureSource::Reference,
+    )
+    .expect("the approved key art measures");
+
+    let angle = report
+        .row_angle
+        .expect("reference art reports its row angle");
+    assert!((30.0..31.0).contains(&angle.low_degrees));
+    let elevation = report
+        .implied_elevation_degrees
+        .expect("reference art reports an implied elevation");
+    assert!(
+        (34.0..38.0).contains(&elevation),
+        "the approved art is a shallow isometric camera, got {elevation:.2}"
+    );
+}
+
+#[test]
+fn measuring_a_captured_frame_withholds_the_camera() {
+    // The game renders without multisampling, so aliased near-diagonals bias
+    // the measured angle. Reporting it anyway would be a confident wrong
+    // answer, which is worse than no answer.
+    let report = measure(
+        &repo_root().join(KEY_ART_REFERENCE_PATH),
+        MeasureSource::Capture,
+    )
+    .expect("any png measures");
+
+    assert!(
+        report.row_angle.is_none(),
+        "a capture must not report a row angle"
+    );
+    assert!(report.implied_elevation_degrees.is_none());
+    assert!(
+        report.note.is_some(),
+        "withholding must say why, or it reads as a measurement failure"
+    );
+}
+
+#[test]
+fn every_measurement_reports_the_mass_ratio_the_gates_care_about() {
+    let report = measure(
+        &repo_root().join(KEY_ART_REFERENCE_PATH),
+        MeasureSource::Capture,
+    )
+    .expect("key art measures");
+
+    assert!(
+        (1.4..1.6).contains(&report.rack_to_floor),
+        "the approved art holds roughly three parts rack to two parts floor, got {:.3}",
+        report.rack_to_floor
+    );
+    assert!(report.rack_mass > 0.0 && report.floor_mass > 0.0);
+}
+
+#[test]
+fn measuring_a_missing_file_is_an_error_not_a_panic() {
+    let missing = repo_root().join("docs/reference/there-is-no-such-plate.png");
+    assert!(measure(&missing, MeasureSource::Reference).is_err());
+}
+
+#[test]
+fn a_floorless_frame_reports_no_ratio_rather_than_infinity() {
+    let flat = repo_root().join("tests/fixtures/metrics/no-floor.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([251, 252, 253]))
+        .save(&flat)
+        .expect("fixture is writable");
+    let report = measure(&flat, MeasureSource::Capture).expect("measures");
+    std::fs::remove_file(&flat).ok();
+
+    assert!(
+        report.rack_to_floor.is_finite(),
+        "a frame with no floor must not divide by zero"
+    );
+}
+
+fn args(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_owned()).collect()
+}
+
+#[test]
+fn measure_parses_a_path_in_either_form() {
+    let split = parse_verification_args(args(&["--measure", "a.png"])).expect("parses");
+    assert_eq!(split.measure.as_deref(), Some(Path::new("a.png")));
+    let joined = parse_verification_args(args(&["--measure=a.png"])).expect("parses");
+    assert_eq!(joined.measure, split.measure);
+}
+
+#[test]
+fn measure_defaults_to_treating_an_image_as_a_capture() {
+    // The safe default: withhold the camera unless the operator says the image
+    // is drawn art. Getting it wrong this way loses a number; the other way
+    // publishes a wrong one.
+    let request = parse_verification_args(args(&["--measure", "a.png"])).expect("parses");
+    assert_eq!(request.measure_source, MeasureSource::Capture);
+}
+
+#[test]
+fn measure_reference_opts_in_to_reporting_the_camera() {
+    let request =
+        parse_verification_args(args(&["--measure", "a.png", "--reference"])).expect("parses");
+    assert_eq!(request.measure_source, MeasureSource::Reference);
+}
+
+#[test]
+fn measure_without_a_path_is_a_usage_error() {
+    assert!(parse_verification_args(args(&["--measure"])).is_err());
+}
+
+#[test]
+fn measure_given_twice_is_a_usage_error() {
+    assert!(parse_verification_args(args(&["--measure", "a.png", "--measure", "b.png"])).is_err());
+}
+
+#[test]
+fn reference_without_measure_is_a_usage_error() {
+    // Silently ignoring a flag that changes what gets reported would let a
+    // mistyped command look like it worked.
+    assert!(parse_verification_args(args(&["--reference"])).is_err());
 }

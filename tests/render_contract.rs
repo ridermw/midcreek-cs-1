@@ -1310,6 +1310,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: None,
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1319,6 +1320,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: Some(VerificationFault::Stall),
             capture_delay: None,
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1328,6 +1330,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: Some(30),
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1337,6 +1340,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: Some(0),
             flood: None,
+            ..VerificationRequest::default()
         })
     );
     assert_eq!(
@@ -1346,6 +1350,7 @@ fn command_line_accepts_the_documented_shapes() {
             fault: None,
             capture_delay: None,
             flood: Some(4096),
+            ..VerificationRequest::default()
         })
     );
 }

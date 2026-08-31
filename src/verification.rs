@@ -95,8 +95,8 @@ use crate::{
     metrics::{
         BADGE_ROLE_MIN, DIAGONAL_BAND_MIN, EDGE_DENSITY_RANGE, FLOOR_MIN, FrameMetrics,
         HISTOGRAM_MAX, HUD_STATE_MIN, INK_RANGE, LUMINANCE_RANGE, LUMINANCE_REFERENCE_TOLERANCE,
-        PALETTE_MIN, PALETTE_TOLERANCE, PixelRect, RACK_MIN, SENTINEL_MAX, WORKER_REGION,
-        WORKER_ROLE_MIN, YELLOW_MIN, palette_table, squared_distance,
+        MeasureSource, PALETTE_MIN, PALETTE_TOLERANCE, PixelRect, RACK_MIN, SENTINEL_MAX,
+        WORKER_REGION, WORKER_ROLE_MIN, YELLOW_MIN, palette_table, squared_distance,
     },
     operations::{
         FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction, MovementLock,
@@ -3810,6 +3810,10 @@ pub struct VerificationRequest {
     /// How many bytes the flood fixture writes to each of stdout and stderr
     /// before exiting successfully, when one was requested.
     pub flood: Option<u64>,
+    /// The image to measure, when a measurement was requested.
+    pub measure: Option<PathBuf>,
+    /// What the operator declared that image to be.
+    pub measure_source: MeasureSource,
 }
 
 /// Largest flood the fixture will produce, so a typo cannot fill a disk.
@@ -3865,6 +3869,8 @@ pub fn parse_verification_args(
     const FAULT: &str = "--verify-fault";
     const DELAY: &str = "--verify-capture-delay";
     const FLOOD: &str = "--verify-flood";
+    const MEASURE: &str = "--measure";
+    const REFERENCE: &str = "--reference";
     let mut arguments = arguments.into_iter();
     let mut request = VerificationRequest::default();
     while let Some(argument) = arguments.next() {
@@ -3881,6 +3887,24 @@ pub fn parse_verification_args(
                     return Err(format!("{OUTPUT} was given more than once"));
                 }
                 request.output = Some(PathBuf::from(value));
+            }
+            MEASURE => {
+                let Some(value) = value.or_else(|| arguments.next()) else {
+                    return Err(format!("{MEASURE} requires an image path"));
+                };
+                if request.measure.is_some() {
+                    return Err(format!("{MEASURE} was given more than once"));
+                }
+                request.measure = Some(PathBuf::from(value));
+            }
+            REFERENCE => {
+                if value.is_some() {
+                    return Err(format!("{REFERENCE} takes no value"));
+                }
+                if request.measure_source == MeasureSource::Reference {
+                    return Err(format!("{REFERENCE} was given more than once"));
+                }
+                request.measure_source = MeasureSource::Reference;
             }
             FAULT => {
                 let Some(value) = value.or_else(|| arguments.next()) else {
@@ -3951,6 +3975,16 @@ pub fn parse_verification_args(
         && (request.output.is_some() || request.fault.is_some() || request.capture_delay.is_some())
     {
         return Err(format!("{FLOOD} is a fixture and runs on its own"));
+    }
+    // Silently ignoring a flag that changes what gets reported would let a
+    // mistyped command look like it worked.
+    if request.measure_source == MeasureSource::Reference && request.measure.is_none() {
+        return Err(format!("{REFERENCE} only means something with {MEASURE}"));
+    }
+    if request.measure.is_some()
+        && (request.output.is_some() || request.flood.is_some() || request.fault.is_some())
+    {
+        return Err(format!("{MEASURE} reads one image and runs on its own"));
     }
     Ok(request)
 }
