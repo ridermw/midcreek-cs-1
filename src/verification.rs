@@ -222,7 +222,17 @@ impl FrameName {
     }
 }
 
-/// Every file this module may ever write or remove, in stable order.
+/// The scratch file [`VerifyOutput::prepare`] writes and removes to prove the
+/// directory is writable before a run commits to it.
+///
+/// It is named here rather than inlined because this module's contract is that
+/// it touches only files it has declared. The probe is not an artifact — it
+/// never survives `prepare`, is never published, and is never cleared — so it
+/// is deliberately not in [`ARTIFACT_NAMES`]; [`OWNED_NAMES`] is the union the
+/// contract is stated over.
+pub const PROBE_FILE_NAME: &str = ".midcreek-verify-probe";
+
+/// Every artifact a run publishes, in stable order.
 pub const ARTIFACT_NAMES: [&str; 15] = [
     "01-healthy-center-ne.png",
     "02-fault-queue-ne.png",
@@ -240,6 +250,25 @@ pub const ARTIFACT_NAMES: [&str; 15] = [
     "14-low-resolution-queue.png",
     REPORT_FILE_NAME,
 ];
+
+/// Every file name this module may ever write or remove, in stable order.
+///
+/// This is the whole of it: the published [`ARTIFACT_NAMES`] plus the writable
+/// probe. Anything outside this set is a name the module has no business
+/// touching, which is the property [`VerifyOutput`] exists to hold. It is
+/// derived from [`ARTIFACT_NAMES`] rather than restated, so a fifteenth frame
+/// joins it without anyone editing a second list.
+pub const OWNED_NAMES: [&str; ARTIFACT_NAMES.len() + 1] = owned_names();
+
+const fn owned_names() -> [&'static str; ARTIFACT_NAMES.len() + 1] {
+    let mut names = [PROBE_FILE_NAME; ARTIFACT_NAMES.len() + 1];
+    let mut index = 0;
+    while index < ARTIFACT_NAMES.len() {
+        names[index] = ARTIFACT_NAMES[index];
+        index += 1;
+    }
+    names
+}
 
 // ---------------------------------------------------------------------------
 // Output directory
@@ -293,6 +322,13 @@ pub enum VerifyOutputError {
         /// The offending path.
         path: PathBuf,
     },
+    /// The writable probe name is already taken by something this run did not
+    /// create, so proving the directory writable would mean overwriting,
+    /// following, or unlinking a stranger.
+    StaleProbe {
+        /// The offending path.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for VerifyOutputError {
@@ -334,6 +370,12 @@ impl fmt::Display for VerifyOutputError {
                 "refusing to write {name} because {} is not a regular file",
                 path.display()
             ),
+            Self::StaleProbe { path } => write!(
+                formatter,
+                "refusing to prove {} writable because the probe name is already taken; this run \
+                 did not create it and will not overwrite, follow, or remove it",
+                path.display()
+            ),
         }
     }
 }
@@ -353,6 +395,10 @@ pub struct VerifyOutput {
 
 impl VerifyOutput {
     /// Validates `path` and creates at most its final missing component.
+    ///
+    /// Writability is proven by writing and removing [`PROBE_FILE_NAME`],
+    /// which is a declared [`OWNED_NAMES`] entry rather than an undeclared
+    /// temporary: this type may only ever touch names it has published.
     pub fn prepare(path: &Path) -> Result<Self, VerifyOutputError> {
         if path.as_os_str().is_empty() {
             return Err(VerifyOutputError::Empty);
@@ -420,11 +466,45 @@ impl VerifyOutput {
             }
         }
 
-        let probe = path.join(".midcreek-verify-probe");
-        fs::write(&probe, b"probe").map_err(|error| VerifyOutputError::Unwritable {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
+        // The probe is the one file `prepare` creates, and it may only ever be
+        // a file `prepare` created. Anything already sitting on the name is
+        // refused outright rather than reused: a regular file is debris from a
+        // crashed run and not ours to truncate, and a symbolic link is worse
+        // than that — `fs::write` follows it, so a link aimed at any file this
+        // process can write would be overwritten with the probe text and then
+        // unlinked by the cleanup below, all under a name the caller never
+        // supplied.
+        let probe = path.join(PROBE_FILE_NAME);
+        if fs::symlink_metadata(&probe).is_ok() {
+            return Err(VerifyOutputError::StaleProbe { path: probe });
+        }
+        // `create_new` closes the gap between that check and this write rather
+        // than trusting it: `O_CREAT | O_EXCL` fails on an existing entry and
+        // fails on a symbolic link, so the handle below is always a regular
+        // file this call has just made.
+        let created = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(VerifyOutputError::StaleProbe { path: probe });
+            }
+            Err(error) => {
+                return Err(VerifyOutputError::Unwritable {
+                    path: path.to_path_buf(),
+                    reason: error.to_string(),
+                });
+            }
+        };
+        io::Write::write_all(&mut file, b"probe").map_err(|error| {
+            VerifyOutputError::Unwritable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }
         })?;
+        drop(file);
         fs::remove_file(&probe).map_err(|error| VerifyOutputError::Unwritable {
             path: path.to_path_buf(),
             reason: error.to_string(),
@@ -877,6 +957,17 @@ pub const PARENT_WATCHDOG: Duration = Duration::from_secs(
 /// generous enough that booting the real game, loading its assets, and taking
 /// the healthy capture can never be mistaken for the stall it is testing.
 pub const STALL_WATCHDOG: Duration = Duration::from_secs(20);
+
+/// The short readback budget [`VerificationFault::DropCapture`] runs with.
+///
+/// Another test instrument. The drop fixture refuses to record any readback,
+/// so the run can only end by waiting the budget out; the failure it proves —
+/// a lost callback named with its frame, stage, and artifact state — is
+/// identical at any budget, and the production [`CAPTURE_TIMEOUT`] would spend
+/// ten seconds of every gate run idling to re-measure a constant. It is still
+/// far longer than a healthy readback of the first frame takes, so a real
+/// callback can never be mistaken for the loss it is testing.
+pub const DROP_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many frames one non-capture stage may take before it is declared stuck.
 pub const STAGE_FRAME_BUDGET: u64 = 4_000;
@@ -1465,6 +1556,9 @@ pub struct VerificationRun {
     held: BTreeSet<KeyCode>,
     release_next: Vec<KeyCode>,
     pending: Option<PendingCapture>,
+    /// The facts measured for the outstanding capture, held back until that
+    /// readback lands at the contracted size.
+    staged_facts: Option<(FrameName, FrameFacts)>,
     capture_index: usize,
     probe_index: usize,
     resize_frame: Option<u64>,
@@ -1492,6 +1586,7 @@ impl VerificationRun {
             held: BTreeSet::new(),
             release_next: Vec::new(),
             pending: None,
+            staged_facts: None,
             capture_index: 0,
             probe_index: 0,
             resize_frame: None,
@@ -1528,6 +1623,18 @@ impl VerificationRun {
     #[must_use]
     pub const fn with_watchdog(mut self, watchdog: Duration) -> Self {
         self.watchdog = watchdog;
+        self
+    }
+
+    /// The same run with a different readback budget.
+    ///
+    /// This is a test override and production never calls it: the only caller
+    /// is the injected [`VerificationFault::DropCapture`], which proves the
+    /// lost-callback failure in seconds instead of re-measuring
+    /// [`CAPTURE_TIMEOUT`] in full.
+    #[must_use]
+    pub const fn with_capture_timeout(mut self, timeout: Duration) -> Self {
+        self.capture_timeout = timeout;
         self
     }
 
@@ -1856,14 +1963,7 @@ fn drive_verification(world: &mut World) {
         return;
     };
 
-    for key in std::mem::take(&mut run.release_next) {
-        write_key(world, window, key, ButtonState::Released);
-        run.observations.keys.push(KeyFacts {
-            stage: run.machine.stage().name().to_owned(),
-            key: key_name(key),
-            state: "released".to_owned(),
-        });
-    }
+    release_tapped_keys(&mut run, world, window);
 
     if watchdog_expired(&run) {
         let stage = run.machine.stage().name();
@@ -2072,6 +2172,26 @@ fn tap_key(run: &mut VerificationRun, world: &mut World, window: Entity, key: Ke
     run.release_next.push(key);
 }
 
+/// Releases every key [`tap_key`] pressed on the previous driver frame.
+///
+/// A tap is one real press followed by one real release a frame later, and
+/// both halves are recorded, because the recorded key sequence is the evidence
+/// that the journey was driven by the game's own input path. This runs at the
+/// top of every driver frame, before any stage looks at the world, so
+/// `release_next` is always empty by the time a stage decides what to press
+/// next — which is why no stage guards on it.
+fn release_tapped_keys(run: &mut VerificationRun, world: &mut World, window: Entity) {
+    let stage = run.machine.stage().name().to_owned();
+    for key in std::mem::take(&mut run.release_next) {
+        write_key(world, window, key, ButtonState::Released);
+        run.observations.keys.push(KeyFacts {
+            stage: stage.clone(),
+            key: key_name(key),
+            state: "released".to_owned(),
+        });
+    }
+}
+
 /// The arrow keys that walk towards `target` through the live camera basis.
 ///
 /// This is the real screen-relative control path: the world direction is
@@ -2097,7 +2217,7 @@ fn arrows_towards(basis: &ViewBasis, from: Vec2, target: Vec2, tolerance: f32) -
 /// Requests one capture, or reports whether the outstanding one has landed.
 ///
 /// A capture costs the journey no simulated time at all. The request frame
-/// records the frame's facts, spawns the real screenshot observer, and stops
+/// measures the frame's facts, spawns the real screenshot observer, and stops
 /// the clock; the readback is then waited out on the condition that actually
 /// matters — the observer's own record plus a complete file on disk — for as
 /// many zero-time render pumps as the GPU needs. That is what makes the
@@ -2105,6 +2225,13 @@ fn arrows_towards(basis: &ViewBasis, from: Vec2, target: Vec2, tolerance: f32) -
 /// machine, and it never becomes simulated time. A callback that has not
 /// arrived inside [`CAPTURE_TIMEOUT`] of wall clock really is lost, and is a
 /// hard failure that names what it was waiting for.
+///
+/// The measured facts are *staged*, not reported, until the readback lands at
+/// the contracted size. A frame's facts are evidence about a captured frame,
+/// and a run that failed because the callback never arrived has no captured
+/// frame to describe: reporting the facts anyway would put a full record of a
+/// photograph nobody ever took into the failure evidence. A successful run
+/// lands all fourteen, so the canonical report of a passing run is unchanged.
 fn capture(
     world: &mut World,
     run: &mut VerificationRun,
@@ -2114,23 +2241,52 @@ fn capture(
     match run.pending {
         None => {
             let facts = frame_facts(world, run, state, frame)?;
-            run.observations
-                .frames
-                .insert(frame.file_name().to_owned(), facts);
+            run.staged_facts = Some((frame, facts));
             request_capture(world, run, frame);
             set_simulated_step(world, Duration::ZERO);
             Ok(false)
         }
         Some(pending) => {
-            debug_assert_eq!(
-                pending.frame, frame,
-                "a stage only ever waits on the capture it requested"
-            );
+            // A checked failure, not a `debug_assert`: the release binary is
+            // the one CI runs, and a stage waiting on somebody else's readback
+            // would otherwise file the wrong frame's facts in silence.
+            if pending.frame != frame {
+                return Err(format!(
+                    "stage {} waited on {} while {} was still outstanding",
+                    run.machine.stage().name(),
+                    frame.file_name(),
+                    pending.frame.file_name()
+                ));
+            }
             if !poll_capture(world, run)? {
                 return Ok(false);
             }
-            run.pending = None;
-            Ok(true)
+            // The readback landed, and the facts that describe it must be the
+            // facts this stage measured for this frame. Neither branch below
+            // may report success: a landed capture with nothing staged would
+            // publish a frame the report says nothing about, and a landed
+            // capture holding somebody else's facts would publish a frame
+            // described by the wrong photograph. Both leave `pending` exactly
+            // as it was, so nothing advances on a failure.
+            match run.staged_facts.take() {
+                Some((staged, facts)) if staged == frame => {
+                    run.observations
+                        .frames
+                        .insert(frame.file_name().to_owned(), facts);
+                    run.pending = None;
+                    Ok(true)
+                }
+                Some((staged, _)) => Err(format!(
+                    "{} landed, but the staged facts belong to {}",
+                    frame.file_name(),
+                    staged.file_name()
+                )),
+                None => Err(format!(
+                    "{} landed with no staged facts; the stage never measured the frame it \
+                     photographed",
+                    frame.file_name()
+                )),
+            }
         }
     }
 }
@@ -2266,13 +2422,17 @@ fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, St
 
 /// The pixel size a PNG declares, read from its header alone.
 ///
-/// This is deliberately a header read rather than a decode: it runs once per
-/// capture on the critical path, and the only question is whether the surface
-/// the window server handed back is the one the contract names.
+/// This really is a header read, not a decode and not a whole-file load: it
+/// runs once per capture on the critical path, the frames are megabytes, and
+/// the only question is whether the surface the window server handed back is
+/// the one the contract names. Twenty-four bytes carry the signature, the
+/// `IHDR` chunk name, and both dimensions, so twenty-four bytes are read.
 fn png_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    let header = fs::read(path).ok()?;
-    let header = header.get(..24)?;
+    let mut header = [0u8; 24];
+    fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
     if header[..8] != SIGNATURE || &header[12..16] != b"IHDR" {
         return None;
     }
@@ -3066,7 +3226,7 @@ fn step_stage(
                 return advance(run);
             };
             if state.orbit.heading() != heading || !state.orbit.is_settled() {
-                if state.orbit.is_settled() && run.release_next.is_empty() {
+                if state.orbit.is_settled() {
                     tap_key(run, world, window, KeyCode::KeyE);
                 }
                 return Ok(());
@@ -3198,6 +3358,10 @@ fn journey_target(state: &Snapshot) -> Result<Vec2, String> {
 }
 
 /// Presses the real `E` key until the orbit settles on `heading`.
+///
+/// A settled orbit is the whole guard: the tween starts on the frame the game
+/// consumes the press, so the next driver frame already reads unsettled and
+/// cannot tap again.
 fn orbit_to(
     run: &mut VerificationRun,
     world: &mut World,
@@ -3208,7 +3372,7 @@ fn orbit_to(
     if state.orbit.heading() == heading && state.orbit.is_settled() {
         return advance(run);
     }
-    if state.orbit.heading() != heading && state.orbit.is_settled() && run.release_next.is_empty() {
+    if state.orbit.heading() != heading && state.orbit.is_settled() {
         tap_key(run, world, window, KeyCode::KeyE);
     }
     Ok(())
@@ -3449,17 +3613,23 @@ impl VerificationPlugin {
     /// The live run this plugin drives.
     ///
     /// A production run — no fault on the command line — gets the derived
-    /// [`APP_WATCHDOG`]. An injected fault may name a shorter active-work
-    /// watchdog so its fixture can be waited out in seconds; that override is
-    /// the fault's own, and there is no way to reach it without asking for the
-    /// fault.
+    /// [`APP_WATCHDOG`] and [`CAPTURE_TIMEOUT`]. An injected fault may name a
+    /// shorter budget of either kind so its fixture can be waited out in
+    /// seconds; those overrides are the fault's own, and there is no way to
+    /// reach one without asking for the fault.
     fn run(&self) -> VerificationRun {
-        let run = VerificationRun::new(self.output.clone(), self.fault)
+        let mut run = VerificationRun::new(self.output.clone(), self.fault)
             .with_capture_delay(self.capture_delay);
-        match self.fault.and_then(VerificationFault::watchdog_override) {
-            Some(watchdog) => run.with_watchdog(watchdog),
-            None => run,
+        if let Some(watchdog) = self.fault.and_then(VerificationFault::watchdog_override) {
+            run = run.with_watchdog(watchdog);
         }
+        if let Some(timeout) = self
+            .fault
+            .and_then(VerificationFault::capture_timeout_override)
+        {
+            run = run.with_capture_timeout(timeout);
+        }
+        run
     }
 }
 
@@ -3551,6 +3721,24 @@ impl VerificationFault {
         match self {
             Self::Stall => Some(STALL_WATCHDOG),
             Self::DropCapture | Self::Hang => None,
+        }
+    }
+
+    /// The readback budget this fault runs with instead of
+    /// [`CAPTURE_TIMEOUT`], when it needs a different one.
+    ///
+    /// Only [`Self::DropCapture`] does. That fixture never records a readback
+    /// at all, so the *only* way it can end is by waiting out the budget — and
+    /// what it proves is that a lost callback fails the run naming its frame,
+    /// stage, and artifact, which is the same proof at one second as at ten.
+    /// Charging every gate run ten seconds of deliberate idling to re-measure
+    /// a constant buys nothing. Nothing selects a fault unless it is asked for
+    /// on the command line, so a production run always gets
+    /// [`CAPTURE_TIMEOUT`].
+    pub const fn capture_timeout_override(self) -> Option<Duration> {
+        match self {
+            Self::DropCapture => Some(DROP_CAPTURE_TIMEOUT),
+            Self::Stall | Self::Hang => None,
         }
     }
 
@@ -3722,6 +3910,17 @@ pub fn parse_verification_args(
     }
     if request.capture_delay.is_some() && request.output.is_none() {
         return Err(format!("{DELAY} only applies to a {OUTPUT} run"));
+    }
+    // The delay holds a readback open for further pumps *after the observer
+    // recorded it*, and `drop-capture` is defined as never recording one. The
+    // combination therefore asks for a delay that can never be applied, and
+    // silently produces an ordinary lost-callback run under a name that
+    // suggests something else was measured.
+    if request.capture_delay.is_some() && request.fault == Some(VerificationFault::DropCapture) {
+        return Err(format!(
+            "{DELAY} needs a recorded readback, and {FAULT} {} never records one",
+            VerificationFault::DropCapture.name()
+        ));
     }
     if request.flood.is_some()
         && (request.output.is_some() || request.fault.is_some() || request.capture_delay.is_some())
@@ -4422,7 +4621,28 @@ fn evaluate_equipment(
         if !category.requires_every_prop() {
             continue;
         }
-        for prop in measurable {
+        // Every prop of this family carries its own evidence, so the loop runs
+        // over everything that projects into the viewport rather than over
+        // whatever happened to be measurable. An empty region set is not proof
+        // that a prop is out of shot — `on_screen` is the projection's own
+        // answer to that — so a prop that is in shot and measured nothing is a
+        // failure in its own right, not a prop to quietly skip. Skipping it is
+        // exactly how a rack row that stopped projecting a usable region would
+        // have vanished from the contract while every other row kept it green.
+        for prop in on_screen {
+            if prop.measured.is_empty() {
+                failures.push(failure(
+                    name,
+                    &format!("equipment-{}-unmeasured", prop.facts.id),
+                    0.0,
+                    format!(
+                        "{} projects into the viewport, so it must keep at least one region of \
+                         {EQUIPMENT_REGION_MIN_PIXELS} pixels to be judged on",
+                        prop.facts.id
+                    ),
+                ));
+                continue;
+            }
             if prop.qualifies() {
                 continue;
             }
@@ -5023,14 +5243,78 @@ mod tests {
         operations::{RackEntry, TicketId},
     };
 
-    /// A scratch output directory nothing in these tests ever writes into.
-    fn scratch_output() -> VerifyOutput {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("midcreek-stage-{}-{unique}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        VerifyOutput::prepare(&path).expect("the scratch directory must prepare")
+    /// A scratch output directory, removed when the test that owns it ends.
+    ///
+    /// The unit tests prepare real directories because [`VerifyOutput`] is the
+    /// only way to name an artifact path, and a few of them write real PNGs
+    /// into one. Holding the guard for the length of the test is what stops
+    /// the suite scattering directories through the system temp directory,
+    /// one per run, forever.
+    ///
+    /// Both ends of that fail closed. A stale directory that cannot be cleared
+    /// means the fixture is about to run against somebody else's leftovers, and
+    /// a scratch directory that cannot be removed means the leak this guard
+    /// exists to prevent has happened anyway; a discarded `Result` would report
+    /// neither.
+    struct Scratch {
+        output: VerifyOutput,
+    }
+
+    /// Removes `path` and everything under it, treating "it was not there" as
+    /// success and every other failure as a failure.
+    ///
+    /// This is split out so the distinction is testable: the whole point is
+    /// that `NotFound` is the one error a pre-clean may swallow.
+    fn clear_scratch(path: &Path) -> io::Result<()> {
+        match fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("midcreek-stage-{}-{unique}", std::process::id()));
+            clear_scratch(&path).unwrap_or_else(|error| {
+                panic!(
+                    "a stale scratch directory {} could not be cleared, so this fixture would \
+                     have run against somebody else's leftovers: {error}",
+                    path.display()
+                )
+            });
+            Self {
+                output: VerifyOutput::prepare(&path).expect("the scratch directory must prepare"),
+            }
+        }
+
+        fn output(&self) -> VerifyOutput {
+            self.output.clone()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let root = self.output.root();
+            let Err(error) = clear_scratch(root) else {
+                return;
+            };
+            // Panicking inside a `drop` that is already unwinding aborts the
+            // process and would bury the real failure, so the teardown failure
+            // is reported the only other way it can be.
+            assert!(
+                std::thread::panicking(),
+                "the scratch directory {} could not be removed: {error}",
+                root.display()
+            );
+            eprintln!(
+                "the scratch directory {} could not be removed while unwinding: {error}",
+                root.display()
+            );
+        }
     }
 
     /// The two racks the journey reasons about, laid out like the real hall.
@@ -5123,15 +5407,17 @@ mod tests {
         world
     }
 
-    /// A run parked on the stage that captures [`CAPTURE_TEST_FRAME`].
-    fn capture_run() -> VerificationRun {
-        let mut run = VerificationRun::new(scratch_output(), None);
+    /// A run parked on the stage that captures [`CAPTURE_TEST_FRAME`], with
+    /// the scratch directory guard the caller has to keep alive.
+    fn capture_run() -> (Scratch, VerificationRun) {
+        let scratch = Scratch::new();
+        let mut run = VerificationRun::new(scratch.output(), None);
         while run.stage() != VerificationStage::LowResolutionCapture {
             run.machine
                 .advance()
                 .expect("the documented order reaches low-resolution-capture");
         }
-        run
+        (scratch, run)
     }
 
     /// A snapshot a capture stage is happy to photograph.
@@ -5180,7 +5466,7 @@ mod tests {
     #[test]
     fn a_capture_completes_when_the_callback_lands_long_after_the_old_frame_budget() {
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
 
         run.frame += 1;
@@ -5221,7 +5507,7 @@ mod tests {
     #[test]
     fn a_pending_capture_freezes_the_clock_and_the_landing_restores_the_fixed_step() {
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
 
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
@@ -5257,7 +5543,7 @@ mod tests {
     #[test]
     fn zero_time_pumps_leave_every_recorded_journey_fact_untouched() {
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
 
         run.frame = 617;
@@ -5308,7 +5594,7 @@ mod tests {
     #[test]
     fn a_lost_callback_names_its_frame_stage_and_artifact_state() {
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
         run.capture_timeout = Duration::ZERO;
 
@@ -5341,7 +5627,8 @@ mod tests {
     fn an_injected_readback_delay_holds_the_capture_open_for_exactly_its_pumps() {
         const DELAY: u64 = 7;
         let mut world = capture_world();
-        let mut run = capture_run().with_capture_delay(DELAY);
+        let (_scratch, run) = capture_run();
+        let mut run = run.with_capture_delay(DELAY);
         let state = capture_snapshot();
 
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
@@ -5368,7 +5655,7 @@ mod tests {
     #[test]
     fn a_capture_that_comes_back_the_wrong_size_fails_naming_both_sizes() {
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
         let (width, height) = CAPTURE_TEST_FRAME.size();
 
@@ -5390,29 +5677,244 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Frame facts follow the frame
+    // -----------------------------------------------------------------------
+
+    /// A failed run may not describe a photograph nobody took.
+    ///
+    /// The facts of a capture are measured on the request frame, long before
+    /// the readback resolves. Reporting them there put a complete record of a
+    /// frame — its worker crop, its HUD rectangles, its equipment projections
+    /// — into the evidence of a run that never got that frame back.
+    #[test]
+    fn a_frame_that_never_landed_contributes_no_facts_to_the_report() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        assert!(
+            run.observations.frames.is_empty(),
+            "a requested capture reports nothing until it lands"
+        );
+        assert!(
+            run.staged_facts
+                .as_ref()
+                .is_some_and(|(frame, _)| *frame == CAPTURE_TEST_FRAME),
+            "the measured facts are staged against the frame they belong to"
+        );
+
+        backdate(&mut run, CAPTURE_TIMEOUT + Duration::from_secs(1));
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a readback past its budget is lost");
+        assert!(
+            run.observations.frames.is_empty(),
+            "a lost callback's frame must not appear in the report: {:?}",
+            run.observations.frames.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The other half: a readback that really lands files its facts under its
+    /// own name, so a passing run's report is exactly what it always was.
+    #[test]
+    fn a_landed_frame_files_its_facts_under_its_own_name() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        let _ = take_capture_lasting(&mut world, &mut run, &state, Duration::from_secs(1));
+        assert_eq!(
+            run.observations.frames.keys().collect::<Vec<_>>(),
+            vec![CAPTURE_TEST_FRAME.file_name()],
+            "a landed readback reports exactly its own frame"
+        );
+        assert!(
+            run.staged_facts.is_none(),
+            "the staging slot is emptied by the frame that claimed it"
+        );
+    }
+
+    /// Waiting on somebody else's readback is a checked failure in the binary
+    /// CI actually runs, not a debug assertion that evaporates in release.
+    #[test]
+    fn a_stage_that_waits_on_another_frames_readback_fails_naming_both() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        let other = FrameName::HealthyCenterNorthEast;
+        assert_ne!(other, CAPTURE_TEST_FRAME);
+
+        let reason = capture(&mut world, &mut run, &state, other)
+            .expect_err("a stage may only wait on the capture it asked for");
+        assert!(
+            reason.contains(other.file_name()) && reason.contains(CAPTURE_TEST_FRAME.file_name()),
+            "the failure must name what was waited on and what was outstanding: {reason}"
+        );
+    }
+
+    /// The staging slot and the outstanding capture have to agree, and a
+    /// landed readback with nothing staged is not a success.
+    #[test]
+    fn a_landed_capture_with_no_staged_facts_fails_and_leaves_the_capture_outstanding() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        run.staged_facts = None;
+
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("a landed frame nobody measured cannot be reported");
+        assert!(
+            reason.contains(CAPTURE_TEST_FRAME.file_name()) && reason.contains("no staged facts"),
+            "the failure must name the frame it could not describe: {reason}"
+        );
+        assert!(
+            run.observations.frames.is_empty(),
+            "nothing may be reported for a frame with no measured facts"
+        );
+        assert!(
+            run.pending.is_some(),
+            "a failure must not clear the capture as though it had succeeded"
+        );
+    }
+
+    /// The same, for facts staged against a different frame.
+    #[test]
+    fn a_landed_capture_holding_another_frames_facts_fails_without_reporting_either() {
+        let mut world = capture_world();
+        let (_scratch, mut run) = capture_run();
+        let state = capture_snapshot();
+
+        capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
+        land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
+        let other = FrameName::HealthyCenterNorthEast;
+        assert_ne!(other, CAPTURE_TEST_FRAME);
+        let (_, facts) = run
+            .staged_facts
+            .take()
+            .expect("the request staged this frame's facts");
+        run.staged_facts = Some((other, facts));
+
+        let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
+            .expect_err("one frame's photograph may not be described by another's facts");
+        assert!(
+            reason.contains(CAPTURE_TEST_FRAME.file_name()) && reason.contains(other.file_name()),
+            "the failure must name both frames: {reason}"
+        );
+        assert!(
+            run.observations.frames.is_empty(),
+            "neither frame may be reported"
+        );
+        assert!(
+            run.pending.is_some(),
+            "a failure must not clear the capture as though it had succeeded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scratch hygiene
+    // -----------------------------------------------------------------------
+
+    /// The scratch pre-clean swallows exactly one error and no others: a
+    /// directory that was never there is nothing to clear, and anything else
+    /// means the fixture is about to run on top of somebody else's state.
+    #[test]
+    fn clearing_scratch_forgives_a_missing_directory_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!(
+            "midcreek-scratch-clear-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        clear_scratch(&root).expect("a directory that was never there is already clear");
+
+        fs::create_dir_all(root.join("nested")).expect("the test owns this directory");
+        fs::write(root.join("nested/frame.png"), b"x").expect("the test owns this file");
+        clear_scratch(&root).expect("a real scratch tree clears");
+        assert!(!root.exists());
+
+        // A path whose parent is a regular file cannot be a directory, and the
+        // operating system says so with something other than `NotFound`.
+        let blocker = root.with_extension("file");
+        let _ = fs::remove_file(&blocker);
+        fs::write(&blocker, b"not a directory").expect("the test owns this file");
+        let error = clear_scratch(&blocker.join("under-a-file"))
+            .expect_err("a path under a regular file is not a clearable directory");
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "this fixture only proves anything if the error is not the forgiven one: {error}"
+        );
+        fs::remove_file(&blocker).expect("the test owns this file");
+    }
+
+    /// The guard really does remove what it made, so the fail-closed teardown
+    /// is not firing on every test.
+    #[test]
+    fn a_scratch_guard_removes_its_own_directory() {
+        let root = {
+            let scratch = Scratch::new();
+            let root = scratch.output.root().to_path_buf();
+            assert!(root.is_dir(), "the guard prepared a real directory");
+            root
+        };
+        assert!(
+            !root.exists(),
+            "the guard must remove {} when it drops",
+            root.display()
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // The active-work watchdog
     // -----------------------------------------------------------------------
 
-    /// Requests one capture, holds the readback open for `wait` of wall clock,
-    /// and lands it, exactly as a slow renderer does.
+    /// Ages both clocks by `wait`, exactly as a real readback of that length
+    /// does: the run gets `wait` older, and every second of it belongs to the
+    /// outstanding readback.
     ///
-    /// The wait is applied by backdating rather than by sleeping: the quantity
-    /// under test is a wall-clock duration, and a test that really slept the
-    /// fourteen readbacks of a CI run would take minutes. Both clocks are
-    /// backdated together, because that is what a real wait does — the run
-    /// gets `wait` older, and every second of it belongs to this readback.
+    /// Backdating rather than sleeping is the whole point. The quantity under
+    /// test is a wall-clock duration, and a test that really slept the
+    /// fourteen readbacks of a CI run would take minutes.
+    fn backdate(run: &mut VerificationRun, wait: Duration) {
+        run.started -= wait;
+        run.pending
+            .as_mut()
+            .expect("a capture is outstanding")
+            .requested_at = Instant::now() - wait;
+    }
+
+    /// Requests one capture, holds the readback open for `wait` of wall clock,
+    /// lands it, and returns the fixture's own observation overhead.
+    ///
+    /// That returned duration is what makes the banking assertions exact
+    /// instead of approximate. Banking records `requested_at.elapsed()`, so
+    /// the banked amount is `wait` plus however long this fixture took to get
+    /// from backdating to the bank — which is bounded above by the elapsed
+    /// time of a window that opens strictly before the backdate and closes
+    /// strictly after the bank. The PNG is written *before* the clock is
+    /// backdated, so an encode that takes a fifth of a second is not mistaken
+    /// for readback wait.
+    #[must_use]
     fn take_capture_lasting(
         world: &mut World,
         run: &mut VerificationRun,
         state: &Snapshot,
         wait: Duration,
-    ) {
-        request_capture_waiting(world, run, state, wait);
+    ) -> Duration {
+        capture(world, run, state, CAPTURE_TEST_FRAME).expect("the request succeeds");
         land_capture(world, run, CAPTURE_TEST_FRAME);
+        let observing = Instant::now();
+        backdate(run, wait);
         assert!(
             capture(world, run, state, CAPTURE_TEST_FRAME).expect("the landed readback completes"),
             "a landed readback inside the capture timeout completes the capture"
         );
+        observing.elapsed()
     }
 
     /// The first half of [`take_capture_lasting`]: a capture requested `wait`
@@ -5424,11 +5926,7 @@ mod tests {
         wait: Duration,
     ) {
         capture(world, run, state, CAPTURE_TEST_FRAME).expect("the request succeeds");
-        run.started -= wait;
-        run.pending
-            .as_mut()
-            .expect("the request left a capture outstanding")
-            .requested_at = Instant::now() - wait;
+        backdate(run, wait);
     }
 
     /// The regression this whole watchdog rework exists for.
@@ -5447,7 +5945,7 @@ mod tests {
         const WAIT: Duration = Duration::from_secs(9);
 
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
         let waited = WAIT * CAPTURES;
         assert!(
@@ -5456,7 +5954,7 @@ mod tests {
         );
 
         for _ in 0..CAPTURES {
-            take_capture_lasting(&mut world, &mut run, &state, WAIT);
+            let _ = take_capture_lasting(&mut world, &mut run, &state, WAIT);
         }
         assert!(
             run.started.elapsed() > APP_WATCHDOG,
@@ -5488,7 +5986,7 @@ mod tests {
     /// no capture outstanding is the stuck run it exists to name.
     #[test]
     fn active_time_past_the_watchdog_still_expires_it() {
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         assert!(!watchdog_expired(&run), "a fresh run has not expired");
 
         run.started = Instant::now() - (APP_WATCHDOG + Duration::from_secs(1));
@@ -5502,20 +6000,21 @@ mod tests {
         );
     }
 
-    /// How far a banked wall-clock duration may miss the duration it is
-    /// banking. Everything under test here is measured from a real `Instant`,
-    /// so the only honest assertion is "the elapsed wait, plus the handful of
-    /// microseconds it took to observe it".
-    const BANK_SLACK: Duration = Duration::from_millis(250);
-
     /// The exclusion has to be the capture's *own* wall duration: bank less
     /// and a slow renderer still creeps towards expiry, bank more and the
     /// watchdog stops measuring anything at all.
+    ///
+    /// The bound is measured, not guessed. Banking records the readback's
+    /// `requested_at.elapsed()`, so the banked total can only exceed the
+    /// simulated wait by the time this test itself spent between backdating
+    /// the clock and observing the bank — which is exactly what the fixture
+    /// hands back. A fixed slack constant here is what made this assertion
+    /// fail on a machine whose PNG encoder took two hundred milliseconds.
     #[test]
     fn a_completed_capture_banks_exactly_its_own_wall_duration() {
         const WAIT: Duration = Duration::from_secs(6);
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
 
         assert_eq!(
@@ -5523,16 +6022,17 @@ mod tests {
             Duration::ZERO,
             "a run that has taken no captures has excluded nothing"
         );
-        take_capture_lasting(&mut world, &mut run, &state, WAIT);
+        let first = take_capture_lasting(&mut world, &mut run, &state, WAIT);
         assert!(
-            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
-            "one {WAIT:?} readback must bank {WAIT:?}, banked {:?}",
+            (WAIT..=WAIT + first).contains(&run.capture_excluded),
+            "one {WAIT:?} readback must bank {WAIT:?} and no more than the {first:?} this test \
+             took to look, banked {:?}",
             run.capture_excluded
         );
 
-        take_capture_lasting(&mut world, &mut run, &state, WAIT);
+        let second = take_capture_lasting(&mut world, &mut run, &state, WAIT);
         assert!(
-            (WAIT * 2..WAIT * 2 + BANK_SLACK).contains(&run.capture_excluded),
+            (WAIT * 2..=WAIT * 2 + first + second).contains(&run.capture_excluded),
             "a second {WAIT:?} readback accumulates onto the first, banked {:?}",
             run.capture_excluded
         );
@@ -5541,29 +6041,34 @@ mod tests {
     /// A wait is excluded continuously from request to resolution, and exactly
     /// once: the live subtraction while the capture is outstanding must not
     /// survive the banking, or the run would be credited twice for one wait.
+    ///
+    /// Every bound here is measured rather than guessed. The run's clock is
+    /// restarted so that the only active work it can possibly have done is
+    /// this test's own, and each ceiling is read strictly after the quantity
+    /// it bounds.
     #[test]
     fn an_outstanding_wait_is_excluded_live_and_banked_once() {
         const WAIT: Duration = Duration::from_secs(6);
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
 
-        run.started = Instant::now() - WAIT;
+        let setup = Instant::now();
+        run.started = Instant::now();
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
-        run.pending
-            .as_mut()
-            .expect("a capture is outstanding")
-            .requested_at = Instant::now() - WAIT;
+        let waiting = Instant::now();
+        backdate(&mut run, WAIT);
+        let live = run.active_elapsed();
+        let setup_cost = setup.elapsed();
         assert_eq!(
             run.capture_excluded,
             Duration::ZERO,
             "an outstanding wait is subtracted live, not banked early"
         );
         assert!(
-            run.active_elapsed() < BANK_SLACK,
-            "a run that has only ever waited on this capture has done no active work, \
-             it measured {:?}",
-            run.active_elapsed()
+            live <= setup_cost,
+            "a run that has only ever waited on this capture has done no active work beyond the \
+             {setup_cost:?} this test spent setting it up, it measured {live:?}"
         );
 
         land_capture(&mut world, &run, CAPTURE_TEST_FRAME);
@@ -5571,15 +6076,16 @@ mod tests {
             capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the readback landed"),
             "the landed readback completes the capture"
         );
+        let banked = run.capture_excluded;
+        let settled = run.active_elapsed();
+        let waited = waiting.elapsed();
         assert!(
-            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
-            "the resolved wait is banked once, banked {:?}",
-            run.capture_excluded
+            (WAIT..=WAIT + waited).contains(&banked),
+            "the resolved wait is banked once, banked {banked:?}"
         );
         assert!(
-            run.active_elapsed() < BANK_SLACK,
-            "banking must replace the live subtraction, not double it: {:?}",
-            run.active_elapsed()
+            settled <= setup_cost + waited,
+            "banking must replace the live subtraction, not double it: {settled:?}"
         );
     }
 
@@ -5591,18 +6097,17 @@ mod tests {
     fn a_timed_out_capture_restores_the_clock_and_banks_its_wait() {
         const WAIT: Duration = Duration::from_secs(11);
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
 
         run.started = Instant::now() - WAIT;
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
-        run.pending
-            .as_mut()
-            .expect("a capture is outstanding")
-            .requested_at = Instant::now() - WAIT;
+        let observing = Instant::now();
+        backdate(&mut run, WAIT);
 
         let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
             .expect_err("a readback past its wall-clock budget is lost");
+        let overhead = observing.elapsed();
         assert!(
             reason.contains("screenshot callback"),
             "the lost readback names itself: {reason}"
@@ -5613,7 +6118,7 @@ mod tests {
             "a failed capture still hands the clock back"
         );
         assert!(
-            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
+            (WAIT..=WAIT + overhead).contains(&run.capture_excluded),
             "a lost readback's wait is still the capture timeout's, banked {:?}",
             run.capture_excluded
         );
@@ -5626,6 +6131,10 @@ mod tests {
                 .is_some_and(|pending| pending.charged && !pending.completed),
             "the lost capture stays outstanding, and its wait stays banked exactly once"
         );
+        assert!(
+            run.staged_facts.is_some(),
+            "the lost frame's facts stay staged, so they never reach the report"
+        );
     }
 
     /// A frame that comes back at the wrong size resolves the capture too, so
@@ -5634,62 +6143,89 @@ mod tests {
     fn a_rejected_capture_banks_its_wait_before_it_fails() {
         const WAIT: Duration = Duration::from_secs(4);
         let mut world = capture_world();
-        let mut run = capture_run();
+        let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
         let (width, height) = CAPTURE_TEST_FRAME.size();
 
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
-        run.pending
-            .as_mut()
-            .expect("a capture is outstanding")
-            .requested_at = Instant::now() - WAIT;
         land_capture_sized(
             &mut world,
             &run,
             CAPTURE_TEST_FRAME,
             (width / 2, height / 2),
         );
+        let observing = Instant::now();
+        backdate(&mut run, WAIT);
 
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
             .expect_err("a half-resolution surface is not the contracted frame");
+        let overhead = observing.elapsed();
         assert!(
-            (WAIT..WAIT + BANK_SLACK).contains(&run.capture_excluded),
+            (WAIT..=WAIT + overhead).contains(&run.capture_excluded),
             "a refused readback still waited, banked {:?}",
             run.capture_excluded
         );
     }
 
-    /// The stall fixture's short watchdog is an override on the fault, and
-    /// nothing else can reach it: a production run has no fault, so it gets
-    /// the derived budget.
+    /// A fixture's short budgets are overrides on the fault, and nothing else
+    /// can reach them: a production run has no fault, so it gets the derived
+    /// budgets.
     #[test]
-    fn only_the_stall_fault_shortens_the_active_work_watchdog() {
+    fn only_the_injected_faults_shorten_the_production_budgets() {
         assert_eq!(
             VerificationFault::Stall.watchdog_override(),
             Some(STALL_WATCHDOG)
         );
         assert_eq!(VerificationFault::DropCapture.watchdog_override(), None);
         assert_eq!(VerificationFault::Hang.watchdog_override(), None);
+        assert_eq!(
+            VerificationFault::DropCapture.capture_timeout_override(),
+            Some(DROP_CAPTURE_TIMEOUT)
+        );
+        assert_eq!(VerificationFault::Stall.capture_timeout_override(), None);
+        assert_eq!(VerificationFault::Hang.capture_timeout_override(), None);
         assert!(
-            STALL_WATCHDOG < APP_WATCHDOG,
-            "the override exists to be faster than production, not to weaken it"
+            STALL_WATCHDOG < APP_WATCHDOG && DROP_CAPTURE_TIMEOUT < CAPTURE_TIMEOUT,
+            "the overrides exist to be faster than production, not to weaken it"
         );
 
-        let plugin = VerificationPlugin::new(scratch_output(), None, 0);
+        let scratch = Scratch::new();
+        let plugin = VerificationPlugin::new(scratch.output(), None, 0);
+        let production = plugin.run();
         assert_eq!(
-            plugin.run().watchdog,
-            APP_WATCHDOG,
+            production.watchdog, APP_WATCHDOG,
             "a run with no injected fault is a production run"
         );
         assert_eq!(
-            VerificationPlugin::new(scratch_output(), Some(VerificationFault::Stall), 0)
-                .run()
-                .watchdog,
-            STALL_WATCHDOG,
+            production.capture_timeout, CAPTURE_TIMEOUT,
+            "a run with no injected fault gets the production readback budget"
+        );
+
+        let stall =
+            VerificationPlugin::new(scratch.output(), Some(VerificationFault::Stall), 0).run();
+        assert_eq!(
+            stall.watchdog, STALL_WATCHDOG,
             "the stall fixture runs on its own short budget"
         );
         assert_eq!(
-            VerificationPlugin::new(scratch_output(), Some(VerificationFault::Hang), 0)
+            stall.capture_timeout, CAPTURE_TIMEOUT,
+            "the stall fixture has no business shortening the readback budget"
+        );
+
+        let drop =
+            VerificationPlugin::new(scratch.output(), Some(VerificationFault::DropCapture), 0)
+                .run();
+        assert_eq!(
+            drop.capture_timeout, DROP_CAPTURE_TIMEOUT,
+            "the drop fixture waits out its own short readback budget"
+        );
+        assert_eq!(
+            drop.watchdog, APP_WATCHDOG,
+            "the drop fixture has no business shortening the watchdog"
+        );
+
+        assert_eq!(
+            VerificationPlugin::new(scratch.output(), Some(VerificationFault::Hang), 0)
                 .run()
                 .watchdog,
             APP_WATCHDOG,
@@ -5715,23 +6251,29 @@ mod tests {
 
     /// A run parked on [`VerificationStage::BeginRepair`], plus the world and
     /// window the driver writes its real key messages into.
-    fn begin_repair_run() -> (World, Entity, VerificationRun) {
+    fn begin_repair_run() -> (Scratch, World, Entity, VerificationRun) {
         let mut world = World::new();
         world.init_resource::<Messages<KeyboardInput>>();
         world.insert_resource(ViewBasis::default());
         let window = world.spawn_empty().id();
 
-        let mut run = VerificationRun::new(scratch_output(), None);
+        let scratch = Scratch::new();
+        let mut run = VerificationRun::new(scratch.output(), None);
         while run.stage() != VerificationStage::BeginRepair {
             run.machine
                 .advance()
                 .expect("the documented order reaches begin-repair");
         }
-        (world, window, run)
+        (scratch, world, window, run)
     }
 
     /// Runs up to `frames` real driver frames, stopping the moment the stage
     /// hands over, so each test observes exactly one stage's behaviour.
+    ///
+    /// The release of the previous frame's taps goes through the driver's own
+    /// [`release_tapped_keys`], not a copy of it: a helper that wrote the real
+    /// release message but skipped the [`KeyFacts`] record would leave these
+    /// tests looking at a key sequence the shipped driver never produces.
     fn step_frames(
         world: &mut World,
         run: &mut VerificationRun,
@@ -5743,9 +6285,7 @@ mod tests {
         for _ in 0..frames {
             run.frame += 1;
             run.stage_frame += 1;
-            for key in std::mem::take(&mut run.release_next) {
-                write_key(world, window, key, ButtonState::Released);
-            }
+            release_tapped_keys(run, world, window);
             step_stage(world, run, state, window)?;
             if run.stage() != entry {
                 break;
@@ -5758,7 +6298,7 @@ mod tests {
     /// held still off the arrival spot, and a movement key is down.
     #[test]
     fn begin_repair_hands_over_when_a_running_repair_holds_the_technician_off_the_spot() {
-        let (mut world, window, mut run) = begin_repair_run();
+        let (_scratch, mut world, window, mut run) = begin_repair_run();
         let roster = journey_roster();
         let spot = journey_spot(&roster);
         let state = begin_repair_snapshot(
@@ -5791,7 +6331,7 @@ mod tests {
     /// hand-over must still happen, not stall waiting for a lock that is gone.
     #[test]
     fn begin_repair_hands_over_when_the_started_repair_already_released_the_lock() {
-        let (mut world, window, mut run) = begin_repair_run();
+        let (_scratch, mut world, window, mut run) = begin_repair_run();
         let roster = journey_roster();
         let spot = journey_spot(&roster);
         let state = begin_repair_snapshot(
@@ -5809,12 +6349,29 @@ mod tests {
 
         assert_eq!(run.stage(), VerificationStage::RepairCapture);
         assert!(run.held.is_empty(), "still held: {:?}", run.held);
+
+        // The hand-over is not the end of the story the report tells. The
+        // repair capture needs a repair that is still holding the controls,
+        // and this snapshot's lock has already been released, so the very next
+        // frame must fail with that exact reason rather than photograph a hall
+        // with nobody repairing anything. Stopping at the hand-over would
+        // leave that claim untested.
+        let reason = step_stage(&mut world, &mut run, &state, window)
+            .expect_err("a repair capture with no live repair must fail immediately");
+        assert!(
+            reason.contains("no repair holding the controls"),
+            "the repair capture must name what it was missing: {reason}"
+        );
+        assert!(
+            run.pending.is_none() && run.staged_facts.is_none(),
+            "a refused repair capture must not have asked the GPU for anything"
+        );
     }
 
     /// The lock alone is enough, even with no recorded outcome yet.
     #[test]
     fn begin_repair_hands_over_on_the_movement_lock_alone() {
-        let (mut world, window, mut run) = begin_repair_run();
+        let (_scratch, mut world, window, mut run) = begin_repair_run();
         let roster = journey_roster();
         let spot = journey_spot(&roster);
         let state = begin_repair_snapshot(
@@ -5834,7 +6391,7 @@ mod tests {
     /// Navigation is still the behaviour before any repair starts.
     #[test]
     fn begin_repair_still_walks_to_the_spot_before_any_repair_starts() {
-        let (mut world, window, mut run) = begin_repair_run();
+        let (_scratch, mut world, window, mut run) = begin_repair_run();
         let roster = journey_roster();
         let spot = journey_spot(&roster);
         let state = begin_repair_snapshot(
@@ -5864,7 +6421,7 @@ mod tests {
     /// Arriving with no repair started still taps the real repair key.
     #[test]
     fn begin_repair_taps_the_repair_key_once_it_has_arrived() {
-        let (mut world, window, mut run) = begin_repair_run();
+        let (_scratch, mut world, window, mut run) = begin_repair_run();
         let roster = journey_roster();
         let spot = journey_spot(&roster);
         let state = begin_repair_snapshot(
@@ -5896,7 +6453,7 @@ mod tests {
     /// like, so a rare timing failure is diagnosable from the retained report.
     #[test]
     fn a_stage_budget_failure_reports_the_state_that_stalled_it() {
-        let (mut world, window, mut run) = begin_repair_run();
+        let (_scratch, mut world, window, mut run) = begin_repair_run();
         let roster = journey_roster();
         let spot = journey_spot(&roster);
         let state = begin_repair_snapshot(

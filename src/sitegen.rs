@@ -58,6 +58,13 @@ pub const GALLERY_FRAMES: [(&str, &str); 4] = [
 /// The stable label of the crop published beside the character sheet.
 pub const WORKER_FRAME_LABEL: &str = "worker";
 
+/// The one repository every published commit link points into.
+///
+/// Task cards and challenge cards both link commits, from different renderers.
+/// A second copy of this URL is a second thing to rename, so there is exactly
+/// one and both read it.
+pub const REPOSITORY_URL: &str = "https://github.com/ridermw/midcreek-cs-1";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgressDocument {
@@ -401,6 +408,17 @@ pub fn validate_job_result(result: &JobResult) -> Result<(), SitegenError> {
     }
     for gate in &result.gates {
         validate_gate(gate)?;
+    }
+    if result.status == GateStatus::Passed
+        && result
+            .gates
+            .iter()
+            .any(|gate| gate.status != GateStatus::Passed)
+    {
+        return Err(SitegenError::UnsafeResultValue {
+            field: "status".to_owned(),
+            message: "passed job result contains a gate that did not pass".to_owned(),
+        });
     }
     if let Some(evidence) = &result.evidence {
         validate_relative_directory("evidence", evidence)?;
@@ -949,6 +967,11 @@ pub enum ProgressError {
         challenge_id: String,
         field: String,
     },
+    /// A resolved challenge names a commit this repository does not have.
+    UnknownChallengeCommit {
+        challenge_id: String,
+        commit: String,
+    },
     MissingChallengeResolution {
         challenge_id: String,
     },
@@ -992,6 +1015,13 @@ impl fmt::Display for ProgressError {
                 challenge_id,
                 field,
             } => write!(formatter, "challenge {challenge_id} is missing {field}"),
+            Self::UnknownChallengeCommit {
+                challenge_id,
+                commit,
+            } => write!(
+                formatter,
+                "challenge {challenge_id} references unknown commit {commit}"
+            ),
             Self::MissingChallengeResolution { challenge_id } => {
                 write!(
                     formatter,
@@ -1152,6 +1182,21 @@ pub enum SitegenError {
     MissingRetainedHistory {
         targets: Vec<String>,
     },
+    /// The published history names an image outside the directory of the entry
+    /// that declared it.
+    HistoryFrameOutsideEntry {
+        frames: Vec<String>,
+    },
+    /// The current tree carries a partial or inconsistent verification evidence
+    /// set.
+    PartialEvidencePublication {
+        path: PathBuf,
+    },
+    /// No candidate source tree resolves, so nothing can vouch for the output
+    /// directory being outside one.
+    UnknownRepository {
+        candidates: Vec<PathBuf>,
+    },
 }
 
 impl fmt::Display for SitegenError {
@@ -1265,6 +1310,27 @@ impl fmt::Display for SitegenError {
                 targets.len(),
                 targets.join(", ")
             ),
+            Self::HistoryFrameOutsideEntry { frames } => write!(
+                formatter,
+                "the published history names {} image(s) outside the entry that declared them: {}",
+                frames.len(),
+                frames.join(", ")
+            ),
+            Self::PartialEvidencePublication { path } => write!(
+                formatter,
+                "the verification evidence set is partial or inconsistent at {}",
+                path.display()
+            ),
+            Self::UnknownRepository { candidates } => write!(
+                formatter,
+                "no source tree to protect resolves on this machine, so the output \
+                 cannot be proved to be outside one: {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -1377,12 +1443,21 @@ pub fn validate_progress(
             if challenge
                 .resolved_commit
                 .as_deref()
-                .and_then(|commit| resolve_commit_ref(commit, repo))
-                .is_none()
+                .is_none_or(|commit| commit.trim().is_empty())
             {
                 errors.push(ProgressError::MissingChallengeContext {
                     challenge_id: challenge.id.clone(),
                     field: "resolved_commit".to_owned(),
+                });
+            } else if let Some(commit) = challenge.resolved_commit.as_deref()
+                && resolve_commit_ref(commit, repo).is_none()
+            {
+                // A commit nobody can find is a wrong reference to chase, not
+                // an empty field to fill in, and saying "missing" sends the
+                // reader looking for a value that is right there.
+                errors.push(ProgressError::UnknownChallengeCommit {
+                    challenge_id: challenge.id.clone(),
+                    commit: commit.to_owned(),
                 });
             }
         }
@@ -1406,6 +1481,21 @@ pub fn resolve_commit_ref(commit: &str, repo: &RepoFacts) -> Option<String> {
     .then(|| commit.to_owned())
 }
 
+/// Every progress task ID the reviewed implementation plan declares.
+///
+/// The plan declares nothing machine-readable of its own: a task ID is earned
+/// by a heading whose *text* is one of the exact strings
+/// [`task_ids_for_heading`] lists, so this extraction is coupled to the
+/// reviewed plan's heading prose and to nothing else. Rewording a reviewed
+/// heading — even by an article or a comma — silently drops that heading's
+/// task IDs, and every progress task naming one then fails validation with
+/// [`ProgressError::UnknownPlanTask`]. That is deliberate: the plan is
+/// reviewed prose, so a heading may only change together with the table below
+/// and with `docs/progress.json`, and the coupling is proved by
+/// `renaming_a_reviewed_plan_heading_drops_the_task_ids_it_declared`.
+///
+/// Heading level is not part of the key: the same heading text declares the
+/// same IDs at any depth, because the plan's own nesting is editorial.
 pub fn plan_task_ids_from_markdown(markdown: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let mut heading = None;
@@ -1460,6 +1550,227 @@ fn task_ids_for_heading(heading: &str) -> &'static [&'static str] {
         "Task 9: Add CI and publish the reproducible POC baseline" => &["ci-baseline"][..],
         _ => &[],
     }
+}
+
+// ---------------------------------------------------------------------------
+// The generated README status block
+// ---------------------------------------------------------------------------
+
+/// The exact opening delimiter of the one generated README status block.
+pub const README_STATUS_START: &str = "<!-- sitegen:status:start -->";
+
+/// The exact closing delimiter of the one generated README status block.
+pub const README_STATUS_END: &str = "<!-- sitegen:status:end -->";
+
+/// Why a README's generated status block cannot be read, or is no longer the
+/// block the canonical sources generate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadmeStatusError {
+    /// Neither delimiter appears, so there is no generated block to maintain.
+    Missing,
+    /// One delimiter appears without its partner.
+    MissingDelimiter { delimiter: &'static str },
+    /// A delimiter appears more than once, so no single span is the block.
+    DuplicateDelimiter {
+        delimiter: &'static str,
+        count: usize,
+    },
+    /// The closing delimiter precedes the opening one.
+    Inverted,
+    /// The block is well formed but is not what the canonical sources
+    /// generate.
+    Stale { expected: String, actual: String },
+}
+
+impl fmt::Display for ReadmeStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => write!(
+                formatter,
+                "the generated status block is missing: expected one \
+                 {README_STATUS_START} … {README_STATUS_END} pair"
+            ),
+            Self::MissingDelimiter { delimiter } => write!(
+                formatter,
+                "the generated status block is malformed: {delimiter} is absent"
+            ),
+            Self::DuplicateDelimiter { delimiter, count } => write!(
+                formatter,
+                "the generated status block is malformed: {delimiter} appears \
+                 {count} times, and exactly one is allowed"
+            ),
+            Self::Inverted => write!(
+                formatter,
+                "the generated status block is malformed: {README_STATUS_END} \
+                 precedes {README_STATUS_START}"
+            ),
+            Self::Stale { expected, actual } => write!(
+                formatter,
+                "the generated status block is stale; regenerate it with \
+                 `sitegen readme --repository .`\n--- expected\n{expected}\n--- found\n{actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadmeStatusError {}
+
+/// Renders the generated README status block from the canonical sources.
+///
+/// Two independent things go in. The published facts — the current task, the
+/// task and challenge counts, and how many task IDs the reviewed plan declares
+/// — are read from the parsed `progress` document and from `plan_markdown`, so
+/// the block states what the project actually claims. The identity rows are
+/// digests of the stored bytes of those same two files, so a change to either
+/// source that the facts happen not to move — a reworded summary, a new plan
+/// paragraph, reindented JSON — still makes a stored block stale. The result
+/// is a function of its three arguments alone: no clock, no host, no Git.
+pub fn render_readme_status(
+    progress: &ProgressDocument,
+    progress_json: &str,
+    plan_markdown: &str,
+) -> String {
+    let tasks = |status| {
+        progress
+            .tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .count()
+    };
+    let done = tasks(ProgressStatus::Done);
+    let in_progress = tasks(ProgressStatus::InProgress);
+    let future = tasks(ProgressStatus::Future);
+    let open = progress
+        .challenges
+        .iter()
+        .filter(|challenge| challenge.status == ChallengeStatus::Open)
+        .count();
+    let working_now = progress
+        .tasks
+        .iter()
+        .find(|task| task.status == ProgressStatus::InProgress)
+        .map_or_else(
+            || "all planned work complete".to_owned(),
+            |task| format!("`{}` — {}", table_cell(&task.id), table_cell(&task.title)),
+        );
+
+    format!(
+        "{README_STATUS_START}\n\
+         <!-- Generated by `sitegen readme --repository .`; never edit this block by hand. -->\n\
+         \n\
+         | Generated status | Value |\n\
+         | --- | --- |\n\
+         | Working now | {working_now} |\n\
+         | Tasks | {done} done, {in_progress} in progress, {future} future, {total} total |\n\
+         | Challenges | {open} open, {resolved} resolved, {challenges} total |\n\
+         | Reviewed plan tasks | {plan_tasks} |\n\
+         | `docs/progress.json` | sha256 `{progress_digest}` |\n\
+         | `docs/implementation-plan.md` | sha256 `{plan_digest}` |\n\
+         {README_STATUS_END}",
+        total = progress.tasks.len(),
+        resolved = progress.challenges.len() - open,
+        challenges = progress.challenges.len(),
+        plan_tasks = plan_task_ids_from_markdown(plan_markdown).len(),
+        progress_digest = source_digest(progress_json),
+        plan_digest = source_digest(plan_markdown),
+    )
+}
+
+/// How many bytes of one source's SHA-256 the block publishes.
+///
+/// The rows exist to make a stale block detectable, not to authenticate a
+/// source, so a stable prefix is enough to fit on a README line while still
+/// moving for any edit anybody makes.
+const SOURCE_DIGEST_BYTES: usize = 8;
+
+fn source_digest(source: &str) -> String {
+    Sha256::digest(source.as_bytes())
+        .iter()
+        .take(SOURCE_DIGEST_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One published value, contained to the Markdown table cell that holds it.
+///
+/// Task IDs and titles are prose, and prose legitimately carries `|`, which
+/// closes a cell and would publish a column nobody wrote into a block nobody
+/// is allowed to hand-edit. Control characters are collapsed for the same
+/// reason: a newline in a title would end the row.
+fn table_cell(value: &str) -> String {
+    let mut cell = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => cell.push_str("\\\\"),
+            '|' => cell.push_str("\\|"),
+            character if character.is_control() => cell.push(' '),
+            character => cell.push(character),
+        }
+    }
+    cell
+}
+
+/// The one generated status block a README carries, delimiters included.
+pub fn readme_status_block(readme: &str) -> Result<&str, ReadmeStatusError> {
+    let (start, end) = readme_status_span(readme)?;
+    Ok(&readme[start..end])
+}
+
+/// The byte range of the one generated status block, delimiters included.
+///
+/// Exactly one of each delimiter, in the right order, is the only structure
+/// this accepts. A duplicated, unmatched, or inverted delimiter leaves more
+/// than one — or no — plausible span, and every choice among them rewrites
+/// bytes the generator does not own, so the whole README is refused instead.
+fn readme_status_span(readme: &str) -> Result<(usize, usize), ReadmeStatusError> {
+    for (delimiter, count) in [
+        (
+            README_STATUS_START,
+            readme.matches(README_STATUS_START).count(),
+        ),
+        (README_STATUS_END, readme.matches(README_STATUS_END).count()),
+    ] {
+        if count > 1 {
+            return Err(ReadmeStatusError::DuplicateDelimiter { delimiter, count });
+        }
+    }
+
+    match (
+        readme.find(README_STATUS_START),
+        readme.find(README_STATUS_END),
+    ) {
+        (Some(start), Some(end)) if start < end => Ok((start, end + README_STATUS_END.len())),
+        (Some(_), Some(_)) => Err(ReadmeStatusError::Inverted),
+        (Some(_), None) => Err(ReadmeStatusError::MissingDelimiter {
+            delimiter: README_STATUS_END,
+        }),
+        (None, Some(_)) => Err(ReadmeStatusError::MissingDelimiter {
+            delimiter: README_STATUS_START,
+        }),
+        (None, None) => Err(ReadmeStatusError::Missing),
+    }
+}
+
+/// Proves a README carries exactly the block the canonical sources generate.
+pub fn check_readme_status(readme: &str, expected: &str) -> Result<(), ReadmeStatusError> {
+    let actual = readme_status_block(readme)?;
+    if actual == expected {
+        return Ok(());
+    }
+    Err(ReadmeStatusError::Stale {
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    })
+}
+
+/// Replaces the generated block, preserving every byte outside it.
+pub fn replace_readme_status(readme: &str, block: &str) -> Result<String, ReadmeStatusError> {
+    let (start, end) = readme_status_span(readme)?;
+    let mut updated = String::with_capacity(readme.len() - (end - start) + block.len());
+    updated.push_str(&readme[..start]);
+    updated.push_str(block);
+    updated.push_str(&readme[end..]);
+    Ok(updated)
 }
 
 pub fn validate_reference_manifest(
@@ -1854,7 +2165,7 @@ fn collect_metrics(
 }
 
 /// The published bound each published metric has to meet.
-const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
+const METRIC_BOUNDS: [(&str, MetricBound, &str); 8] = [
     (
         "render.frames-captured",
         MetricBound::Exactly(14.0),
@@ -1877,8 +2188,13 @@ const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
     ),
     (
         "browser.palette-classes",
-        MetricBound::AtLeast(3.0),
+        MetricBound::AtLeast(MINIMUM_PALETTE_CLASSES as f64),
         "at least three approved palette classes in the canvas",
+    ),
+    (
+        "browser.ready-seconds",
+        MetricBound::AtMost(BROWSER_READY_LIMIT_SECONDS),
+        "readiness inside the browser gate's own timeout",
     ),
     (
         "browser.canvas-width",
@@ -1892,10 +2208,27 @@ const METRIC_BOUNDS: [(&str, MetricBound, &str); 7] = [
     ),
 ];
 
+/// How many approved palette classes a published canvas has to show.
+///
+/// This is the browser gate's own `MINIMUM_PALETTE_CLASSES`, and
+/// `the_published_browser_bounds_are_the_browser_gates_own_constants` pins it
+/// there. A stricter number here would fail a canvas the gate itself passed
+/// and take the native evidence beside it down with the run.
+pub const MINIMUM_PALETTE_CLASSES: usize = 3;
+
+/// The longest a published browser gate may have waited for readiness.
+///
+/// This is the browser gate's own `READY_TIMEOUT_SECONDS`, pinned by the same
+/// test. A report that records a longer wait than the gate would ever have
+/// allowed did not come from a passing gate, whatever else it says about
+/// itself; a shorter bound here would invent a failure the gate never found.
+pub const BROWSER_READY_LIMIT_SECONDS: f64 = 30.0;
+
 #[derive(Clone, Copy)]
 enum MetricBound {
     Exactly(f64),
     AtLeast(f64),
+    AtMost(f64),
 }
 
 impl MetricBound {
@@ -1903,6 +2236,7 @@ impl MetricBound {
         match self {
             Self::Exactly(expected) => (value - expected).abs() < f64::EPSILON,
             Self::AtLeast(minimum) => value >= minimum,
+            Self::AtMost(maximum) => value <= maximum,
         }
     }
 }
@@ -1957,19 +2291,27 @@ fn derive_gates(
         },
     ];
     if let Some(browser) = browser {
+        // Readiness is a measurement, not the existence of a report: a gate
+        // that waited longer than its own timeout allows never proved the game
+        // was ready, so the row says so instead of turning green because a
+        // document arrived.
+        let ready = MetricBound::AtMost(BROWSER_READY_LIMIT_SECONDS).holds(browser.ready_seconds);
         gates.push(GateSummary {
             name: "Browser readiness".to_owned(),
-            status: GateStatus::Passed,
-            passed: 1,
-            failed: 0,
+            status: status(ready),
+            passed: u32::from(ready),
+            failed: u32::from(!ready),
             duration_ms: (browser.ready_seconds * 1_000.0).round().max(0.0) as u64,
             artifact_url: None,
         });
+        // A failed palette row that reports zero failures says a red gate
+        // found nothing wrong. The one thing it found wrong is the canvas.
+        let palette = browser.palette_classes.len() >= MINIMUM_PALETTE_CLASSES;
         gates.push(GateSummary {
             name: "Browser canvas palette".to_owned(),
-            status: status(browser.palette_classes.len() >= 3),
+            status: status(palette),
             passed: browser.palette_classes.len() as u32,
-            failed: 0,
+            failed: u32::from(!palette),
             duration_ms: 0,
             artifact_url: None,
         });
@@ -1987,6 +2329,15 @@ fn derive_gates(
 /// latest entry, and a rerun of a commit that is already recorded all return
 /// the previous history untouched, so a documentation-only push cannot
 /// duplicate a screenshot and a failure cannot erase one.
+///
+/// Only the *latest* entry's hash suppresses a new point, so a revert to pixels
+/// an older entry already recorded does open one. That is deliberate: the
+/// history is a timeline of what was published when, not a set of distinct
+/// appearances, and a revert really is a later moment at which the project
+/// looked that way. Deduplicating against the whole history instead would make
+/// a revert invisible and leave the timeline claiming the project still looked
+/// like the entry it had moved on to.
+/// `reverting_to_an_older_visual_hash_opens_a_new_history_point` pins it.
 pub fn update_gallery(
     previous: &GalleryManifest,
     summary: &VerificationSummary,
@@ -2048,18 +2399,39 @@ pub fn update_gallery(
 }
 
 pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, SitegenError> {
+    build_site_in(&default_repository(), inputs, output)
+}
+
+/// The repository this generator publishes from when a caller declares none.
+///
+/// A binary still sitting in the checkout it was built from finds that
+/// checkout here. A relocated one does not, which is exactly why every
+/// repository-relative decision is taken from the root the caller declares and
+/// this is only the fallback.
+pub fn default_repository() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Generates the site from one declared repository.
+///
+/// The approved references, the trusted build roots, and the source tree the
+/// output may not be written into are all read from `repository`, so a
+/// relocated `sitegen` publishes from the checkout it was handed rather than
+/// from the path it happened to be compiled in.
+pub fn build_site_in(
+    repository: &Path,
+    inputs: &SiteInputs,
+    output: &Path,
+) -> Result<SiteManifest, SitegenError> {
     validate_progress(
         &inputs.progress,
         &plan_task_ids_from_markdown(&inputs.plan_markdown),
         &inputs.repo,
     )
     .map_err(SitegenError::Progress)?;
-    validate_reference_manifest(
-        &inputs.reference_manifest,
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-    )
-    .map_err(SitegenError::Reference)?;
-    prepare_output(output)?;
+    validate_reference_manifest(&inputs.reference_manifest, repository)
+        .map_err(SitegenError::Reference)?;
+    prepare_output(repository, output)?;
 
     let plan_html = render_plan_html(&inputs.plan_markdown);
     let current_task = inputs
@@ -2076,8 +2448,8 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         .find(|commit| commit.sha == source_commit)
         .or_else(|| inputs.repo.commits.first())
         .map_or("Unknown", |commit| commit.committed_at.as_str());
-    let reference_paths = copy_reference_assets(&inputs.reference_manifest, output)?;
-    let playable_files = copy_playable_build(inputs.playable.as_ref(), output)?;
+    let reference_paths = copy_reference_assets(repository, &inputs.reference_manifest, output)?;
+    let playable_files = copy_playable_build(repository, inputs.playable.as_ref(), output)?;
     let evidence = publish_verification(inputs, &source_commit, updated_at, current_task, output)?;
     // The manifest is written last, because only a completed promotion knows
     // which pixels this build actually published.
@@ -2089,10 +2461,16 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
             "{{STATUS}}",
             render_status(inputs, current_task, &source_commit, updated_at),
         ),
-        ("{{PLAY}}", render_play(inputs.playable.as_ref())),
+        (
+            "{{PLAY}}",
+            mark_reconcilable("play", &render_play(inputs.playable.as_ref())),
+        ),
         (
             "{{MODE}}",
-            render_mode(inputs.playable.is_some(), evidence.is_some()),
+            mark_reconcilable(
+                "mode",
+                &render_mode(inputs.playable.is_some(), evidence.is_some()),
+            ),
         ),
         (
             "{{COMPARISON}}",
@@ -2115,7 +2493,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
             "{{CHALLENGES}}",
             render_challenges(&inputs.progress, &inputs.repo),
         ),
-        ("{{TESTS}}", render_tests(inputs, evidence.as_ref())),
+        ("{{TESTS}}", render_tests(inputs)),
         ("{{COMMITS}}", render_commits(&inputs.repo)),
     ];
     let html = render_template(include_str!("../site/templates/index.html"), &replacements);
@@ -2129,7 +2507,7 @@ pub fn build_site(inputs: &SiteInputs, output: &Path) -> Result<SiteManifest, Si
         &output.join("site.js"),
         include_bytes!("../site/static/site.js"),
     )?;
-    validate_site_output(output, &inputs.progress)?;
+    validate_site_output_in(repository, output, &inputs.progress)?;
 
     let mut generated_files = vec![
         PathBuf::from("index.html"),
@@ -2173,10 +2551,25 @@ struct PublishedEvidence {
     gallery: GalleryManifest,
     /// The current frames, by stable label.
     current: BTreeMap<String, String>,
+    /// Every frame this build copied into the published tree, in the order it
+    /// copied them.
+    promoted: Vec<PromotedFrame>,
     /// The browser canvas proof, when the gate kept one.
     browser: Option<String>,
     /// Whether this build opened a new point in the history.
     appended: bool,
+}
+
+/// One frame a build copied into `screenshots/current`, and what it shows.
+///
+/// The page links these rather than the frame list the projection carries: the
+/// only pixels a visitor may be pointed at are the ones this build authorized
+/// and copied, so the record that authorized the copy is also the record that
+/// renders it.
+struct PromotedFrame {
+    path: String,
+    stage: String,
+    heading: String,
 }
 
 /// Promotes the current verified frames and updates the visual history.
@@ -2207,10 +2600,16 @@ fn publish_verification(
 
     let mut files = vec![PathBuf::from(VERIFICATION_FILE)];
     let mut current = BTreeMap::new();
+    let mut promoted = Vec::new();
     for frame in &summary.frames {
         let source = resolve_artifact(&evidence.artifacts, &frame.artifact)?;
         let relative = Path::new(CURRENT_SCREENSHOTS).join(&frame.name);
         copy_artifact(&source, &output.join(&relative))?;
+        promoted.push(PromotedFrame {
+            path: format!("{CURRENT_SCREENSHOTS}/{}", frame.name),
+            stage: frame.stage.clone(),
+            heading: frame.heading.clone(),
+        });
         files.push(relative);
     }
     for (label, file) in GALLERY_FRAMES {
@@ -2287,6 +2686,7 @@ fn publish_verification(
         semantic_visual_hash: summary.semantic_visual_hash.clone(),
         gallery,
         current,
+        promoted,
         browser,
         appended,
     }))
@@ -2345,6 +2745,31 @@ pub fn assemble_site(
     publication: CurrentPublication,
     output: &Path,
 ) -> Result<BuildDisposition, SitegenError> {
+    assemble_site_in(
+        &default_repository(),
+        previous,
+        current,
+        workflow,
+        publication,
+        output,
+    )
+}
+
+/// Assembles one publication for a declared repository.
+///
+/// Assembly reads nothing out of the repository; it needs one only to know
+/// which source tree it may not publish into. A relocated binary's compiled-in
+/// checkout is not on the machine, so a caller that knows where the checkout
+/// really is passes it here rather than leaving the output guard with nothing
+/// to compare against.
+pub fn assemble_site_in(
+    repository: &Path,
+    previous: Option<&Path>,
+    current: &Path,
+    workflow: &WorkflowSummary,
+    publication: CurrentPublication,
+    output: &Path,
+) -> Result<BuildDisposition, SitegenError> {
     require_directory(current)?;
 
     // A green run whose current tree is a degraded status page published no
@@ -2378,9 +2803,12 @@ pub fn assemble_site(
         disposition,
         BuildDisposition::RetainLastGreen | BuildDisposition::FailedRetainLastGreen
     );
-    let evidence = evidence_publication(current);
+    let evidence = match publication {
+        CurrentPublication::Generated => evidence_publication(current)?,
+        CurrentPublication::Degraded => EvidencePublication::Absent,
+    };
 
-    prepare_assembly_output(output)?;
+    prepare_assembly_output(repository, output)?;
 
     // The two domains are retained independently. A build may promote verified
     // evidence without producing a game, and a new game never invalidates the
@@ -2406,15 +2834,33 @@ pub fn assemble_site(
         copy_previous_artifacts(previous, output, &retained)?;
     }
 
-    // A build never publishes a game it did not earn.
-    let protected: &[&str] = if retains_game {
+    // A build never publishes artifacts it did not earn. A degraded tree is
+    // status-only by contract, so neither its game nor its evidence may replace
+    // retained verified artifacts or appear on a first publication.
+    let protected: &[&str] = if publication == CurrentPublication::Degraded {
+        &DEGRADED_PROTECTED_ARTIFACTS
+    } else if retains_game || disposition == BuildDisposition::FirstRunStatusOnly {
         &PLAYABLE_ARTIFACTS
     } else {
         &[]
     };
     copy_site_tree(current, current, output, protected)?;
 
-    reconcile_last_green(output)?;
+    // Whether the retained manifest is trustworthy has to be judged from
+    // exactly what the previous publication declared, before
+    // `reconcile_last_green` resyncs its file lists with reality below: that
+    // resync silently repairs a manifest whose declared files disagree with
+    // its package, which would otherwise erase the very inconsistency this
+    // is meant to catch.
+    let retained_playable_trusted = retained_playable_is_consistent(output);
+    reconcile_last_green(output, retained_playable_trusted)?;
+    // `build_site` rendered the current run's own honest state before this
+    // assembly ever ran, blind to whatever game the disposition above just
+    // decided to keep alive. When this run produced no candidate of its own,
+    // the page it wrote still shows the pending state; bring it into
+    // agreement with the retained package this build really carries forward,
+    // never with the current run's own commit.
+    reconcile_playable_display(output, current, disposition, retained_playable_trusted)?;
     require_retained_history(output)?;
     validate_assembled_links(output)?;
     Ok(disposition)
@@ -2430,7 +2876,11 @@ pub fn assemble_site(
 /// named here rather than left to the link checker, because the cause is the
 /// inherited history and not the page that renders it.
 fn require_retained_history(output: &Path) -> Result<(), SitegenError> {
-    let missing = retained_history_targets(output)
+    let (targets, misscoped) = history_frames(output);
+    if !misscoped.is_empty() {
+        return Err(SitegenError::HistoryFrameOutsideEntry { frames: misscoped });
+    }
+    let missing = targets
         .into_iter()
         .filter(|target| !output.join(target).is_file())
         .collect::<Vec<_>>();
@@ -2453,13 +2903,48 @@ enum EvidencePublication {
     Absent,
 }
 
-fn evidence_publication(current: &Path) -> EvidencePublication {
-    if current.join(CURRENT_SCREENSHOTS).is_dir() {
-        EvidencePublication::Promoted
-    } else if current.join(VERIFICATION_FILE).is_file() {
-        EvidencePublication::ProjectionOnly
-    } else {
-        EvidencePublication::Absent
+/// Classifies what the current tree publishes about verification.
+///
+/// A successful build writes its projection, promoted frames, and gallery
+/// together. A failed build writes only its projection. Any other combination
+/// is partial or inconsistent and must not inherit artifacts from another run.
+fn evidence_publication(current: &Path) -> Result<EvidencePublication, SitegenError> {
+    let has_current_frames = current.join(CURRENT_SCREENSHOTS).is_dir();
+    let has_gallery = current.join(GALLERY_FILE).is_file();
+    let verification_path = current.join(VERIFICATION_FILE);
+    let succeeded = verification_path
+        .is_file()
+        .then(|| {
+            fs::read_to_string(&verification_path)
+                .map_err(|error| SitegenError::Io {
+                    path: verification_path.clone(),
+                    message: error.to_string(),
+                })
+                .and_then(|json| {
+                    serde_json::from_str::<VerificationSummary>(&json).map_err(|error| {
+                        SitegenError::Json {
+                            path: verification_path.clone(),
+                            message: error.to_string(),
+                        }
+                    })
+                })
+        })
+        .transpose()?
+        .map(|verdict| verdict.succeeded);
+
+    match (has_current_frames, has_gallery, succeeded) {
+        (true, true, Some(true)) => Ok(EvidencePublication::Promoted),
+        (false, false, Some(false)) => Ok(EvidencePublication::ProjectionOnly),
+        (false, false, None) => Ok(EvidencePublication::Absent),
+        _ => Err(SitegenError::PartialEvidencePublication {
+            path: if succeeded.is_some() {
+                verification_path
+            } else if has_gallery {
+                current.join(GALLERY_FILE)
+            } else {
+                current.join(CURRENT_SCREENSHOTS)
+            },
+        }),
     }
 }
 
@@ -2494,7 +2979,20 @@ fn copy_previous_artifacts(
 /// published in it, never from a second record. A manifest this generator did
 /// not write does not parse, and assembly leaves it exactly as it found it
 /// rather than inventing one.
-fn reconcile_last_green(output: &Path) -> Result<(), SitegenError> {
+///
+/// The declared `game_files` list is only resynced when `retained_playable_trusted`
+/// is true. That flag is judged, by [`retained_playable_is_consistent`], from
+/// exactly what the previous publication declared; if it already disagreed
+/// with its own package, resyncing here would quietly repair that very
+/// disagreement into a manifest a *later* publication's own consistency
+/// check can no longer catch. Provenance found inconsistent must stay
+/// unavailable, not be rehabilitated by the next assembly's resync. The
+/// screenshot list and visual hash describe evidence, an independent
+/// concern from the playable game, so they are always resynced regardless.
+fn reconcile_last_green(
+    output: &Path,
+    retained_playable_trusted: bool,
+) -> Result<(), SitegenError> {
     let path = output.join(LAST_GREEN_FILE);
     let Ok(json) = fs::read_to_string(&path) else {
         return Ok(());
@@ -2502,7 +3000,9 @@ fn reconcile_last_green(output: &Path) -> Result<(), SitegenError> {
     let Ok(mut manifest) = serde_json::from_str::<LastGreenManifest>(&json) else {
         return Ok(());
     };
-    manifest.game_files = published_files(output, "play")?;
+    if retained_playable_trusted {
+        manifest.game_files = published_files(output, "play")?;
+    }
     manifest.screenshot_files = published_files(output, CURRENT_SCREENSHOTS)?;
     if let Some(hash) = promoted_visual_hash(output) {
         manifest.semantic_visual_hash = Some(hash);
@@ -2588,7 +3088,58 @@ pub fn missing_playable_parts(package: &Path) -> Vec<String> {
     missing
 }
 
+/// Whether a retained playable manifest, exactly as it arrived from the
+/// previous publication, is safe to trust as provenance for the homepage.
+///
+/// A manifest is not "shape valid JSON" alone: `LastGreenManifest` has no
+/// validation beyond serde's, so an unsafe commit label or a declared file
+/// list that disagrees with the package it names must be caught here, before
+/// [`reconcile_last_green`] resyncs those same file lists with reality and
+/// silently erases the very inconsistency this exists to refuse. Invalid or
+/// inconsistent retained metadata is treated exactly like no retained game
+/// at all, never normalized into trusted provenance.
+fn retained_playable_is_consistent(output: &Path) -> bool {
+    let package = output.join("play");
+    if !package.is_dir() || !missing_playable_parts(&package).is_empty() {
+        return false;
+    }
+    let Ok(manifest_json) = fs::read_to_string(output.join(LAST_GREEN_FILE)) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<LastGreenManifest>(&manifest_json) else {
+        return false;
+    };
+    if validate_commit("source_commit", &manifest.source_commit).is_err() {
+        return false;
+    }
+    let Ok(actual_files) = published_files(output, "play") else {
+        return false;
+    };
+    manifest.game_files == actual_files
+}
+
+/// Validates one generated page against the compiled-in checkout.
+///
+/// A caller that names no repository is a caller running from the checkout
+/// this binary was built in, so that is the repository this declares. A
+/// relocated run declares its own with [`validate_site_output_in`].
 pub fn validate_site_output(
+    output: &Path,
+    progress: &ProgressDocument,
+) -> Result<(), SitegenError> {
+    validate_site_output_in(&default_repository(), output, progress)
+}
+
+/// Validates one generated page against the repository it was published from.
+///
+/// The verdict is a function of three things and nothing else: the bytes of
+/// `index.html`, the declared `repository`, and the declared `output`. Every
+/// rule below — one `<main>`, unique ids, alt text on every image, every local
+/// link and resource resolving, no path of this publication in the document,
+/// no inline script, a rendered plan heading per progress task — is decided
+/// from those, so the same page reaches the same verdict on any host.
+pub fn validate_site_output_in(
+    repository: &Path,
     output: &Path,
     progress: &ProgressDocument,
 ) -> Result<(), SitegenError> {
@@ -2631,7 +3182,9 @@ pub fn validate_site_output(
         }
     }
 
-    for element in document.select(&selector("a[href], img[src], link[href], script[src]")) {
+    for element in document.select(&selector(
+        "a[href], img[src], link[href], script[src], iframe[src]",
+    )) {
         let attribute = if element.value().attr("href").is_some() {
             "href"
         } else {
@@ -2644,11 +3197,11 @@ pub fn validate_site_output(
         validate_local_target(output, &ids, &retained, &index_path, target)?;
     }
 
-    if html.contains(env!("CARGO_MANIFEST_DIR"))
-        || html.contains("/Users/")
-        || html.contains("file://")
-    {
-        return Err(invalid_html(&index_path, "absolute local path is present"));
+    if let Some(found) = published_host_path(repository, output, &html) {
+        return Err(invalid_html(
+            &index_path,
+            format!("a path of the publishing machine is present: {found}"),
+        ));
     }
 
     for script in document.select(&selector("script")) {
@@ -2708,7 +3261,9 @@ pub fn validate_assembled_links(output: &Path) -> Result<(), SitegenError> {
         .filter_map(|element| element.value().attr("id").map(str::to_owned))
         .collect::<BTreeSet<_>>();
 
-    for element in document.select(&selector("a[href], img[src], link[href], script[src]")) {
+    for element in document.select(&selector(
+        "a[href], img[src], link[href], script[src], iframe[src]",
+    )) {
         let attribute = if element.value().attr("href").is_some() {
             "href"
         } else {
@@ -2723,8 +3278,8 @@ pub fn validate_assembled_links(output: &Path) -> Result<(), SitegenError> {
     Ok(())
 }
 
-fn prepare_output(output: &Path) -> Result<(), SitegenError> {
-    validate_output_path(output)?;
+fn prepare_output(repository: &Path, output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_in(repository, output)?;
     if let Ok(metadata) = fs::symlink_metadata(output) {
         if metadata.is_dir() {
             fs::remove_dir_all(output).map_err(|error| SitegenError::Io {
@@ -2744,8 +3299,8 @@ fn prepare_output(output: &Path) -> Result<(), SitegenError> {
     })
 }
 
-fn prepare_assembly_output(output: &Path) -> Result<(), SitegenError> {
-    validate_output_path(output)?;
+fn prepare_assembly_output(repository: &Path, output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_in(repository, output)?;
     match fs::symlink_metadata(output) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             Err(SitegenError::UnsafeOutputPath {
@@ -2783,8 +3338,13 @@ fn prepare_assembly_output(output: &Path) -> Result<(), SitegenError> {
 /// Nothing else is trusted, so a package path can never reach the source tree
 /// or an arbitrary location on the host.
 pub fn trusted_playable_roots() -> Vec<PathBuf> {
+    trusted_playable_roots_in(&default_repository())
+}
+
+/// The same roots, for a caller that knows which repository it is publishing
+/// from.
+pub fn trusted_playable_roots_in(repository: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Ok(target) = fs::canonicalize(repository.join("target")) {
         roots.push(target);
     }
@@ -2870,6 +3430,15 @@ const EVIDENCE_PIXELS: [&str; 2] = [SCREENSHOTS_ROOT, GALLERY_FILE];
 /// Everything the last green publication said about verification.
 const EVIDENCE_ARTIFACTS: [&str; 3] = [SCREENSHOTS_ROOT, GALLERY_FILE, VERIFICATION_FILE];
 
+/// Every game or evidence path a degraded status tree is forbidden to publish.
+const DEGRADED_PROTECTED_ARTIFACTS: [&str; 5] = [
+    "play",
+    LAST_GREEN_FILE,
+    SCREENSHOTS_ROOT,
+    GALLERY_FILE,
+    VERIFICATION_FILE,
+];
+
 fn copy_site_tree(
     root: &Path,
     source: &Path,
@@ -2950,6 +3519,32 @@ fn is_protected_artifact(relative: &Path, protected: &[&str]) -> bool {
 }
 
 pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_in(&default_repository(), output)
+}
+
+/// Refuses an output directory that would publish into a repository's own
+/// source tree.
+///
+/// Two roots are protected: the repository the caller declared, which is the
+/// checkout this run is publishing from, and the one this binary was compiled
+/// in, which is where a developer's own source tree lives. Declaring a
+/// repository therefore only ever adds protection.
+pub fn validate_output_path_in(repository: &Path, output: &Path) -> Result<(), SitegenError> {
+    validate_output_path_under(&[repository.to_path_buf(), default_repository()], output)
+}
+
+/// The same rule against an explicit set of candidate source trees.
+///
+/// A candidate that is not on this machine — what a relocated binary's
+/// compiled-in path is — cannot be compared with anything and is skipped. If
+/// *no* candidate resolves, nothing is left to compare the output against, and
+/// a check that can prove nothing may not report success: a run with no
+/// repository context refuses to publish rather than silently publishing
+/// anywhere.
+pub fn validate_output_path_under(
+    candidates: &[PathBuf],
+    output: &Path,
+) -> Result<(), SitegenError> {
     if output.as_os_str().is_empty() || output == Path::new(".") {
         return Err(SitegenError::UnsafeOutputPath {
             path: output.to_path_buf(),
@@ -2961,17 +3556,27 @@ pub fn validate_output_path(output: &Path) -> Result<(), SitegenError> {
         });
     }
 
-    let repository =
-        fs::canonicalize(env!("CARGO_MANIFEST_DIR")).map_err(|error| SitegenError::Io {
-            path: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            message: error.to_string(),
-        })?;
     let resolved = resolve_destination(output)?;
-    let target_root = repository.join("target");
-    if resolved.starts_with(&repository) && !resolved.starts_with(target_root) {
-        return Err(SitegenError::UnsafeOutputPath {
-            path: output.to_path_buf(),
+    let mut protected = Vec::new();
+    for root in candidates {
+        let Ok(canonical) = fs::canonicalize(root) else {
+            continue;
+        };
+        if !protected.contains(&canonical) {
+            protected.push(canonical);
+        }
+    }
+    if protected.is_empty() {
+        return Err(SitegenError::UnknownRepository {
+            candidates: candidates.to_vec(),
         });
+    }
+    for root in protected {
+        if resolved.starts_with(&root) && !resolved.starts_with(root.join("target")) {
+            return Err(SitegenError::UnsafeOutputPath {
+                path: output.to_path_buf(),
+            });
+        }
     }
     Ok(())
 }
@@ -3013,10 +3618,10 @@ fn resolve_destination(path: &Path) -> Result<PathBuf, SitegenError> {
 }
 
 fn copy_reference_assets(
+    repository: &Path,
     manifest: &ReferenceManifest,
     output: &Path,
 ) -> Result<BTreeMap<String, PathBuf>, SitegenError> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut paths = BTreeMap::new();
     for asset in &manifest.assets {
         let source = repository.join(&asset.public_path);
@@ -3081,13 +3686,15 @@ fn render_status(
 /// Copies a verified browser package into `play/` and returns the published
 /// relative paths in stable order.
 fn copy_playable_build(
+    repository: &Path,
     playable: Option<&PlayableBuild>,
     output: &Path,
 ) -> Result<Vec<PathBuf>, SitegenError> {
     let Some(playable) = playable else {
         return Ok(Vec::new());
     };
-    let package = resolve_playable_package(&playable.directory, &trusted_playable_roots())?;
+    let package =
+        resolve_playable_package(&playable.directory, &trusted_playable_roots_in(repository))?;
     if let Some(missing) = missing_playable_parts(&package).first() {
         return Err(SitegenError::MissingInput {
             path: package.join(missing),
@@ -3215,6 +3822,191 @@ fn render_pending_play() -> String {
           <span><kbd>Space</kbd> Repair</span>
         </div>"#
                 .to_owned()
+}
+
+/// The playable panel for a build that carries no candidate of its own
+/// forward, but whose assembly retained a previous publication's package.
+///
+/// Unlike [`render_play`], this never cites a workflow run: the retained
+/// package was never produced or proven by the current run, so it carries no
+/// run proof of its own, only the commit its own retained metadata names.
+fn render_retained_play(source_commit: &str) -> String {
+    format!(
+        r#"<div class="play-frame play-frame-live">
+          <iframe class="play-embed" src="play/index.html" title="Playable Cell Shift data centre build" loading="lazy"></iframe>
+        </div>
+        <div class="control-strip" aria-label="Game controls">
+          <span><kbd>Arrow keys</kbd> Move</span>
+          <span><kbd>Q</kbd>/<kbd>E</kbd> Orbit</span>
+          <span><kbd>Space</kbd> Repair</span>
+        </div>
+        <dl class="provenance">
+          <div><dt>Playable build</dt><dd><code>{}</code></dd></div>
+          <div><dt>Retained from</dt><dd>A previous verified publication; this run did not verify it.</dd></div>
+          <div><dt>Direct link</dt><dd><a href="play/index.html">Open the playable build</a></dd></div>
+        </dl>"#,
+        escape_html(&short_sha(source_commit)),
+    )
+}
+
+/// The publication mode badge for a build displaying a retained game.
+fn render_retained_mode(verified: bool) -> String {
+    let detail = if verified {
+        "Playable build retained from a previous publication; current evidence verified separately"
+    } else {
+        "Playable build retained from a previous publication; current run did not verify"
+    };
+    format!(
+        r#"<div class="hero-badge" aria-label="Current publication mode">
+          <span>Mode</span>
+          <strong>Retained</strong>
+          <small>{detail}</small>
+        </div>"#
+    )
+}
+
+/// Wraps one rendered section in a stable HTML comment pair so a later
+/// assembly can find and, when it must, replace it without ever touching the
+/// rest of the page it did not write.
+fn mark_reconcilable(name: &str, html: &str) -> String {
+    format!("<!--{name}-->{html}<!--/{name}-->")
+}
+
+/// The exact byte range of one `mark_reconcilable` section, including its
+/// delimiting comments.
+///
+/// A well-formed section has exactly one opening marker and exactly one
+/// closing marker for `name` in the whole document. Locating only the first
+/// open and the first close after it — without checking for extras — lets a
+/// duplicate opening marker, a duplicate closing marker, or a same-name
+/// nested section (e.g. `<!--play-->A<!--play-->B<!--/play-->C<!--/play-->`)
+/// silently produce a span that covers only *part* of the malformed markup.
+/// A caller that then replaces that span leaves the rest — a stray opening
+/// marker, or trailing content after the "real" close — dangling verbatim in
+/// the output instead of ever being refused. Requiring exactly one of each
+/// marker rejects all such malformed structures up front, before any span is
+/// ever returned.
+fn marked_span(html: &str, name: &str) -> Option<(usize, usize)> {
+    let open = format!("<!--{name}-->");
+    let close = format!("<!--/{name}-->");
+    if html.matches(&open).count() != 1 || html.matches(&close).count() != 1 {
+        return None;
+    }
+    let start = html.find(&open)?;
+    let content_start = start + open.len();
+    let close_start = html[content_start..].find(&close)? + content_start;
+    Some((start, close_start + close.len()))
+}
+
+fn replace_marked(html: &str, name: &str, replacement: &str) -> String {
+    match marked_span(html, name) {
+        Some((start, end)) => format!("{}{replacement}{}", &html[..start], &html[end..]),
+        None => html.to_owned(),
+    }
+}
+
+/// Whether the current run's own verification evidence — read from the
+/// `current` tree the run itself produced, before assembly retains or
+/// overlays anything from a previous publication — proved the current
+/// commit.
+///
+/// This deliberately never reads the assembled `output` tree: when the
+/// current run publishes no verification projection of its own, assembly
+/// retains the previous run's `verification.json` into `output` so that
+/// evidence is not lost, but that retained document describes a different
+/// run's success, not this one's. Reading `current` instead means a run that
+/// attempted no verification of its own can never be credited with a
+/// previous run's separately-recorded success.
+fn current_evidence_succeeded(current: &Path) -> bool {
+    let Ok(json) = fs::read_to_string(current.join(VERIFICATION_FILE)) else {
+        return false;
+    };
+    serde_json::from_str::<VerificationSummary>(&json).is_ok_and(|summary| summary.succeeded)
+}
+
+/// Brings the assembled homepage into agreement with the playable build the
+/// disposition really kept alive.
+///
+/// `build_site` renders the current run's own honest state before it knows
+/// anything this assembly will decide, so a run that produced no candidate of
+/// its own always leaves the pending panel behind, even when a retained game
+/// is about to be carried forward. This is the one place that reconciles the
+/// two: it never touches a page that already shows a game of its own, and it
+/// only ever attributes a retained game to the commit its own retained
+/// metadata names, never to the current run's commit. A retained package or
+/// manifest that is missing, incomplete, unparsable, or internally
+/// inconsistent (judged by `retained_playable_trusted`, computed before this
+/// runs) is treated exactly like no retained game at all, so the page stays
+/// pending rather than inventing provenance for something that cannot be
+/// trusted. The play and mode markers are replaced as one atomic pair: if
+/// either is missing, malformed, or its span crosses or nests with the
+/// other's, neither is touched, so an incorrect badge can never survive
+/// beside a reconciled iframe and a single replacement can never silently
+/// consume its counterpart's markers.
+fn reconcile_playable_display(
+    output: &Path,
+    current: &Path,
+    disposition: BuildDisposition,
+    retained_playable_trusted: bool,
+) -> Result<(), SitegenError> {
+    if !matches!(
+        disposition,
+        BuildDisposition::RetainLastGreen | BuildDisposition::FailedRetainLastGreen
+    ) {
+        return Ok(());
+    }
+    let index_path = output.join("index.html");
+    let Ok(html) = fs::read_to_string(&index_path) else {
+        return Ok(());
+    };
+    let Some((play_start, play_end)) = marked_span(&html, "play") else {
+        return Ok(());
+    };
+    // A build that already shows a game of its own is left exactly as it is,
+    // regardless of whether a retained package would otherwise be trusted.
+    if html[play_start..play_end].contains("play-embed") {
+        return Ok(());
+    }
+    // The play and mode sections are replaced together or not at all: a
+    // missing or malformed mode marker must never leave a stale badge beside
+    // a freshly reconciled iframe.
+    let Some((mode_start, mode_end)) = marked_span(&html, "mode") else {
+        return Ok(());
+    };
+    // Each marker is located independently by an isolated string search, so a
+    // malformed page can produce spans that cross or nest instead of sitting
+    // entirely before or after one another (e.g. a stray `<!--mode-->` inside
+    // what `play`'s search reports as its own span). Replacing one span in
+    // that case would silently delete or truncate the other marker before it
+    // is ever looked for, turning an atomic pair replacement into a partial
+    // one. Two ranges are genuinely disjoint only when one ends at or before
+    // the other begins; anything else is refused untouched.
+    let disjoint = play_end <= mode_start || mode_end <= play_start;
+    if !disjoint {
+        return Ok(());
+    }
+    if !retained_playable_trusted {
+        return Ok(());
+    }
+    let Ok(manifest_json) = fs::read_to_string(output.join(LAST_GREEN_FILE)) else {
+        return Ok(());
+    };
+    let Ok(manifest) = serde_json::from_str::<LastGreenManifest>(&manifest_json) else {
+        return Ok(());
+    };
+
+    let verified = current_evidence_succeeded(current);
+    let patched = replace_marked(
+        &html,
+        "play",
+        &mark_reconcilable("play", &render_retained_play(&manifest.source_commit)),
+    );
+    let patched = replace_marked(
+        &patched,
+        "mode",
+        &mark_reconcilable("mode", &render_retained_mode(verified)),
+    );
+    write_file(&index_path, patched.as_bytes())
 }
 
 fn render_comparison(
@@ -3366,16 +4158,17 @@ fn render_task(task: &ProgressTask, repo: &RepoFacts) -> String {
         format!("After {}", task.depends_on.join(", "))
     };
     let commit = task
-                .completed_commit
-                .as_deref()
-                .and_then(|commit| resolve_commit_ref(commit, repo))
-                .map(|commit| {
-                    format!(
-                        r#"<a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/{commit}">Commit {}</a>"#,
-                        short_sha(&commit)
-                    )
-                })
-                .unwrap_or_default();
+        .completed_commit
+        .as_deref()
+        .and_then(|commit| resolve_commit_ref(commit, repo))
+        .map(|commit| {
+            format!(
+                r#"<a class="commit-link" href="{}">Commit {}</a>"#,
+                commit_url(&commit),
+                short_sha(&commit)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r##"<article class="task-card">
           <a data-progress-task="{}" href="#plan-{}"><h3>{}</h3></a>
@@ -3392,28 +4185,36 @@ fn render_task(task: &ProgressTask, repo: &RepoFacts) -> String {
 }
 
 fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
+    // A promotion copies every captured frame into the published tree, so
+    // every one of them is rendered here. The links come from the record that
+    // authorized and made those copies rather than from the projection beside
+    // it, so the page can only ever point at pixels this build really wrote.
+    let current = evidence
+        .map(|published| render_current_frames(&published.promoted))
+        .unwrap_or_default();
     let gallery = evidence
         .map(|published| &published.gallery)
         .or(inputs.gallery.as_ref());
     let Some(gallery) = gallery.filter(|gallery| !gallery.entries.is_empty()) else {
-        return empty_state(
-            "No verified screenshots yet. The timeline starts after the first deterministic render passes.",
-        );
+        let note = if current.is_empty() {
+            "No verified screenshots yet. The timeline starts after the first deterministic render passes."
+        } else {
+            "The timeline starts at the first accepted history point."
+        };
+        return format!("{current}{}", empty_state(note));
     };
 
     // A build only ever links pixels it published itself. The images of older
     // accepted points are retained by assembly, and the manifest published
     // beside this page is what vouches for them.
     let published = evidence.is_some();
-    let latest_hash = gallery
-        .entries
-        .last()
-        .map_or("", |entry| entry.semantic_visual_hash.as_str());
-    gallery
+    let latest_index = gallery.entries.len() - 1;
+    let history = gallery
         .entries
         .iter()
+        .enumerate()
         .rev()
-        .map(|entry| {
+        .map(|(index, entry)| {
             let images = if published {
                 entry
                     .frames
@@ -3436,8 +4237,7 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
             } else {
                 r#"<p class="history-note">Screenshots for this point are retained from the last green publication.</p>"#.to_owned()
             };
-            let newest = evidence.is_some_and(|value| value.appended)
-                && entry.semantic_visual_hash == latest_hash;
+            let newest = evidence.is_some_and(|value| value.appended) && index == latest_index;
             let chip = if newest {
                 r#"<span class="pending-chip">New this build</span>"#
             } else {
@@ -3462,14 +4262,56 @@ fn render_screenshots(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>)
                 render_deltas(&entry.metric_deltas),
             )
         })
-        .collect()
+        .collect::<String>();
+    format!("{current}{history}")
+}
+
+/// Every frame this build promoted into `screenshots/current`.
+fn render_current_frames(promoted: &[PromotedFrame]) -> String {
+    let figures = promoted
+        .iter()
+        .map(|frame| {
+            format!(
+                r#"<figure><img src="{}" alt="Verified {} capture at the {} heading" loading="lazy"><figcaption>{}</figcaption></figure>"#,
+                escape_html(&frame.path),
+                escape_html(&frame.stage),
+                escape_html(&frame.heading),
+                escape_html(&frame.stage),
+            )
+        })
+        .collect::<String>();
+    if figures.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<article class="screenshot-entry">
+          <div class="timeline-dot"></div>
+          <div>
+            <span class="eyebrow">This build &middot; every promoted frame</span>
+            <p>The complete set of captures behind the evidence published on this page.</p>
+            <div class="screenshot-strip">{figures}</div>
+          </div>
+        </article>"#
+    )
 }
 
 /// The metric changes one history entry recorded, largest movement first.
 fn render_deltas(deltas: &BTreeMap<String, f64>) -> String {
-    let moved = deltas
+    let mut moved = deltas
         .iter()
         .filter(|(_, delta)| **delta != 0.0)
+        .collect::<Vec<_>>();
+    // A point can move a dozen metrics at once, so the list leads with the
+    // movement a reader is looking for. Equal movements keep the manifest's
+    // own stable name order, so the same history always renders the same way.
+    moved.sort_by(|(left_name, left), (right_name, right)| {
+        right
+            .abs()
+            .total_cmp(&left.abs())
+            .then_with(|| left_name.cmp(right_name))
+    });
+    let items = moved
+        .into_iter()
         .map(|(name, delta)| {
             format!(
                 r#"<li><code>{}</code> <strong>{}</strong></li>"#,
@@ -3478,10 +4320,10 @@ fn render_deltas(deltas: &BTreeMap<String, f64>) -> String {
             )
         })
         .collect::<String>();
-    if moved.is_empty() {
+    if items.is_empty() {
         return r#"<p class="history-note">No published metric moved.</p>"#.to_owned();
     }
-    format!(r#"<ul class="delta-list">{moved}</ul>"#)
+    format!(r#"<ul class="delta-list">{items}</ul>"#)
 }
 
 fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
@@ -3517,7 +4359,8 @@ fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
                         .and_then(|commit| resolve_commit_ref(commit, repo))
                         .map(|commit| {
                             format!(
-                                r#"<a href="https://github.com/ridermw/midcreek-cs-1/commit/{commit}">Resolved in {}</a>"#,
+                                r#"<a href="{}">Resolved in {}</a>"#,
+                                commit_url(&commit),
                                 short_sha(&commit)
                             )
                         })
@@ -3540,7 +4383,7 @@ fn render_challenges(progress: &ProgressDocument, repo: &RepoFacts) -> String {
                 .collect()
 }
 
-fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> String {
+fn render_tests(inputs: &SiteInputs) -> String {
     let summary = inputs.verification.as_ref().map(|value| &value.summary);
     let gates = inputs
         .workflow
@@ -3585,7 +4428,7 @@ fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> St
         .as_ref()
         .and_then(|gallery| gallery.entries.last());
     let evidence_html = summary
-        .map(|summary| render_verification_evidence(summary, baseline, evidence))
+        .map(|summary| render_verification_evidence(summary, baseline))
         .unwrap_or_default();
 
     format!(
@@ -3600,7 +4443,6 @@ fn render_tests(inputs: &SiteInputs, evidence: Option<&PublishedEvidence>) -> St
 fn render_verification_evidence(
     summary: &VerificationSummary,
     baseline: Option<&GalleryEntry>,
-    evidence: Option<&PublishedEvidence>,
 ) -> String {
     let metrics = summary
         .metrics
@@ -3650,16 +4492,13 @@ fn render_verification_evidence(
             )
         })
         .unwrap_or_default();
-    let report_link = evidence
-        .map(|_| VERIFICATION_FILE)
-        .unwrap_or(VERIFICATION_FILE);
 
     format!(
         r#"{stage}
         <div class="table-wrap"><table><caption>Published metrics</caption><thead><tr><th>Metric</th><th>Value</th><th>Change</th></tr></thead><tbody>{metrics}</tbody></table></div>
         {failures}
         {}
-        <p class="section-link"><a href="{report_link}">Open the sanitized verification report</a></p>"#,
+        <p class="section-link"><a href="{VERIFICATION_FILE}">Open the sanitized verification report</a></p>"#,
         render_run_provenance(summary),
     )
 }
@@ -3896,21 +4735,160 @@ fn validate_local_target(
     }
 }
 
+/// The path of this publication the generated page names, if any.
+///
+/// A published page is served from a URL, so a location on the machine that
+/// built it never belongs in one. The rule is stated over exactly the two
+/// locations this publication was handed — the repository it published from
+/// and the directory it published into — each as it was given and as it
+/// canonicalizes, matched raw and HTML-escaped at path-component boundaries
+/// anywhere in the document.
+///
+/// Nothing ambient decides the verdict: not `HOME`, not the system temporary
+/// directory, not the working directory, not `RUNNER_TEMP` or
+/// `GITHUB_WORKSPACE`, not the path this binary was compiled in. The same
+/// bytes checked against the same repository and output therefore reach the
+/// same verdict on any host and from any working directory, which is what
+/// makes a publication gate reproducible: a page that publishes on a
+/// developer's machine publishes on the runner, and a refusal can be
+/// explained by the document and the declaration alone. Callers that mean the
+/// compiled-in checkout say so by declaring it, which is what
+/// [`validate_site_output`] does.
+///
+/// Nothing about what an absolute path *looks like* decides it either. The
+/// page renders reserved prose — the plan, the progress document, commit
+/// subjects — and prose legitimately carries paths like `/var/lib/foo`, the
+/// `/midcreek-cs-1/` prefix this project is served below, or another
+/// machine's checkout. Link and resource targets are a separate and stricter
+/// rule: [`validate_local_target`] refuses an absolute or `file:` target in
+/// any `href` or `src` whatever it names.
+///
+/// This reads the generated HTML only. The JSON this build publishes beside
+/// it — `verification.json` and its kin — is a different document under a
+/// different, narrower guarantee, not a stronger one this scan happens to
+/// also cover. `#[serde(deny_unknown_fields)]` fixes the *shape* of that JSON
+/// so an undeclared field is refused, but a declared string or map key can
+/// still hold any bytes its type allows. Of its path-shaped content, only
+/// `PublicFrame::artifact` and `PublicBrowser::screenshot` are actually
+/// proven relative, traversal-free, symlink-free, and contained: each is
+/// resolved by [`resolve_artifact`] before it is assigned into the
+/// projection at all. The repository-relative path keys of `PublicHashes`'s
+/// four maps, and the free strings a frame, the camera, or the stage list
+/// carry, are copied straight from the verifier's own report; they stay
+/// "relative" only by that report's schema and convention, never because
+/// this scan or `resolve_artifact` checked them.
+fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<String> {
+    for root in publication_paths(repository, output) {
+        if contains_path_at_boundary(html, &root)
+            || contains_path_at_boundary(html, &escape_html(&root))
+        {
+            return Some(root);
+        }
+    }
+    // A local filesystem URL is never a published location either: whatever
+    // path follows it, the page is telling a visitor to read the builder's
+    // disk.
+    html.contains("file://").then(|| "file://".to_owned())
+}
+
+fn contains_path_at_boundary(text: &str, path: &str) -> bool {
+    text.match_indices(path).any(|(start, _)| {
+        let preceding = text[..start].chars().next_back();
+        let mut following = text[start + path.len()..].chars();
+        let starts_component = preceding.is_none_or(|value| {
+            !value.is_ascii_alphanumeric() && !matches!(value, '_' | '-' | '.' | '/' | '\\')
+        });
+        let ends_component = match following.next() {
+            None => true,
+            Some(value) if matches!(value, '/' | '\\') || value.is_ascii_whitespace() => true,
+            Some(value)
+                if matches!(
+                    value,
+                    '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | ';' | ':' | '?' | '#'
+                ) =>
+            {
+                true
+            }
+            Some('.') => following.next().is_none_or(|value| {
+                value.is_ascii_whitespace()
+                    || matches!(value, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            }),
+            Some(_) => false,
+        };
+        starts_component && ends_component
+    })
+}
+
+/// The two locations of this publication, in every form a leak could carry.
+///
+/// Each is taken both as it was handed over and as it canonicalizes, because
+/// whatever leaked it held whichever form it happened to hold. A relative
+/// candidate names no location on its own, so only the location it resolves to
+/// is used. The filesystem root is skipped: `/` prefixes every absolute path
+/// there is, so matching it would be matching path shapes again rather than
+/// this publication's own locations. Every real checkout and every real output
+/// directory has at least one component below the root, including a
+/// single-component one like `/srv`.
+fn publication_paths(repository: &Path, output: &Path) -> Vec<String> {
+    let mut roots = Vec::new();
+    for candidate in [repository, output] {
+        for path in [
+            Some(candidate.to_path_buf()),
+            fs::canonicalize(candidate).ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let names_a_location = path.is_absolute()
+                && path
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)));
+            let text = path.to_string_lossy().into_owned();
+            if names_a_location && !roots.contains(&text) {
+                roots.push(text);
+            }
+        }
+    }
+    roots
+}
+
 /// Every history frame the published gallery manifest vouches for.
 fn retained_history_targets(output: &Path) -> BTreeSet<String> {
+    history_frames(output).0
+}
+
+/// The history frames the published manifest vouches for, and the ones it
+/// declares outside the entry that owns them.
+///
+/// Every accepted point publishes into its own commit's directory, so a frame
+/// path that merely starts with the history prefix is not evidence of that
+/// point at all: it can name another entry's pixels, which exist, resolve, and
+/// would satisfy both the link checker and the retained-history rule while
+/// showing a different moment in time under this entry's commit and hash.
+fn history_frames(output: &Path) -> (BTreeSet<String>, Vec<String>) {
     let Ok(json) = fs::read_to_string(output.join(GALLERY_FILE)) else {
-        return BTreeSet::new();
+        return (BTreeSet::new(), Vec::new());
     };
-    serde_json::from_str::<GalleryManifest>(&json)
-        .map(|gallery| {
-            gallery
-                .entries
-                .into_iter()
-                .flat_map(|entry| entry.frames.into_values())
-                .filter(|path| path.starts_with(HISTORY_SCREENSHOTS))
-                .collect()
-        })
-        .unwrap_or_default()
+    let Ok(gallery) = serde_json::from_str::<GalleryManifest>(&json) else {
+        return (BTreeSet::new(), Vec::new());
+    };
+
+    let mut declared = BTreeSet::new();
+    let mut misscoped = Vec::new();
+    for entry in gallery.entries {
+        let root = format!("{HISTORY_SCREENSHOTS}/{}/", short_sha(&entry.source_commit));
+        for path in entry.frames.into_values() {
+            let owned = path
+                .strip_prefix(&root)
+                .is_some_and(|file| !file.is_empty() && !file.contains('/'));
+            if owned {
+                declared.insert(path);
+            } else if !misscoped.contains(&path) {
+                misscoped.push(path);
+            }
+        }
+    }
+    (declared, misscoped)
 }
 
 fn selector(value: &str) -> Selector {
@@ -3929,6 +4907,11 @@ fn empty_state(message: &str) -> String {
         r#"<div class="empty-state"><span class="empty-mark">+</span><p>{}</p></div>"#,
         escape_html(message)
     )
+}
+
+/// The published link to one commit in this repository.
+fn commit_url(commit: &str) -> String {
+    format!("{REPOSITORY_URL}/commit/{commit}")
 }
 
 fn short_sha(sha: &str) -> String {

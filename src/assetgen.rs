@@ -1489,27 +1489,17 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
                     ..json::Node::default()
                 });
             }
-            for (bone_index, bone) in rig.bones.iter().enumerate() {
-                let Some(parent) = &bone.parent else {
+            for (bone_index, parent_index) in layout.parents.iter().enumerate() {
+                let Some(parent_index) = *parent_index else {
                     continue;
                 };
-                let parent_index = layout
-                    .order
-                    .get(parent)
-                    .copied()
-                    .expect("validation guarantees the parent bone exists")
-                    as usize;
                 let child = json::Index::new((bone_base + bone_index) as u32);
                 builder.root.nodes[bone_base + parent_index]
                     .children
                     .get_or_insert_with(Vec::new)
                     .push(child);
             }
-            let root_bone = rig
-                .bones
-                .iter()
-                .position(|bone| bone.parent.is_none())
-                .expect("validation guarantees exactly one root bone");
+            let root_bone = layout.root;
             children.push(json::Index::new((bone_base + root_bone) as u32));
 
             let matrices = rig
@@ -1552,7 +1542,7 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
             );
             builder.root.nodes[skin_index.value()].skin = Some(skin);
 
-            push_animations(&mut builder, rig, bone_base);
+            push_animations(&mut builder, rig, bone_base, path, &module_field)?;
         }
 
         builder.root.nodes[root_index] = json::Node {
@@ -1595,24 +1585,45 @@ fn build_glb(source: &AssetSource, path: &str) -> Result<Vec<u8>, AssetGenError>
 struct RigLayout {
     origins: BTreeMap<String, [f64; 3]>,
     order: BTreeMap<String, u16>,
+    parents: Vec<Option<usize>>,
+    root: usize,
 }
 
 fn rig_layout(rig: &RigSource, path: &str, module_field: &str) -> Result<RigLayout, AssetGenError> {
     let rig_field = format!("{module_field}.rig");
     let mut origins = BTreeMap::new();
     let mut order = BTreeMap::new();
+    let mut parents = Vec::with_capacity(rig.bones.len());
+    let mut roots = Vec::new();
     for (index, bone) in rig.bones.iter().enumerate() {
-        let parent_origin = match &bone.parent {
-            None => [0.0, 0.0, 0.0],
-            Some(parent) => origins
-                .get(parent)
-                .copied()
-                .ok_or_else(|| AssetGenError::Invalid {
-                    path: path.to_owned(),
-                    field: format!("{rig_field}.bones[{index}].parent"),
-                    message: format!("unknown or forward referenced parent bone {parent}"),
-                })?,
+        let (parent_index, parent_origin) = match &bone.parent {
+            None => {
+                roots.push(index);
+                (None, [0.0, 0.0, 0.0])
+            }
+            Some(parent) => {
+                let parent_index =
+                    order
+                        .get(parent)
+                        .copied()
+                        .ok_or_else(|| AssetGenError::Invalid {
+                            path: path.to_owned(),
+                            field: format!("{rig_field}.bones[{index}].parent"),
+                            message: format!("unknown or forward referenced parent bone {parent}"),
+                        })?;
+                let parent_origin =
+                    origins
+                        .get(parent)
+                        .copied()
+                        .ok_or_else(|| AssetGenError::Invalid {
+                            path: path.to_owned(),
+                            field: format!("{rig_field}.bones[{index}].parent"),
+                            message: format!("parent bone {parent} has no resolved bind origin"),
+                        })?;
+                (Some(usize::from(parent_index)), parent_origin)
+            }
         };
+        parents.push(parent_index);
         origins.insert(
             bone.name.clone(),
             [
@@ -1631,7 +1642,19 @@ fn rig_layout(rig: &RigSource, path: &str, module_field: &str) -> Result<RigLayo
         })?;
         order.insert(bone.name.clone(), slot);
     }
-    Ok(RigLayout { origins, order })
+    let [root] = roots[..] else {
+        return Err(AssetGenError::Invalid {
+            path: path.to_owned(),
+            field: format!("{rig_field}.bones"),
+            message: format!("exactly one root bone is required, found {}", roots.len()),
+        });
+    };
+    Ok(RigLayout {
+        origins,
+        order,
+        parents,
+        root,
+    })
 }
 
 fn inverse_bind_matrix(origin: [f64; 3]) -> [f32; 16] {
@@ -1797,17 +1820,29 @@ fn push_mesh(
     ))
 }
 
-fn push_animations(builder: &mut Builder, rig: &RigSource, bone_base: usize) {
-    for clip in &rig.clips {
+fn push_animations(
+    builder: &mut Builder,
+    rig: &RigSource,
+    bone_base: usize,
+    path: &str,
+    module_field: &str,
+) -> Result<(), AssetGenError> {
+    for (clip_index, clip) in rig.clips.iter().enumerate() {
         let mut channels = Vec::with_capacity(clip.tracks.len());
         let mut samplers = Vec::with_capacity(clip.tracks.len());
 
-        for track in &clip.tracks {
+        for (track_index, track) in clip.tracks.iter().enumerate() {
             let bone_index = rig
                 .bones
                 .iter()
                 .position(|bone| bone.name == track.bone)
-                .expect("validation guarantees the target bone exists");
+                .ok_or_else(|| AssetGenError::Invalid {
+                    path: path.to_owned(),
+                    field: format!(
+                        "{module_field}.rig.clips[{clip_index}].tracks[{track_index}].bone"
+                    ),
+                    message: format!("unknown animation target bone {}", track.bone),
+                })?;
             let rest = rig.bones[bone_index].translation;
 
             let times = track
@@ -1901,6 +1936,7 @@ fn push_animations(builder: &mut Builder, rig: &RigSource, bone_base: usize) {
             },
         );
     }
+    Ok(())
 }
 
 fn glb_container(json_chunk: &[u8], bin_chunk: &[u8]) -> Vec<u8> {

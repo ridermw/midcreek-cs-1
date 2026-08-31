@@ -731,6 +731,41 @@ class HistoryFailureSiteTest(unittest.TestCase):
         self.assert_status_only(result)
         self.assertIn("does not name play/index.html", result.stderr)
 
+    def test_a_manifest_must_name_every_required_playable_file(self) -> None:
+        for required in GAME_FILES[:5]:
+            with self.subTest(required=required):
+                shutil.rmtree(self.output, ignore_errors=True)
+                previous = write_previous_publication(self.root / "previous")
+                manifest = last_green_manifest()
+                manifest["game_files"] = [
+                    entry for entry in manifest["game_files"] if entry != required
+                ]
+                (previous / "last-green.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+
+                result = self.run_fallback(previous)
+
+                self.assert_status_only(result)
+                self.assertIn(f"does not name {required}", result.stderr)
+
+    def test_a_manifest_must_name_at_least_one_playable_asset(self) -> None:
+        previous = write_previous_publication(self.root / "previous")
+        manifest = last_green_manifest()
+        manifest["game_files"] = [
+            entry
+            for entry in manifest["game_files"]
+            if not entry.startswith("play/assets/")
+        ]
+        (previous / "last-green.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        result = self.run_fallback(previous)
+
+        self.assert_status_only(result)
+        self.assertIn("does not name a file below play/assets/", result.stderr)
+
     def test_a_previous_path_that_does_not_exist_is_not_fatal(self) -> None:
         result = self.run_fallback(self.root / "never-checked-out")
 

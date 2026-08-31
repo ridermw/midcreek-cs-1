@@ -161,15 +161,6 @@ impl GeneratedAssets {
         let module = module_for(kind)?;
         self.scene(module.asset, module.module)
     }
-
-    /// Every tracked handle, for load-state polling.
-    pub fn handle_ids(&self) -> Vec<UntypedAssetId> {
-        self.documents
-            .iter()
-            .map(|(_, handle)| handle.id().untyped())
-            .chain(self.scenes.iter().map(|(_, handle)| handle.id().untyped()))
-            .collect()
-    }
 }
 
 /// Every generated-asset failure observed while resolving the load state.
@@ -248,6 +239,16 @@ impl AssetReadyProof {
     /// tracks and the modules the pipeline declares. Readiness requires this to
     /// be empty, so a proof that skips, duplicates, or misbinds a handle can
     /// never satisfy [`AssetLoadState::Ready`].
+    ///
+    /// The mismatch branches below are defensive integrity checks rather than
+    /// expected runtime outcomes. [`resolve_asset_load_state`] builds the proof
+    /// from the same [`GeneratedAssets`] registry only after every tracked
+    /// document and scene reports loaded and every declared module name, index,
+    /// and spawned handle agrees. A gap is therefore unreachable through that
+    /// successful construction path today. Keeping the checks makes the proof
+    /// self-validating for mutation tests and ensures a future constructor
+    /// refactor fails closed instead of allowing an incomplete proof to set the
+    /// Ready latch.
     pub fn gaps(&self, generated: &GeneratedAssets) -> Vec<String> {
         let mut gaps = Vec::new();
 
@@ -389,9 +390,9 @@ impl RenderAssets {
 }
 
 /// Loads every generated asset and publishes the shared render handles.
-pub struct AssetPlugin;
+pub struct GeneratedAssetPlugin;
 
-impl Plugin for AssetPlugin {
+impl Plugin for GeneratedAssetPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<AssetLoadState>()
             .init_resource::<AssetLoadReport>()
@@ -543,6 +544,8 @@ fn resolve_asset_load_state(
         // Readiness is a one-way latch, so the reason for it is captured here,
         // in the same branch and the same frame, and never re-derived later.
         let proof = AssetReadyProof::new(proven_documents, proven_modules);
+        // This should be empty by construction. Treating a defensive proof gap
+        // as a load failure keeps that invariant explicit and fail-closed.
         failures = proof.gaps(&generated);
         if failures.is_empty() {
             commands.insert_resource(proof);
@@ -566,11 +569,28 @@ enum LoadOutcome {
 }
 
 fn load_outcome(server: &AssetServer, id: UntypedAssetId) -> LoadOutcome {
-    match server.get_recursive_dependency_load_state(id) {
+    classify_load_state(server.get_recursive_dependency_load_state(id))
+}
+
+fn classify_load_state(state: Option<RecursiveDependencyLoadState>) -> LoadOutcome {
+    match state {
         Some(RecursiveDependencyLoadState::Loaded) => LoadOutcome::Loaded,
         Some(RecursiveDependencyLoadState::Failed(error)) => LoadOutcome::Failed(error.to_string()),
         Some(RecursiveDependencyLoadState::Loading)
-        | Some(RecursiveDependencyLoadState::NotLoaded)
-        | None => LoadOutcome::Pending,
+        | Some(RecursiveDependencyLoadState::NotLoaded) => LoadOutcome::Pending,
+        None => LoadOutcome::Failed("recursive dependency load state is missing".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_recursive_dependency_state_is_a_terminal_failure() {
+        assert!(matches!(
+            classify_load_state(None),
+            LoadOutcome::Failed(message) if message.contains("missing")
+        ));
     }
 }

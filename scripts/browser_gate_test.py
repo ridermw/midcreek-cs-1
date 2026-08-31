@@ -21,6 +21,7 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -360,6 +361,44 @@ class HeaderFloodServer:
         self._listener.close()
 
 
+class HandshakeServer:
+    """A loopback server that sends one complete upgrade response."""
+
+    def __init__(self, response: bytes) -> None:
+        self._response = response
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self.port = self._listener.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self.port}/devtools/page/1"
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self._listener.accept()
+        except OSError:
+            return
+        with connection:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return
+                request += chunk
+            connection.sendall(self._response)
+            self._stop.wait(5.0)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+
+
 class BoundedReadTest(unittest.TestCase):
     """One deadline bounds the handshake, every read, and every call."""
 
@@ -426,6 +465,43 @@ class BoundedReadTest(unittest.TestCase):
         self.assertIn("header bytes", message)
         self.assertIn(str(browser_gate.MAX_HANDSHAKE_BYTES), message)
 
+    def test_a_complete_oversized_header_block_is_refused(self) -> None:
+        response = (
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"X-Pad: "
+            + b"p" * browser_gate.MAX_HANDSHAKE_BYTES
+            + b"\r\n\r\n"
+        )
+        server = HandshakeServer(response)
+        self.addCleanup(server.close)
+
+        client = None
+        try:
+            with self.assertRaises(GateFailure) as failure:
+                client = browser_gate.WebSocket(server.url)
+        finally:
+            if client is not None:
+                client.close()
+
+        self.assertIn(str(browser_gate.MAX_HANDSHAKE_BYTES), str(failure.exception))
+
+    def test_websocket_bytes_after_a_legal_handshake_do_not_count_as_headers(self) -> None:
+        response = (
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n"
+            + frame(TEXT, b"x" * (browser_gate.MAX_HANDSHAKE_BYTES + 1))
+        )
+        server = HandshakeServer(response)
+        self.addCleanup(server.close)
+        client = browser_gate.WebSocket(server.url)
+        self.addCleanup(client.close)
+
+        self.assertEqual(
+            client.receive(),
+            "x" * (browser_gate.MAX_HANDSHAKE_BYTES + 1),
+        )
+
 
 class SessionBudgetTest(unittest.TestCase):
     """Every DevTools call is bounded by what is left of the whole gate."""
@@ -466,6 +542,80 @@ class SessionBudgetTest(unittest.TestCase):
             5.0,
             "the call waited on its own timeout instead of the gate budget",
         )
+
+
+# ---------------------------------------------------------------------------
+# Browser-open deadline
+# ---------------------------------------------------------------------------
+
+
+class BrowserOpenDeadlineTest(unittest.TestCase):
+    def test_a_missing_endpoint_stops_at_the_browser_open_budget(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+
+        def unavailable(*_args: object, **_kwargs: object) -> object:
+            if clock.now > 0.5:
+                raise AssertionError("the endpoint retry loop outlived its phase")
+            raise urllib.error.URLError("browser is not listening")
+
+        with (
+            patch.object(browser_gate, "BROWSER_TIMEOUT_SECONDS", 0.5),
+            patch.object(browser_gate.time, "monotonic", clock.monotonic),
+            patch.object(browser_gate.time, "sleep", clock.sleep),
+            patch.object(browser_gate.urllib.request, "urlopen", unavailable),
+            self.assertRaises(GateFailure) as failure,
+        ):
+            browser_gate.open_page(
+                9222,
+                "http://127.0.0.1:8000/",
+                browser_gate.Deadline(600.0),
+            )
+
+        self.assertIn("never opened a DevTools endpoint", str(failure.exception))
+
+
+# ---------------------------------------------------------------------------
+# Readiness deadline
+# ---------------------------------------------------------------------------
+
+
+class BrowserReadinessDeadlineTest(unittest.TestCase):
+    def test_ready_observed_after_the_deadline_is_not_accepted(self) -> None:
+        class Budget:
+            def remaining(self) -> float:
+                return browser_gate.READY_TIMEOUT_SECONDS
+
+        class Session:
+            label = "page"
+
+            def __init__(self) -> None:
+                self.session = Budget()
+                self.answers = iter(
+                    ["ready", {"present": True, "text": ""}]
+                )
+
+            def evaluate(self, _expression: str) -> object:
+                return next(self.answers)
+
+        with (
+            patch.object(
+                browser_gate.time,
+                "monotonic",
+                side_effect=[0.0, 29.9, 30.1],
+            ),
+            patch.object(browser_gate, "write_diagnostics"),
+            self.assertRaises(GateFailure),
+        ):
+            browser_gate.wait_for_ready(Session(), Path("."))
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +1052,45 @@ class BoundedBodyTest(unittest.TestCase):
             "the clamp should shrink with the remaining budget",
         )
 
+    def test_a_complete_body_is_not_reclamped_after_urllib_closes_its_socket(
+        self,
+    ) -> None:
+        class ClosingSocket:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def settimeout(self, _timeout: float) -> None:
+                if self.closed:
+                    raise OSError("socket is closed")
+
+        class Raw:
+            def __init__(self, connection: ClosingSocket) -> None:
+                self._sock = connection
+
+        class Response:
+            def __init__(self, connection: ClosingSocket) -> None:
+                self.fp = Raw(connection)
+                self.connection = connection
+                self.reads = 0
+
+            def read1(self, _size: int) -> bytes:
+                self.reads += 1
+                self.connection.closed = True
+                return b'{"ready":true}'
+
+            def isclosed(self) -> bool:
+                return self.connection.closed
+
+        connection = ClosingSocket()
+        response = Response(connection)
+
+        body = browser_gate.read_bounded(
+            response, 64 * 1024, browser_gate.Deadline(30.0), "reading"
+        )
+
+        self.assertEqual(body, b'{"ready":true}')
+        self.assertEqual(response.reads, 1)
+
 
 class KeyboardOwnershipTest(unittest.TestCase):
     """Drives the real gate functions against the scriptable page."""
@@ -1284,9 +1473,16 @@ class FakeHomepage:
 
     PUBLISHED = "http://127.0.0.1:9/midcreek-cs-1/play/index.html"
 
-    def __init__(self, **overrides: object) -> None:
+    def __init__(
+        self,
+        *,
+        reports: list[dict] | None = None,
+        remaining: float = browser_gate.BROWSER_TIMEOUT_SECONDS,
+        **overrides: object,
+    ) -> None:
         self.report = {
             "count": 1,
+            "readyState": "complete",
             "class": "play-embed",
             "classes": ["play-embed"],
             "src": "play/index.html",
@@ -1296,15 +1492,24 @@ class FakeHomepage:
             "height": 648.0,
         }
         self.report.update(overrides)
+        self.reports = reports or []
+        self.report_index = 0
+        self.session = type(
+            "FakeBrowserSession",
+            (),
+            {"remaining": lambda _self: remaining},
+        )()
 
     scope = browser_gate.TOP_SCOPE
     label = browser_gate.TOP_SCOPE.label
 
     def evaluate(self, expression: str) -> object:
         if expression == browser_gate.DISCOVER_EMBED_JS:
-            if self.report["count"] != 1:
-                return {"count": self.report["count"]}
-            return self.report
+            if not self.reports:
+                return self.report
+            report = self.reports[min(self.report_index, len(self.reports) - 1)]
+            self.report_index += 1
+            return report
         raise AssertionError(f"the fake homepage cannot answer {expression!r}")
 
 
@@ -1318,6 +1523,44 @@ class EmbedDiscoveryTest(unittest.TestCase):
         report = self.discover(FakeHomepage())
 
         self.assertEqual(report["src"], "play/index.html")
+
+    def test_discovery_waits_for_an_iframe_while_the_homepage_is_loading(self) -> None:
+        published = FakeHomepage().report
+        report = self.discover(
+            FakeHomepage(
+                reports=[
+                    {"count": 0, "readyState": "loading"},
+                    published,
+                ]
+            )
+        )
+
+        self.assertEqual(report["src"], "play/index.html")
+
+    def test_loading_without_an_iframe_stops_at_the_shared_phase_bound(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        page = FakeHomepage(
+            reports=[{"count": 0, "readyState": "loading"}],
+            remaining=0.5,
+        )
+
+        with (
+            patch.object(browser_gate.time, "monotonic", clock.monotonic),
+            patch.object(browser_gate.time, "sleep", clock.sleep),
+            self.assertRaises(GateFailure),
+        ):
+            self.discover(page)
+
+        self.assertEqual(clock.now, 0.5)
 
     def test_a_homepage_without_exactly_one_embed_fails(self) -> None:
         for count in (0, 2):

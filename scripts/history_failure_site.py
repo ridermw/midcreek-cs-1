@@ -10,7 +10,7 @@ treating this page as the replacement for them.
 
 So the only decision left here is what the page may say. It may link the
 retained game when the previous publication's own `last-green.json` parses,
-names that tree, and names the file the link points at — and otherwise it says
+names that tree, and names a complete playable package — and otherwise it says
 nothing about a game at all. A previous tree that is corrupt, symlinked,
 truncated, forged, or simply absent costs this page a sentence; it never costs
 the run its publication.
@@ -66,6 +66,18 @@ MAX_GAME_FILES = 4096
 
 #: The one file the status page would link, if it linked anything.
 PLAYABLE_ENTRY = "play/index.html"
+
+#: The complete fixed package roster `sitegen` requires before publication.
+REQUIRED_PLAYABLE_FILES = (
+    PLAYABLE_ENTRY,
+    "play/play.js",
+    "play/play.css",
+    "play/game.js",
+    "play/game_bg.wasm",
+)
+
+#: The package must also contain at least one generated asset below this root.
+PLAYABLE_ASSETS = "play/assets/"
 
 #: The directory the previous publication keeps its game in.
 PLAYABLE_ROOT = "play"
@@ -224,9 +236,9 @@ def playable_refusal(previous: Path | None) -> str | None:
     a sentence, not its status.
 
     A claim is earned by provenance, never by existence. The manifest the
-    generator wrote has to parse, name this exact tree, and name the one file
-    the page would link; the files it names have to be plain files really
-    inside the package. Anything short of that leaves the domain unclaimed and
+    generator wrote has to parse, name this exact tree, and name every required
+    file plus an asset; the files it names have to be plain files really inside
+    the package. Anything short of that leaves the domain unclaimed and
     untouched, for assembly to retain or refuse on its own terms.
     """
     if previous is None:
@@ -266,8 +278,11 @@ def playable_refusal(previous: Path | None) -> str | None:
             return f"{LAST_GREEN_FILE} {refusal}"
         named.add(PurePosixPath(entry).as_posix())
 
-    if PLAYABLE_ENTRY not in named:
-        return f"{LAST_GREEN_FILE} does not name {PLAYABLE_ENTRY}"
+    for required in REQUIRED_PLAYABLE_FILES:
+        if required not in named:
+            return f"{LAST_GREEN_FILE} does not name {required}"
+    if not any(entry.startswith(PLAYABLE_ASSETS) for entry in named):
+        return f"{LAST_GREEN_FILE} does not name a file below {PLAYABLE_ASSETS}"
     return None
 
 

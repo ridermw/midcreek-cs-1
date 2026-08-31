@@ -44,7 +44,9 @@
 //! public screen-to-world interface, so the orbit task can retarget the basis
 //! without touching a single movement rule.
 
-use bevy::{prelude::*, world_serialization::WorldInstance};
+use bevy::{
+    animation::AnimatedBy, ecs::system::SystemParam, prelude::*, world_serialization::WorldInstance,
+};
 
 use crate::{
     CellShiftSet,
@@ -52,11 +54,10 @@ use crate::{
     assets::GeneratedAssets,
     design::{INITIAL_CAMERA_YAW_DEGREES, PLAYER_RADIUS, PropId, ROOM_SIZE},
     operations::MovementLock,
-    world::{HallColliders, HallState, PlayerSpawnPoint},
+    world::{HallBlueprint, HallColliders, HallState, PlayerSpawnPoint},
 };
 
-/// Ground speed of the technician, in metres per second.
-pub const PLAYER_SPEED: f32 = 3.0;
+pub use crate::design::PLAYER_SPEED;
 
 /// Accepted displacement below this length is treated as standing still.
 pub const PLAYER_MOVE_EPSILON: f32 = 1.0e-5;
@@ -326,6 +327,12 @@ pub enum PlayerRigError {
     MissingTechnicianDocument,
     /// The spawned technician exposes no `AnimationPlayer`.
     MissingAnimationPlayer,
+    /// Descendant animation players exist, but none is linked through
+    /// [`AnimatedBy`] to every required rig target.
+    UnlinkedAnimationPlayer {
+        /// Number of descendant animation players inspected.
+        found: usize,
+    },
     /// The generated technician document lacks a declared clip.
     MissingAnimationClip {
         /// Declared clip name.
@@ -620,11 +627,14 @@ fn report_rig_unavailable(
     report: &mut PlayerRigReport,
     next: &mut NextState<PlayerRigState>,
     error: PlayerRigError,
+    was_bound: bool,
 ) {
     if !report.is_healthy() {
         return;
     }
-    warn!("technician rig is rebinding: {error:?}");
+    if was_bound {
+        warn!("technician rig is rebinding: {error:?}");
+    }
     report.errors = vec![error];
     next.set(PlayerRigState::Pending);
 }
@@ -648,13 +658,16 @@ fn bind_technician_rig(
     children: Query<&Children>,
     named: Query<(&Name, &Transform)>,
     players: Query<Entity, With<AnimationPlayer>>,
+    animated_by: Query<&AnimatedBy>,
     parts: Option<Res<PlayerParts>>,
+    animations: Option<Res<PlayerAnimations>>,
     generated: Res<GeneratedAssets>,
     documents: Res<Assets<Gltf>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut report: ResMut<PlayerRigReport>,
     mut next: ResMut<NextState<PlayerRigState>>,
 ) {
+    let was_bound = parts.is_some() || animations.is_some();
     let Ok(root) = technicians.single() else {
         report_rig_unavailable(
             &mut report,
@@ -662,6 +675,7 @@ fn bind_technician_rig(
             PlayerRigError::TechnicianInstanceUnavailable {
                 found: technicians.iter().count(),
             },
+            was_bound,
         );
         return;
     };
@@ -682,7 +696,15 @@ fn bind_technician_rig(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if parts.is_some() && stale.is_empty() && report.is_healthy() {
+    let animation_player_is_live = animations.as_deref().is_some_and(|animations| {
+        players.contains(animations.player)
+            && parts.as_deref().is_some_and(|parts| {
+                parts.all().iter().all(|part| {
+                    animated_by.get(part.entity).map(|link| link.0) == Ok(animations.player)
+                })
+            })
+    });
+    if parts.is_some() && stale.is_empty() && animation_player_is_live && report.is_healthy() {
         return;
     }
 
@@ -706,6 +728,7 @@ fn bind_technician_rig(
             &mut report,
             &mut next,
             PlayerRigError::TechnicianRigNodesUnavailable,
+            was_bound,
         );
         return;
     }
@@ -719,20 +742,35 @@ fn bind_technician_rig(
         }
     };
 
-    let animation_player = parts.as_ref().and_then(|_| {
+    let animation_players = parts.as_ref().map_or_else(Vec::new, |_| {
+        let mut found = Vec::new();
         let mut stack = vec![root];
         while let Some(entity) = stack.pop() {
             if players.contains(entity) {
-                return Some(entity);
+                found.push(entity);
             }
             if let Ok(kids) = children.get(entity) {
                 stack.extend(kids.iter());
             }
         }
-        None
+        found
+    });
+    let animation_player = parts.as_ref().and_then(|parts| {
+        animation_players.iter().copied().find(|player| {
+            parts
+                .all()
+                .iter()
+                .all(|part| animated_by.get(part.entity).map(|link| link.0) == Ok(*player))
+        })
     });
     if parts.is_some() && animation_player.is_none() {
-        errors.push(PlayerRigError::MissingAnimationPlayer);
+        errors.push(if animation_players.is_empty() {
+            PlayerRigError::MissingAnimationPlayer
+        } else {
+            PlayerRigError::UnlinkedAnimationPlayer {
+                found: animation_players.len(),
+            }
+        });
     }
 
     let document = generated
@@ -801,12 +839,18 @@ fn bind_technician_rig(
     next.set(PlayerRigState::Ready);
 }
 
+#[derive(SystemParam)]
+struct MovementContext<'w> {
+    basis: Res<'w, ViewBasis>,
+    colliders: Res<'w, HallColliders>,
+    blueprint: Option<Res<'w, HallBlueprint>>,
+    lock: Option<Res<'w, MovementLock>>,
+}
+
 fn move_player(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    basis: Res<ViewBasis>,
-    colliders: Res<HallColliders>,
-    lock: Option<Res<MovementLock>>,
+    movement: MovementContext,
     mut motion: ResMut<PlayerMotion>,
     mut technicians: Query<&mut Transform, With<Technician>>,
 ) {
@@ -824,19 +868,26 @@ fn move_player(
     // A repair holds the technician still. The arrow keys are dropped rather
     // than merely blocked, so the published motion really is standing still and
     // the animation state cannot keep a stale walking pose.
-    if lock.is_some_and(|lock| lock.is_locked()) {
+    if movement
+        .lock
+        .as_deref()
+        .is_some_and(MovementLock::is_locked)
+    {
         *motion = PlayerMotion::default();
         return;
     }
 
     let requested_screen = arrow_input(&keys);
-    let requested_world = basis.world_direction(requested_screen);
+    let requested_world = movement.basis.world_direction(requested_screen);
     let from = Vec2::new(transform.translation.x, transform.translation.z);
     let resolution = resolve_move(
         from,
         requested_world * PLAYER_SPEED * movement_delta_secs(time.delta_secs()),
-        &colliders,
-        ROOM_SIZE,
+        &movement.colliders,
+        movement
+            .blueprint
+            .as_deref()
+            .map_or(ROOM_SIZE, |hall| hall.0.room.size),
         PLAYER_RADIUS,
     );
 
@@ -871,7 +922,7 @@ pub fn update_player_animation(
     animations: Res<PlayerAnimations>,
     mut state: ResMut<PlayerAnimationState>,
     mut players: Query<&mut AnimationPlayer>,
-    mut transforms: Query<&mut Transform>,
+    mut transforms: Query<&mut Transform, With<Name>>,
 ) {
     let Ok(mut player) = players.get_mut(animations.player) else {
         return;
@@ -910,7 +961,7 @@ mod tests {
     const HEADINGS: [f32; 4] = [45.0, 135.0, 225.0, 315.0];
 
     fn colliders() -> HallColliders {
-        HallColliders::from(crate::design::SceneBlueprint::v0().colliders)
+        HallColliders::from_validated_blueprint(&crate::design::SceneBlueprint::v0())
     }
 
     fn keys(pressed: &[KeyCode]) -> ButtonInput<KeyCode> {

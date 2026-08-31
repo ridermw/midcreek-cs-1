@@ -8,7 +8,7 @@ use std::{
 use bevy::color::LinearRgba;
 use midcreek_cs_1::{
     assetgen::{
-        ASSET_MODULES, ASSET_NAMES, AssetGenError, GENERATED_DIR, GENERATOR_NAME,
+        ASSET_MODULES, ASSET_NAMES, AssetGenError, AssetSource, GENERATED_DIR, GENERATOR_NAME,
         MAX_BONES_PER_RIG, MAX_PRIMITIVES_PER_MESH, MAX_TRIANGLES_PER_ASSET,
         MAX_VERTICES_PER_PRIMITIVE, SOURCE_DIR, TECHNICIAN_BONES, TECHNICIAN_CLIPS, check_assets,
         generate_assets, generate_glb, generated_path, load_source, parse_source, source_path,
@@ -235,6 +235,82 @@ fn generation_rejects_a_source_over_the_triangle_budget() {
     assert!(
         message.contains("triangle") && message.contains(&MAX_TRIANGLES_PER_ASSET.to_string()),
         "message {message} should name the triangle budget"
+    );
+}
+
+fn technician_rig(source: &mut AssetSource) -> &mut midcreek_cs_1::assetgen::RigSource {
+    source
+        .modules
+        .iter_mut()
+        .find(|module| module.name == "technician")
+        .expect("technician module")
+        .rig
+        .as_mut()
+        .expect("technician rig")
+}
+
+fn assert_typed_generation_error(
+    mut source: AssetSource,
+    mutate: impl FnOnce(&mut midcreek_cs_1::assetgen::RigSource),
+    expected_field: &str,
+    expected_message: &str,
+) {
+    mutate(technician_rig(&mut source));
+    let error = generate_glb(&source, "assets/source/technician.ron")
+        .expect_err("malformed post-parse rig data must not publish GLB bytes");
+    let AssetGenError::Invalid { field, message, .. } = error else {
+        panic!("expected a typed invalid error, got {error:?}");
+    };
+    assert!(
+        field.contains(expected_field),
+        "field {field} should mention {expected_field}"
+    );
+    assert!(
+        message.contains(expected_message),
+        "message {message} should mention {expected_message}"
+    );
+}
+
+#[test]
+fn generation_rejects_malformed_post_parse_rig_data_without_publishing_bytes() {
+    let source = load_source(&repo_root(), "technician").expect("technician source");
+
+    assert_typed_generation_error(
+        source.clone(),
+        |rig| rig.bones[1].parent = Some("missing-parent".to_owned()),
+        "parent",
+        "missing-parent",
+    );
+    assert_typed_generation_error(
+        source.clone(),
+        |rig| rig.bones.clear(),
+        "bones",
+        "root bone",
+    );
+    assert_typed_generation_error(
+        source,
+        |rig| rig.clips[0].tracks[0].bone = "missing-animation-target".to_owned(),
+        "tracks[0].bone",
+        "missing-animation-target",
+    );
+}
+
+#[test]
+fn write_assets_publishes_nothing_when_generation_fails() {
+    let root = temp_root("assetgen-no-partial-write");
+    copy_pipeline(&repo_root(), root.path());
+    fs::write(
+        source_path(root.path(), "technician"),
+        "this is not a valid asset source",
+    )
+    .expect("fixture source should be replaceable");
+    let output = root.path().join("published");
+
+    let error = write_assets(root.path(), &output).expect_err("generation must fail");
+    assert!(matches!(error, AssetGenError::Parse { .. }));
+    assert!(
+        !output.exists(),
+        "write_assets must generate the full batch before publishing any GLB"
     );
 }
 

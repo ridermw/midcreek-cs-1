@@ -42,7 +42,7 @@ impl Plugin for CellShiftPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(FLOOR_LIGHT.into()))
             .add_plugins((
-                assets::AssetPlugin,
+                assets::GeneratedAssetPlugin,
                 world::HallPlugin,
                 player::TechnicianPlugin,
                 camera::CameraPlugin,
@@ -68,6 +68,21 @@ impl Plugin for CellShiftPlugin {
     }
 }
 
+/// Asset settings shared by playable and verification app construction.
+///
+/// Browser packages contain no metadata files, so the web build avoids
+/// requesting them. Native builds retain Bevy's default metadata behavior.
+#[doc(hidden)]
+pub fn runtime_asset_plugin() -> bevy::asset::AssetPlugin {
+    let plugin = bevy::asset::AssetPlugin::default();
+    #[cfg(target_arch = "wasm32")]
+    let plugin = bevy::asset::AssetPlugin {
+        meta_check: bevy::asset::AssetMetaCheck::Never,
+        ..plugin
+    };
+    plugin
+}
+
 pub fn run() {
     let mut app = App::new();
     app.add_plugins(
@@ -76,10 +91,7 @@ pub fn run() {
                 primary_window: Some(primary_window()),
                 ..default()
             })
-            .set(bevy::asset::AssetPlugin {
-                meta_check: bevy::asset::AssetMetaCheck::Never,
-                ..default()
-            }),
+            .set(runtime_asset_plugin()),
     )
     .add_plugins(CellShiftPlugin);
 
@@ -118,10 +130,7 @@ pub fn run_verification(
                 primary_window: Some(window),
                 ..default()
             })
-            .set(bevy::asset::AssetPlugin {
-                meta_check: bevy::asset::AssetMetaCheck::Never,
-                ..default()
-            }),
+            .set(runtime_asset_plugin()),
     )
     .add_plugins(CellShiftPlugin)
     .add_plugins(verification::VerificationPlugin::new(

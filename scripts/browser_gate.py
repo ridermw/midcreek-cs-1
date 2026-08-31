@@ -194,7 +194,17 @@ class WebSocket:
                     f"without finishing, over the {MAX_HANDSHAKE_BYTES} byte limit"
                 )
             self._read_more()
-        head, self._buffer = self._buffer.split(b"\r\n\r\n", 1)
+        header_end = self._buffer.index(b"\r\n\r\n")
+        if header_end > MAX_HANDSHAKE_BYTES:
+            self.close()
+            raise GateFailure(
+                f"the DevTools handshake sent {header_end} header bytes, over the "
+                f"{MAX_HANDSHAKE_BYTES} byte limit"
+            )
+        head, self._buffer = (
+            self._buffer[:header_end],
+            self._buffer[header_end + 4 :],
+        )
         if b"101" not in head.split(b"\r\n", 1)[0]:
             raise GateFailure(f"DevTools refused the WebSocket upgrade: {head!r}")
 
@@ -650,6 +660,9 @@ def read_bounded(response: object, limit: int, deadline: Deadline, doing: str) -
         if not chunk:
             break
         data += chunk
+        is_closed = getattr(response, "isclosed", None)
+        if callable(is_closed) and is_closed():
+            break
     return bytes(data)
 
 
@@ -783,15 +796,30 @@ class Page:
 
 
 def open_page(cdp_port: int, url: str, deadline: Deadline) -> DevTools:
+    opened_by = time.monotonic() + min(
+        BROWSER_TIMEOUT_SECONDS,
+        deadline.require("waiting for a DevTools endpoint"),
+    )
     version_url = f"http://127.0.0.1:{cdp_port}/json/version"
     while True:
-        remaining = deadline.require("waiting for a DevTools endpoint")
+        remaining = min(
+            deadline.require("waiting for a DevTools endpoint"),
+            opened_by - time.monotonic(),
+        )
+        if remaining <= 0.0:
+            break
         try:
             with urllib.request.urlopen(version_url, timeout=min(2.0, remaining)) as response:
                 json.loads(read_bounded(response, 64 * 1024, deadline, "reading the DevTools version"))
                 break
         except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout):
-            time.sleep(0.25)
+            time.sleep(min(0.25, max(0.0, opened_by - time.monotonic())))
+
+    if remaining <= 0.0:
+        deadline.require("waiting for a DevTools endpoint")
+        raise GateFailure(
+            f"the browser never opened a DevTools endpoint on port {cdp_port}"
+        )
 
     timeout = min(BROWSER_TIMEOUT_SECONDS, deadline.require("opening a browser target"))
     new_target = urllib.request.Request(
@@ -847,9 +875,10 @@ def wait_for_ready(session: Page, diagnostics: Path) -> float:
     state = "missing"
     while time.monotonic() < deadline:
         state = session.evaluate(GAME_STATE_JS)
-        if state == "ready":
-            return time.monotonic() - started
-        if state == "error":
+        observed_at = time.monotonic()
+        if state == "ready" and observed_at <= deadline:
+            return observed_at - started
+        if state in ("ready", "error"):
             break
         time.sleep(0.25)
     errors = session.evaluate(BROWSER_ERRORS_JS)
@@ -1317,11 +1346,13 @@ def check_canvas_pixels(
 DISCOVER_EMBED_JS = """
 (() => {
   const frames = Array.from(document.getElementsByTagName("iframe"));
-  if (frames.length !== 1) return { count: frames.length };
+  const readyState = document.readyState;
+  if (frames.length !== 1) return { count: frames.length, readyState };
   const frame = frames[0];
   const rect = frame.getBoundingClientRect();
   return {
     count: 1,
+    readyState,
     class: frame.className,
     classes: Array.from(frame.classList),
     src: frame.getAttribute("src"),
@@ -1339,7 +1370,19 @@ PUBLISHED_EMBED_CLASS = "play-embed"
 
 def discover_embed(session: Page, expected_url: str) -> dict:
     """Finds the published playable frame and proves it is the published one."""
-    report = dict(session.evaluate(DISCOVER_EMBED_JS))
+    started = time.monotonic()
+    budget = min(BROWSER_TIMEOUT_SECONDS, session.session.remaining())
+    ready_by = started + budget
+    while True:
+        report = dict(session.evaluate(DISCOVER_EMBED_JS))
+        observed_at = time.monotonic()
+        if (
+            report.get("count") != 0
+            or report.get("readyState") == "complete"
+            or observed_at >= ready_by
+        ):
+            break
+        time.sleep(min(0.25, ready_by - observed_at))
     if report.get("count") != 1:
         raise GateFailure(
             f"the generated homepage carries {report.get('count')} iframes; the "
