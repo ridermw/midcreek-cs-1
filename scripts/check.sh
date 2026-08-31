@@ -6,16 +6,19 @@
 # It runs, in order:
 #
 #   1. actionlint over every workflow, pinned to one version;
-#   2. rustfmt in check mode;
-#   3. Clippy over every target and feature with warnings denied;
-#   4. the autonomous asset generator in --check mode;
-#   5. sitegen validation of the published progress data;
-#   6. every pure, integration, and site test;
-#   7. the rendered verification contract, which launches the real game and
+#   2. the browser-gate unit suite against loopback and fake sockets;
+#   3. rustfmt in check mode;
+#   4. Clippy over every target and feature with warnings denied;
+#   5. the autonomous asset generator in --check mode;
+#   6. sitegen validation of the published progress data;
+#   7. the history suite, including the degraded publication fallback composed
+#      with the real assembler;
+#   8. every pure, integration, and site test;
+#   9. the rendered verification contract, which launches the real game and
 #      analyses its fourteen real frames;
-#   8. the packaged WebAssembly build and its headless browser gate, when a
+#  10. the packaged WebAssembly build and its headless browser gate, when a
 #      browser and the pinned wasm-bindgen toolchain are available;
-#   9. the release build.
+#  11. the release build.
 #
 # The rendered contract needs a real renderer. On a headless Linux machine that
 # means Xvfb: a missing display or a missing renderer is a hard failure here,
@@ -35,7 +38,54 @@ step() {
 export BEVY_ASSET_ROOT="$repository"
 
 # ---------------------------------------------------------------------------
-# Renderer availability
+# Pure gates
+# ---------------------------------------------------------------------------
+
+# The workflow is the one program here that can only run on a push to main, so
+# it is linted before anything expensive: a run that cannot start proves
+# nothing about the gates it was supposed to carry.
+step "workflow lint"
+./scripts/actionlint.sh
+
+step "browser gate unit tests"
+python3 scripts/browser_gate_test.py
+
+step "rustfmt"
+cargo fmt --all --check
+
+step "clippy"
+cargo clippy --all-targets --all-features -- -D warnings
+
+step "generated assets are current"
+cargo run --quiet --bin assetgen -- --check
+
+# The published timeline resolves the commit every finished task names, so the
+# checkout has to reach those commits before anything validates them. On a
+# shallow clone this repairs the history first; under `set -e` a validation run
+# against a short clone would end the gate before it could.
+step "published history bound"
+./scripts/ensure-history.sh
+
+step "published progress data is consistent"
+cargo run --quiet --bin sitegen -- validate \
+  --progress docs/progress.json \
+  --plan docs/implementation-plan.md \
+  --repository .
+
+# The history suite composes the degraded publication fallback with the real
+# assembler, so it runs once the step above has built `sitegen` for it.
+step "history bound tests"
+python3 scripts/ensure_history_test.py
+
+step "pure and integration tests"
+cargo test --lib --bins
+cargo test --test asset_contract
+cargo test --test app_contract
+cargo test --test sitegen_contract
+cargo test --test pages_assembly_contract
+
+# ---------------------------------------------------------------------------
+# Rendered gate
 # ---------------------------------------------------------------------------
 
 # The rendered contract launches real game windows. Its tests are serialized so
@@ -57,42 +107,6 @@ case "$(uname -s)" in
     exit 1
     ;;
 esac
-
-# ---------------------------------------------------------------------------
-# Pure gates
-# ---------------------------------------------------------------------------
-
-# The workflow is the one program here that can only run on a push to main, so
-# it is linted before anything expensive: a run that cannot start proves
-# nothing about the gates it was supposed to carry.
-step "workflow lint"
-./scripts/actionlint.sh
-
-step "rustfmt"
-cargo fmt --all --check
-
-step "clippy"
-cargo clippy --all-targets --all-features -- -D warnings
-
-step "generated assets are current"
-cargo run --quiet --bin assetgen -- --check
-
-step "published progress data is consistent"
-cargo run --quiet --bin sitegen -- validate \
-  --progress docs/progress.json \
-  --plan docs/implementation-plan.md \
-  --repository .
-
-step "pure and integration tests"
-cargo test --lib --bins
-cargo test --test asset_contract
-cargo test --test app_contract
-cargo test --test sitegen_contract
-cargo test --test pages_assembly_contract
-
-# ---------------------------------------------------------------------------
-# Rendered gate
-# ---------------------------------------------------------------------------
 
 step "rendered verification contract"
 "${render_command[@]}"
@@ -120,8 +134,21 @@ browser_available() {
   return 1
 }
 
+# `rustup target list --installed | grep -q ...` is a false skip waiting to
+# happen. `grep -q` exits at the first match, `rustup` is then killed by
+# SIGPIPE, and `pipefail` reports the whole pipeline as failed — so an
+# installed target reads as a missing one and the browser gate below is skipped
+# while the run still looks green. That is the one failure this script must
+# never have, so the list is captured before anything reads it and nothing is
+# ever asked to write into a closed pipe.
+wasm_target_installed() {
+  local installed
+  installed="$(rustup target list --installed)" || return 1
+  grep -qx wasm32-unknown-unknown <<<"$installed"
+}
+
 if command -v wasm-bindgen >/dev/null 2>&1 \
-  && rustup target list --installed | grep -qx wasm32-unknown-unknown \
+  && wasm_target_installed \
   && browser_available; then
   step "playable web build and browser gate"
   ./scripts/build-web.sh "$web_package"

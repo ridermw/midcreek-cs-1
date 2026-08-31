@@ -17,9 +17,9 @@ push to `main`, whether that push is green or red.
 | --- | --- |
 | Working now | `ci-baseline` — Add CI and publish the reproducible POC baseline |
 | Tasks | 12 done, 1 in progress, 0 future, 13 total |
-| Challenges | 0 open, 12 resolved, 12 total |
+| Challenges | 2 open, 12 resolved, 14 total |
 | Reviewed plan tasks | 13 |
-| `docs/progress.json` | sha256 `25fad3414d18253d` |
+| `docs/progress.json` | sha256 `2676dd1630820a90` |
 | `docs/implementation-plan.md` | sha256 `bc948da3974c990b` |
 <!-- sitegen:status:end -->
 
@@ -931,6 +931,26 @@ without packaging a game and can package a game without verifying anything:
 So `RetainLastGreen` keeps the last verified game while publishing the native
 evidence this run really produced, and `FailedRetainLastGreen` publishes the
 current failure status beside the last green screenshots.
+
+When Publish cannot prove its checkout reaches every commit
+`docs/progress.json` names, the strict generator is not run at all;
+`scripts/history_failure_site.py` writes a degraded current tree instead — one
+`index.html` carrying the sanitized workflow result, and nothing else. That
+tree is assembled with `--publication degraded`, which is how a page that built
+no game says it is not the replacement for one: a green run that would
+otherwise be a `GreenReplacement` becomes a retention, so the last verified
+game survives a publication the generator could not produce. Without the flag
+the assembler refuses the whole publication rather than dropping a verified
+game for a page that never had one.
+
+The fallback copies nothing. Assembly is the single place a previous domain is
+carried forward, and it carries it once. All the fallback decides is whether
+the page may link the retained build, and it earns that by provenance rather
+than existence: the previous `last-green.json` has to parse as the manifest
+this generator writes, name a valid source commit, and exactly list the plain
+files inside `play/`, within explicit manifest and package limits. An unsafe
+previous tree costs the fallback page that one sentence. The assembler checks
+the retained tree independently and can refuse the final publication.
 
 `last-green.json` describes the assembled tree rather than the plan that
 produced it. The generator writes it after promotion completes, enumerating

@@ -8,6 +8,11 @@
 # endpoint to the repository-owned Python gate. Diagnostics are retained on
 # failure and the exact server and browser PIDs are always terminated.
 #
+# The site the browser sees is generated here by the same `sitegen` commands
+# the Pages workflow runs, from this very package, so the gate proves the real
+# published homepage and its real `play/` copy rather than a host document
+# written to look like them.
+#
 # The diagnostics directory is destructive, so it is canonicalized, contained
 # to the repository build root or the workflow runner temporary directory, and
 # only ever cleaned when a previous run of this script created it.
@@ -35,12 +40,6 @@ else
   caller_supplied=0
 fi
 sentinel=".midcreek-web-smoke"
-case "$diagnostics_input" in
-  "")
-    echo "refusing an empty path as a diagnostics directory" >&2
-    exit 1
-    ;;
-esac
 if [[ -L "$diagnostics_input" ]]; then
   echo "refusing the symbolic link $diagnostics_input as a diagnostics directory" >&2
   exit 1
@@ -123,6 +122,10 @@ http_port="$(free_port)"
 cdp_port="$(free_port)"
 profile="$(mktemp -d "${TMPDIR:-/tmp}/midcreek-chrome-XXXXXX")"
 serve_root="$(mktemp -d "${TMPDIR:-/tmp}/midcreek-serve-XXXXXX")"
+# The generated site is built from a package the site generator will only
+# accept from a trusted build root, so it is staged under the repository's own
+# target directory rather than in the system temporary directory.
+build_root="$repository/target/web-smoke-site"
 
 server_pid=""
 browser_pid=""
@@ -137,7 +140,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -rf "$profile" "$serve_root"
+  rm -rf "$profile" "$serve_root" "$build_root"
   if [[ "$status" -eq 0 ]]; then
     rm -f "$diagnostics/server.log" "$diagnostics/browser.log"
   else
@@ -148,15 +151,50 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # The published site is a project page, so the game must work below a prefix.
+# The gate proves the package twice: directly, and inside the homepage the site
+# generator really produces. That homepage is generated here, from this very
+# package, by the same repository-owned commands the Pages workflow runs — the
+# gate is never handed a hand-written host document to prove instead.
 prefix="midcreek-cs-1"
-mkdir -p "$serve_root/$prefix/play"
-cp -R "$package/." "$serve_root/$prefix/play/"
+site_root="$serve_root/$prefix"
+rm -rf "$build_root"
+mkdir -p "$build_root/web/play"
+cp -R "$package/." "$build_root/web/play/"
+
+# One passed gate row, recorded by the same runner the workflow uses, is what
+# makes this package a promotable playable build as far as the generator is
+# concerned. Nothing here hand-writes a result manifest.
+"$repository/scripts/run-gate.sh" "$build_root/web/gates.jsonl" "Headless browser gate" \
+  -- true >/dev/null
+cargo run --quiet --manifest-path "$repository/Cargo.toml" --bin sitegen -- result \
+  --job build-web \
+  --gates "$build_root/web/gates.jsonl" \
+  --output "$build_root/web" >/dev/null
+
+cargo run --quiet --manifest-path "$repository/Cargo.toml" --bin sitegen -- inputs \
+  --repository "$repository" \
+  --source-commit "$(git -C "$repository" rev-parse HEAD)" \
+  --run-url "https://github.com/ridermw/midcreek-cs-1/actions" \
+  --native-outcome skipped \
+  --web-outcome success \
+  --web "$build_root/web" \
+  --output "$build_root/pages" >/dev/null
+
+cargo run --quiet --manifest-path "$repository/Cargo.toml" --bin sitegen -- build \
+  --inputs "$build_root/pages/inputs.json" \
+  --output "$site_root" >/dev/null
+
+if [[ ! -f "$site_root/index.html" || ! -f "$site_root/play/index.html" ]]; then
+  echo "the generated site has no homepage or no published play/ package" >&2
+  exit 1
+fi
 
 python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$serve_root" \
   >"$diagnostics/server.log" 2>&1 &
 server_pid=$!
 
 base_url="http://127.0.0.1:$http_port/$prefix/play"
+hub_url="http://127.0.0.1:$http_port/$prefix/"
 for _ in $(seq 1 100); do
   if curl -fsS -o /dev/null "$base_url/index.html"; then
     break
@@ -196,4 +234,5 @@ python3 "$repository/scripts/browser_gate.py" \
   --cdp-port "$cdp_port" \
   --package "$package" \
   --design-source "$repository/src/design.rs" \
-  --diagnostics "$diagnostics"
+  --diagnostics "$diagnostics" \
+  --hub-url "$hub_url"

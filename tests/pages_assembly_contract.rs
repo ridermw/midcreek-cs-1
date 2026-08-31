@@ -7,8 +7,8 @@ use std::{
 };
 
 use midcreek_cs_1::sitegen::{
-    BuildDisposition, GateStatus, LastGreenManifest, SitegenError, WorkflowSummary, assemble_site,
-    validate_assembled_links,
+    BuildDisposition, CurrentPublication, GateStatus, LastGreenManifest, SitegenError,
+    WorkflowSummary, assemble_site, validate_assembled_links,
 };
 use sha2::{Digest, Sha256};
 
@@ -23,6 +23,7 @@ fn first_run_without_game_publishes_status_only() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -57,6 +58,7 @@ fn status_only_run_retains_previous_game_without_failure_disposition() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -93,6 +95,7 @@ fn native_failure_retains_previous_game_with_failure_disposition() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -131,6 +134,7 @@ fn web_failure_retains_previous_game_with_failure_disposition() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Failed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -183,6 +187,7 @@ fn a_failed_run_with_a_complete_retained_package_shows_the_playable_iframe() {
         current.path(),
         // The current run's own commit, distinct from the retained one.
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -246,6 +251,7 @@ fn a_status_only_retention_without_failure_also_shows_the_playable_iframe() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -277,6 +283,7 @@ fn a_run_that_already_shows_its_own_game_is_left_exactly_as_it_is() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -300,6 +307,7 @@ fn malformed_retained_metadata_leaves_the_homepage_pending() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -334,6 +342,7 @@ fn an_incomplete_retained_package_leaves_the_homepage_pending() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -363,6 +372,7 @@ fn a_retained_source_commit_that_is_not_a_full_sha_leaves_the_homepage_pending()
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -400,6 +410,7 @@ fn retained_metadata_declaring_a_file_list_inconsistent_with_its_package_leaves_
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -434,6 +445,7 @@ fn crossing_play_and_mode_markers_are_refused_without_partial_reconciliation() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -494,6 +506,7 @@ fn duplicate_or_nested_same_name_play_markers_are_refused_without_partial_reconc
             Some(previous.path()),
             current.path(),
             &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+            CurrentPublication::Generated,
             output.path(),
         )
         .unwrap();
@@ -526,6 +539,7 @@ fn assemble_twice_with_untrusted_previous(
         Some(previous),
         current_one.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         intermediate.path(),
     )
     .unwrap();
@@ -539,6 +553,7 @@ fn assemble_twice_with_untrusted_previous(
         Some(intermediate.path()),
         current_two.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -596,6 +611,7 @@ fn current_evidence_is_never_credited_from_a_run_that_attempted_no_verification_
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -633,6 +649,7 @@ fn incomplete_successful_current_evidence_is_refused() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -665,6 +682,7 @@ fn a_missing_mode_marker_leaves_the_play_panel_unreconciled_too() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -699,6 +717,7 @@ fn a_broken_iframe_target_is_refused_after_assembly() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -724,6 +743,7 @@ fn first_run_status_only_never_publishes_an_inconsistent_current_playable_packag
         None,
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -748,6 +768,7 @@ fn promoted_frames_without_a_gallery_manifest_are_refused_as_partial_evidence() 
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -775,6 +796,7 @@ fn successful_projection_without_promoted_artifacts_is_refused_as_partial_eviden
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -803,6 +825,7 @@ fn promoted_artifacts_without_a_projection_are_refused_as_partial_evidence() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -832,6 +855,7 @@ fn promoted_artifacts_with_an_incomplete_projection_are_refused() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -1119,6 +1143,7 @@ fn a_nested_symlink_inside_the_current_tree_is_refused_rather_than_followed() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -1170,6 +1195,7 @@ fn a_history_frame_that_points_into_another_entrys_directory_is_refused() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .expect_err("an entry may not publish another entry's pixels as its own");
@@ -1201,6 +1227,7 @@ fn a_history_frame_that_points_outside_history_is_refused() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .expect_err("a history entry may not publish current pixels as its own");
@@ -1216,6 +1243,80 @@ fn a_history_frame_that_points_outside_history_is_refused() {
 }
 
 #[test]
+fn assemble_cli_refuses_a_publication_kind_it_does_not_recognise() {
+    let current = fixture_site(
+        "current-unknown-publication",
+        &[("index.html", "CURRENT SOURCE: PASSED; WEB NOT RUN")],
+    );
+    let output = TempDirectory::new("unknown-publication-output");
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    let command = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+        .args([
+            "assemble",
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--publication",
+            "green",
+            "--output",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("sitegen should launch");
+
+    assert_eq!(command.status.code(), Some(2));
+    let stderr = String::from_utf8(command.stderr).unwrap();
+    assert!(
+        stderr.contains("--publication must be generated or degraded"),
+        "{stderr}"
+    );
+    assert!(!output.path().join("index.html").exists());
+}
+
+#[test]
+fn assemble_cli_publishes_a_degraded_tree_over_a_retained_game() {
+    let previous = fixture_site(
+        "previous-green-degraded-cli",
+        &[
+            ("play/index.html", "old shell"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+        ],
+    );
+    let current = fixture_site("current-degraded-cli", &DEGRADED_STATUS_PAGE);
+    let output = TempDirectory::new("degraded-cli-output");
+    let result_path = fixture_root().join("pages/native-passed-web-skipped.json");
+
+    let command = Command::new(env!("CARGO_BIN_EXE_sitegen"))
+        .args([
+            "assemble",
+            "--previous",
+            previous.path().to_str().unwrap(),
+            "--current",
+            current.path().to_str().unwrap(),
+            "--result",
+            result_path.to_str().unwrap(),
+            "--publication",
+            "degraded",
+            "--output",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("sitegen should launch");
+
+    assert_eq!(command.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(command.stdout).unwrap(),
+        "RetainLastGreen\n"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+}
+
+#[test]
 fn assembly_never_deletes_a_nonempty_caller_directory() {
     let current = fixture_site("status-only", &[("index.html", "CURRENT SOURCE: GREEN")]);
     let output = TempDirectory::new("nonempty-output");
@@ -1225,6 +1326,7 @@ fn assembly_never_deletes_a_nonempty_caller_directory() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -1246,6 +1348,7 @@ fn invalid_current_site_does_not_create_the_output_directory() {
         None,
         &current,
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         &output,
     );
 
@@ -1350,13 +1453,12 @@ mod workflow_contract {
     }
 
     #[test]
-    fn builds_the_web_game_only_after_verification_passes() {
+    fn builds_the_web_game_after_verify_even_when_verification_fails() {
         let workflow = workflow_source();
         let web = web_job(&workflow);
 
         assert!(web.contains("needs: verify"), "{web}");
-        // A job-level condition sits at four spaces; step conditions are deeper.
-        assert!(!web.contains("\n    if:"), "{web}");
+        assert!(web.contains("\n    if: always()\n"), "{web}");
         assert!(web.contains("permissions:\n      contents: read"), "{web}");
         assert!(!web.contains("contents: write"), "{web}");
     }
@@ -1450,6 +1552,10 @@ mod workflow_contract {
         let named = [
             "Workflow lint",
             "Published progress data",
+            // Composes the degraded publication fallback with the real
+            // assembler, so it is measured here rather than with the cheap
+            // gates: it needs the `sitegen` the gate above leaves built.
+            "History bound tests",
             "Rust formatting",
             "Clippy lints",
             "Generated asset freshness",
@@ -2180,6 +2286,7 @@ fn a_green_run_replaces_the_previous_playable_build_and_last_green_metadata() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2243,6 +2350,7 @@ fn a_green_run_with_an_incomplete_package_refuses_to_wipe_the_previous_game() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         &output,
     );
 
@@ -2285,6 +2393,7 @@ fn a_green_run_that_lost_its_package_entirely_refuses_to_wipe_the_previous_game(
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         &output,
     );
 
@@ -2302,6 +2411,282 @@ fn a_green_run_that_lost_its_package_entirely_refuses_to_wipe_the_previous_game(
     );
 }
 
+/// A degraded current tree is a status page the site generator did not write.
+/// It is the shape `scripts/history_failure_site.py` publishes when Publish
+/// cannot verify the history: one `index.html`, no game, no evidence.
+const DEGRADED_STATUS_PAGE: [(&str, &str); 1] = [(
+    "index.html",
+    "<!doctype html><html><body><main><h1>Publication history unavailable</h1></main></body></html>",
+)];
+
+#[test]
+fn a_green_run_publishing_a_degraded_page_retains_the_previous_game() {
+    // The defect this guards: a status page passed off as a replacement.
+    //
+    // A green run whose history could not be verified never built a site, so
+    // there is no new game to promote and nothing to replace the last verified
+    // one with. Refusing the whole publication would take the run's own status
+    // down with it; treating the page as a replacement would throw a verified
+    // game away for a page that never had one. Retention is the only answer
+    // left that is true.
+    let previous = fixture_site(
+        "previous-green-degraded",
+        &[
+            ("index.html", "PREVIOUS SOURCE: GREEN"),
+            ("play/index.html", "old shell"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+            ("last-green.json", r#"{"source_commit":"old"}"#),
+        ],
+    );
+    let current = fixture_site("current-degraded-green", &DEGRADED_STATUS_PAGE);
+    let output = TempDirectory::new("degraded-green-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Degraded,
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::RetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("last-green.json")).unwrap(),
+        r#"{"source_commit":"old"}"#
+    );
+    let index = fs::read_to_string(output.path().join("index.html")).unwrap();
+    assert!(index.contains("Publication history unavailable"));
+    assert!(!index.contains("PREVIOUS SOURCE: GREEN"));
+}
+
+#[test]
+fn a_degraded_page_retains_the_previous_game_whatever_the_run_did() {
+    for (native, web) in [
+        (GateStatus::Passed, GateStatus::Passed),
+        (GateStatus::Passed, GateStatus::SkippedDependency),
+        (GateStatus::SkippedDependency, GateStatus::SkippedDependency),
+    ] {
+        let previous = fixture_site(
+            "previous-degraded-matrix",
+            &[
+                ("play/index.html", "old shell"),
+                ("play/game_bg.wasm", "last-known-good-game"),
+            ],
+        );
+        let current = fixture_site("current-degraded-matrix", &DEGRADED_STATUS_PAGE);
+        let output = TempDirectory::new("degraded-matrix-output");
+
+        let disposition = assemble_site(
+            Some(previous.path()),
+            current.path(),
+            &workflow_summary(native, web),
+            CurrentPublication::Degraded,
+            output.path(),
+        )
+        .unwrap();
+
+        assert_eq!(disposition, BuildDisposition::RetainLastGreen, "{native:?}");
+        assert_eq!(
+            fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+            "last-known-good-game"
+        );
+    }
+}
+
+#[test]
+fn a_failed_run_publishing_a_degraded_page_still_retains_the_previous_game() {
+    let previous = fixture_site(
+        "previous-degraded-failed",
+        &[
+            ("play/index.html", "old shell"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+        ],
+    );
+    let current = fixture_site("current-degraded-failed", &DEGRADED_STATUS_PAGE);
+    let output = TempDirectory::new("degraded-failed-output");
+
+    let disposition = assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Failed),
+        CurrentPublication::Degraded,
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FailedRetainLastGreen);
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+}
+
+#[test]
+fn a_degraded_page_with_no_previous_publication_is_status_only() {
+    let current = fixture_site("current-degraded-first-run", &DEGRADED_STATUS_PAGE);
+    let output = TempDirectory::new("degraded-first-run-output");
+
+    let disposition = assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Degraded,
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(disposition, BuildDisposition::FirstRunStatusOnly);
+    assert!(!output.path().join("play").exists());
+    assert!(!output.path().join("last-green.json").exists());
+}
+
+#[test]
+fn a_degraded_page_never_promotes_a_game_it_carries_by_accident() {
+    // Degradation reduces what a tree may claim; it never grants it a game.
+    // Anything under `play/` in a degraded current tree is protected out of
+    // the copy exactly as it is for any other retaining disposition, so the
+    // published game stays the one the previous publication earned.
+    let previous = fixture_site(
+        "previous-degraded-protected",
+        &[
+            ("play/index.html", "old shell"),
+            ("play/game_bg.wasm", "last-known-good-game"),
+        ],
+    );
+    let current = fixture_site(
+        "current-degraded-smuggled",
+        &[
+            (
+                "index.html",
+                "<!doctype html><html><body><main><h1>Status</h1></main></body></html>",
+            ),
+            ("play/game_bg.wasm", "smuggled-game"),
+        ],
+    );
+    let output = TempDirectory::new("degraded-protected-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Degraded,
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+}
+
+#[test]
+fn a_degraded_publication_retains_previous_game_and_evidence_artifacts() {
+    let previous = previous_with_evidence(
+        "previous-degraded-evidence",
+        &index_linking(&[OLD_HISTORY, CURRENT_FRAME]),
+    );
+    let previous_projection = GREEN_PROJECTION.replace("bbbbbbbb", "aaaaaaaa");
+    fs::write(
+        previous.path().join("verification.json"),
+        &previous_projection,
+    )
+    .unwrap();
+    let current = fixture_site(
+        "current-degraded-evidence",
+        &[
+            (
+                "index.html",
+                "<!doctype html><html><body><main><h1>Status</h1></main></body></html>",
+            ),
+            ("play/game_bg.wasm", "smuggled-game"),
+            ("last-green.json", r#"{"source_commit":"smuggled"}"#),
+            ("gallery.json", TWO_POINT_GALLERY),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "smuggled current"),
+            (OLD_HISTORY, "smuggled old history"),
+            (NEW_HISTORY, "smuggled new history"),
+        ],
+    );
+    let output = TempDirectory::new("degraded-evidence-output");
+
+    assemble_site(
+        Some(previous.path()),
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Degraded,
+        output.path(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(output.path().join("play/game_bg.wasm")).unwrap(),
+        "last-known-good-game"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("gallery.json")).unwrap(),
+        PRIOR_GALLERY
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join("verification.json")).unwrap(),
+        previous_projection
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(CURRENT_FRAME)).unwrap(),
+        "old current"
+    );
+    assert_eq!(
+        fs::read_to_string(output.path().join(OLD_HISTORY)).unwrap(),
+        "old history"
+    );
+    assert!(!output.path().join(NEW_HISTORY).exists());
+    assert!(
+        !fs::read_to_string(output.path().join("last-green.json"))
+            .unwrap()
+            .contains("smuggled")
+    );
+}
+
+#[test]
+fn a_first_degraded_publication_discards_game_and_evidence_artifacts() {
+    let current = fixture_site(
+        "current-first-degraded-evidence",
+        &[
+            (
+                "index.html",
+                "<!doctype html><html><body><main><h1>Status</h1></main></body></html>",
+            ),
+            ("play/game_bg.wasm", "smuggled-game"),
+            ("last-green.json", r#"{"source_commit":"smuggled"}"#),
+            ("gallery.json", r#"{"entries":[]}"#),
+            ("verification.json", GREEN_PROJECTION),
+            (CURRENT_FRAME, "smuggled current"),
+        ],
+    );
+    let output = TempDirectory::new("first-degraded-evidence-output");
+
+    assemble_site(
+        None,
+        current.path(),
+        &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Degraded,
+        output.path(),
+    )
+    .unwrap();
+
+    assert!(output.path().join("index.html").is_file());
+    assert!(!output.path().join("play").exists());
+    assert!(!output.path().join("last-green.json").exists());
+    assert!(!output.path().join("screenshots").exists());
+    assert!(!output.path().join("gallery.json").exists());
+    assert!(!output.path().join("verification.json").exists());
+}
+
 #[test]
 fn a_green_first_run_without_any_game_still_publishes_status_only() {
     let current = fixture_site(
@@ -2314,6 +2699,7 @@ fn a_green_first_run_without_any_game_still_publishes_status_only() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2364,6 +2750,7 @@ fn a_green_replacement_keeps_the_previous_screenshot_history() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2432,6 +2819,7 @@ fn a_failed_run_retains_the_previous_gallery_and_screenshots() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2484,6 +2872,7 @@ fn a_first_green_run_without_a_previous_site_publishes_its_own_history() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2611,6 +3000,7 @@ fn a_green_replacement_without_current_evidence_keeps_the_manifest_that_names_it
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2658,6 +3048,7 @@ fn two_later_builds_keep_the_earliest_history_named_and_renderable() {
             Some(first.path()),
             quiet.path(),
             &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+            CurrentPublication::Generated,
             second.path(),
         )
         .unwrap(),
@@ -2683,6 +3074,7 @@ fn two_later_builds_keep_the_earliest_history_named_and_renderable() {
         Some(second.path()),
         loud.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Passed),
+        CurrentPublication::Generated,
         third.path(),
     )
     .unwrap();
@@ -2730,6 +3122,7 @@ fn a_status_only_run_publishes_current_evidence_while_retaining_the_previous_gam
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2775,6 +3168,7 @@ fn a_status_only_run_without_evidence_retains_the_previous_evidence_and_game() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2816,6 +3210,7 @@ fn a_failed_run_publishes_its_failure_while_retaining_the_previous_pixels() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2863,6 +3258,7 @@ fn a_web_failure_still_publishes_the_native_evidence_that_passed() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::Failed),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2895,6 +3291,7 @@ fn an_assembled_page_that_links_a_file_assembly_did_not_carry_is_refused() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     );
 
@@ -2927,6 +3324,7 @@ fn a_status_only_run_never_publishes_a_package_it_did_not_verify() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -2967,6 +3365,7 @@ fn a_failed_projection_never_relabels_the_retained_screenshots() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Failed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -3011,6 +3410,7 @@ fn retained_last_green_metadata_is_reconciled_with_the_assembled_tree() {
         Some(previous.path()),
         current.path(),
         &status_only_workflow(),
+        CurrentPublication::Generated,
         output.path(),
     )
     .unwrap();
@@ -3068,6 +3468,7 @@ fn a_first_run_that_inherited_a_history_it_cannot_supply_is_refused() {
         None,
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .expect_err("a first run cannot supply a history it never published");
@@ -3110,6 +3511,7 @@ fn a_later_run_whose_predecessor_lost_its_history_is_refused() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .expect_err("a history whose images are gone cannot be published");
@@ -3147,6 +3549,7 @@ fn an_inherited_history_its_predecessor_supplies_publishes_normally() {
         Some(previous.path()),
         current.path(),
         &workflow_summary(GateStatus::Passed, GateStatus::SkippedDependency),
+        CurrentPublication::Generated,
         output.path(),
     )
     .expect("a supplied history publishes");

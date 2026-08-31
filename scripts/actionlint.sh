@@ -41,14 +41,33 @@ tools="$repository/target/tools"
 cache="$tools/actionlint/$ACTIONLINT_VERSION"
 binary="$cache/actionlint"
 
-# The cache lives inside the repository's own build output. A tools directory
-# that has been pointed somewhere else is refused rather than trusted.
-if [[ -e "$tools" ]]; then
-  resolved="$(cd "$tools" && pwd -P)"
-  if [[ "$resolved" != "$repository/target/tools" ]]; then
+# The cache lives inside the repository's own build output, and every
+# directory on the way down to it has to really be one. A symbolic link, or a
+# plain file, anywhere along `target/tools/actionlint/<version>` would place
+# the binary this gate then executes outside the tree — or make the install
+# fail with a message about the wrong thing entirely — so each component that
+# already exists is checked rather than only the one that usually does.
+for candidate in "$repository/target" "$tools" "$tools/actionlint" "$cache"; do
+  [[ -e "$candidate" ]] || continue
+  if [[ -L "$candidate" ]]; then
+    echo "refusing a tools cache outside the repository: $candidate is a symbolic link" >&2
+    exit 2
+  fi
+  if [[ ! -d "$candidate" ]]; then
+    echo "refusing a tools cache outside the repository: $candidate is not a directory" >&2
+    exit 2
+  fi
+  resolved="$(cd "$candidate" && pwd -P)"
+  if [[ "$resolved" != "$candidate" ]]; then
     echo "refusing a tools cache outside the repository: $resolved" >&2
     exit 2
   fi
+done
+
+# The binary is executed, so it is never followed through a link either.
+if [[ -L "$binary" ]]; then
+  echo "refusing a tools cache outside the repository: $binary is a symbolic link" >&2
+  exit 2
 fi
 
 # The binary is trusted only when it says it is the pinned version. That check
@@ -62,6 +81,8 @@ installed_version() {
 if [[ "$(installed_version || true)" != "v$ACTIONLINT_VERSION" ]]; then
   if ! command -v go >/dev/null 2>&1; then
     echo "actionlint v$ACTIONLINT_VERSION is not cached and Go is not installed" >&2
+    echo "Go is a prerequisite of the local clean gate (scripts/check.sh), which" >&2
+    echo "lints the workflows before it runs anything expensive." >&2
     echo "install Go, or place the pinned binary at $binary" >&2
     exit 2
   fi

@@ -9,28 +9,71 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# How much history a checkout takes. It has to reach every commit
+# `docs/progress.json` names; `scripts/ensure-history.sh` proves that it does
+# and deepens a bounded number of times if it does not, so this is a starting
+# depth rather than an assumption.
+env:
+  HISTORY_DEPTH: 250
+
 jobs:
   verify:
     name: Verify
-    runs-on: ubuntu-latest
+    # Pinned rather than tracked. `ubuntu-latest` moves to the next image on
+    # GitHub's schedule, and the browser gate below depends on the Chrome this
+    # image ships; a silent image bump is a silently different gate.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
+      # The published timeline resolves commit references against the checked
+      # out history, so the clone has to reach every commit `docs/progress.json`
+      # names — and no further. `fetch-depth: 0` reached all of them by reaching
+      # everything, including every branch this repository has and the 34 MB
+      # WebAssembly modules on the generated `pages-live` branch. A finite depth
+      # fetches only this branch, and the step below proves that depth really
+      # covers the referenced commits instead of assuming it.
       - name: Check out source
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ env.HISTORY_DEPTH }}
+          filter: blob:none
 
       # The runner's temporary directory is a runner fact, and a job-level
       # `env:` is evaluated before a runner exists. It is resolved here, from
       # the environment the runner really hands the step, so every later step
       # names one workflow-owned result root instead of rebuilding the path.
+      #
+      # It is resolved first, before any step that can fail. A job that died
+      # before this ran would leave the summary below with no result root to
+      # read and no gate file to summarize, and would publish a run that could
+      # not say what went wrong with it.
       - name: Resolve the native result root
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/native"
           echo "RESULT=$RUNNER_TEMP/native" >> "$GITHUB_ENV"
           echo "GATES=$RUNNER_TEMP/native/gates.jsonl" >> "$GITHUB_ENV"
+
+      # These cheap, non-rendering gates run before package installation or
+      # renderer discovery can fail. The history bound is measured rather than
+      # treated as a precondition: a short clone is a fact this run publishes,
+      # and the browser client tests exercise loopback and fake sockets only.
+      #
+      # The history *tests* are not here with them. They compose the degraded
+      # publication fallback with the real assembler, so they need a built
+      # `sitegen`, and this runner cannot build one until the prerequisites
+      # below are installed. They run as their own named gate further down,
+      # recorded exactly like every other row.
+      - name: Run the early non-browser gates
+        run: |
+          set -uo pipefail
+
+          ./scripts/run-gate.sh "$GATES" "Published history bound" -- \
+            ./scripts/ensure-history.sh
+
+          ./scripts/run-gate.sh "$GATES" "Browser gate unit tests" -- \
+            python3 scripts/browser_gate_test.py
 
       - name: Install Linux build prerequisites
         run: |
@@ -48,7 +91,43 @@ jobs:
             libegl1 \
             libvulkan1 \
             mesa-vulkan-drivers \
+            vulkan-tools \
             xvfb
+
+      # Dependency sources only. Compiled output is deliberately not cached:
+      # a restored `target/` would let a stale artifact decide a gate, and the
+      # gates here are the only thing the published site is allowed to claim.
+      - name: Cache the Cargo dependency sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-verify-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-deps-verify-${{ runner.os }}-
+
+      # The rendered contract is the site's image evidence, so the adapter it
+      # renders on is pinned to Mesa's software rasterizer instead of whatever
+      # the image happens to expose. The adapter is proved present first: a
+      # name that selects nothing would silently fall back to another device
+      # and publish frames from a renderer nobody chose.
+      - name: Pin the software renderer
+        run: |
+          set -euo pipefail
+          summary="$(xvfb-run -a vulkaninfo --summary 2>&1 || true)"
+          printf '%s\n' "$summary"
+          if ! printf '%s' "$summary" | grep -qi 'llvmpipe'; then
+            echo "no llvmpipe Vulkan device is present on this runner" >&2
+            echo "the rendered contract may only publish software-rendered frames" >&2
+            exit 1
+          fi
+          {
+            echo "LIBGL_ALWAYS_SOFTWARE=1"
+            echo "WGPU_BACKEND=vulkan"
+            echo "WGPU_ADAPTER_NAME=llvmpipe"
+          } >> "$GITHUB_ENV"
 
       # Every named gate runs and is recorded even after an earlier one fails,
       # so one run publishes the whole matrix instead of stopping at the first
@@ -68,6 +147,12 @@ jobs:
               --progress docs/progress.json \
               --plan docs/implementation-plan.md \
               --repository .
+
+          # Runs here rather than with the other cheap gates: its composed
+          # cases drive the real `sitegen assemble` over a real degraded
+          # fallback tree, and the step above is what leaves that binary built.
+          ./scripts/run-gate.sh "$GATES" "History bound tests" -- \
+            python3 scripts/ensure_history_test.py
 
           ./scripts/run-gate.sh "$GATES" "Rust formatting" -- \
             cargo fmt --all --check
@@ -99,6 +184,24 @@ jobs:
           ./scripts/run-gate.sh "$GATES" "Release build" -- \
             cargo build --release
 
+          # Every named gate above has to leave exactly one row behind, and the
+          # history gates measured before them count too. A gate name the
+          # recording runner refuses is recorded nowhere and its command never
+          # runs, so a run that is short a row would otherwise publish a green
+          # matrix with one gate silently missing from it. The shortfall becomes
+          # a public failed row instead, and the verdict step below concludes on
+          # it like any other red gate.
+          expected=15
+          recorded=0
+          if [[ -f "$GATES" ]]; then
+            recorded="$(grep -c '' "$GATES")"
+          fi
+          if (( recorded != expected )); then
+            echo "recorded $recorded of $expected named gates" >&2
+            printf '{"name":"Named gate list","status":"failed","duration_ms":0}\n' \
+              >>"$GATES"
+          fi
+
       # The rendered contract keeps its whole run under target/render-contract.
       # Only the report and the frames are lifted into the workflow-owned
       # evidence root; the captured stdout and stderr stay behind as run
@@ -117,12 +220,38 @@ jobs:
           fi
           ls -1 "$destination" || true
 
+      # A green render gate has exactly one interesting run in it: the primary
+      # journey whose frames the site publishes. The fault-injection runs beside
+      # it only prove the analyzers bite, and shipping them turns every routine
+      # green run into a large artifact nobody opens. When the gate went red the
+      # whole directory travels, because then any of those runs may be the
+      # reason it did.
+      - name: Select the rendered run diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          selected="$RUNNER_TEMP/render-diagnostics"
+          rm -rf "$selected"
+          mkdir -p "$selected"
+          gate=""
+          if [[ -f "$GATES" ]]; then
+            gate="$(grep -F '"name":"Rendered image contracts"' "$GATES" | tail -n 1)"
+          fi
+          if [[ "$gate" == *'"status":"passed"'* ]]; then
+            if [[ -d target/render-contract/primary ]]; then
+              cp -R target/render-contract/primary "$selected/primary"
+            fi
+          elif [[ -d target/render-contract ]]; then
+            cp -R target/render-contract/. "$selected/"
+          fi
+          ls -1 "$selected" || true
+
       - name: Upload the rendered run diagnostics
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: render-contract-diagnostics
-          path: target/render-contract
+          path: ${{ runner.temp }}/render-diagnostics
           retention-days: 7
           if-no-files-found: ignore
 
@@ -163,23 +292,44 @@ jobs:
 
   build-web:
     name: Build web
+    # Verify is a dependency for ordering, not a precondition. A red native
+    # gate must not delete the web job: Publish reads both measured results to
+    # decide what it publishes, and a job that never ran leaves no gates, no
+    # package, and no browser evidence for it to read. The job still reaches
+    # its own truthful verdict below, so a failed web gate still fails here.
+    if: always()
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
+      # This job runs the site generator too — `scripts/web-smoke.sh` builds the
+      # real homepage the browser gate proves — and the generator resolves the
+      # commit every finished task names. So this checkout gets the same
+      # bounded depth, the same blob filter, and the same proof that the depth
+      # really reaches those commits as the jobs that validate them.
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ env.HISTORY_DEPTH }}
+          filter: blob:none
 
-      # As in Verify: the runner context does not exist when a job-level `env:`
-      # is evaluated, so the result root is resolved from the runner's own
-      # environment in a step.
       - name: Resolve the web result root
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/web"
           echo "RESULT=$RUNNER_TEMP/web" >> "$GITHUB_ENV"
           echo "GATES=$RUNNER_TEMP/web/gates.jsonl" >> "$GITHUB_ENV"
+
+      # As in Verify, the history bound is a measured gate rather than a
+      # precondition, so a short clone is published as a failed row and the web
+      # gates below still run and are still counted.
+      - name: Run the history gate
+        run: |
+          set -uo pipefail
+
+          ./scripts/run-gate.sh "$GATES" "Published history bound" -- \
+            ./scripts/ensure-history.sh
 
       - name: Install Linux build prerequisites
         run: |
@@ -205,6 +355,19 @@ jobs:
           "$chrome" --version
           echo "CHROME=$chrome" >> "$GITHUB_ENV"
 
+      # Dependency sources only, for the same reason Verify caches nothing it
+      # compiles: the packaged WebAssembly the site serves is built here.
+      - name: Cache the Cargo dependency sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-web-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-deps-web-${{ runner.os }}-
+
       - name: Run the web gates
         run: |
           set -uo pipefail
@@ -217,6 +380,21 @@ jobs:
 
           ./scripts/run-gate.sh "$GATES" "Headless browser gate" -- \
             ./scripts/web-smoke.sh "$RESULT/play" "$RESULT/browser"
+
+          # As in Verify: a refused gate name records nothing, so a short row
+          # count is published as a failed row rather than as a green matrix
+          # with a gate missing from it. The history gate measured before these
+          # counts too.
+          expected=4
+          recorded=0
+          if [[ -f "$GATES" ]]; then
+            recorded="$(grep -c '' "$GATES")"
+          fi
+          if (( recorded != expected )); then
+            echo "recorded $recorded of $expected named gates" >&2
+            printf '{"name":"Named gate list","status":"failed","duration_ms":0}\n' \
+              >>"$GATES"
+          fi
 
       - name: Summarize the web gates
         id: web
@@ -257,7 +435,7 @@ jobs:
     name: Publish
     if: always()
     needs: [verify, build-web]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -267,10 +445,22 @@ jobs:
       id-token: write
       actions: read
     steps:
+      # As in Verify: a finite depth that is proved to reach every published
+      # commit, rather than an unbounded clone of every branch.
       - name: Check out source
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ env.HISTORY_DEPTH }}
+          filter: blob:none
+
+      # Publish has to publish. A short clone is already a failed row measured
+      # in Verify, so this repairs the history when it can and never ends the
+      # job when it cannot: the generator below decides what it can publish
+      # from what it actually has.
+      - name: Reach every referenced commit if the history allows it
+        id: history
+        continue-on-error: true
+        run: ./scripts/ensure-history.sh
 
       - name: Check out previous Pages site
         id: previous
@@ -292,6 +482,18 @@ jobs:
             libx11-dev \
             libxi-dev \
             libxrandr-dev
+
+      # Dependency sources only; Publish compiles the same crate the gates did.
+      - name: Cache the Cargo dependency sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-publish-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-deps-publish-${{ runner.os }}-
 
       # Either upstream job may have failed, been skipped, or never uploaded
       # anything. A missing download is a fact this run publishes, never a
@@ -319,6 +521,7 @@ jobs:
           NATIVE_DOWNLOAD: ${{ steps.native.outcome }}
           WEB_DOWNLOAD: ${{ steps.web.outcome }}
           PREVIOUS_CHECKOUT: ${{ steps.previous.outcome }}
+          PUBLISH_HISTORY: ${{ steps.history.outcome }}
         run: |
           set -euo pipefail
 
@@ -340,37 +543,95 @@ jobs:
             previous_args=(--previous "$GITHUB_WORKSPACE/previous-pages")
           fi
 
-          # One repository-owned command decides everything this run
-          # publishes: the merged gate matrix, the commit timeline, the
-          # inherited screenshot history, whether the verified evidence really
-          # projects, and whether a complete playable package was earned.
-          cargo run --quiet --bin sitegen -- inputs \
-            --repository "$GITHUB_WORKSPACE" \
-            --source-commit "$GITHUB_SHA" \
-            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --native-outcome "$VERIFY_RESULT" \
-            --web-outcome "$WEB_RESULT" \
-            "${native_args[@]}" \
-            "${web_args[@]}" \
-            "${previous_args[@]}" \
-            --output "$pages_root"
+          # One repository-owned command creates the sanitized inputs both
+          # publication paths trust: the merged gate matrix, commit facts,
+          # inherited screenshot history, projected verification evidence, and
+          # any complete playable package this run earned.
+          project_inputs() {
+            cargo run --quiet --bin sitegen -- inputs \
+              --repository "$GITHUB_WORKSPACE" \
+              --source-commit "$GITHUB_SHA" \
+              --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --native-outcome "$VERIFY_RESULT" \
+              --web-outcome "$WEB_RESULT" \
+              "${native_args[@]}" \
+              "${@}" \
+              "${previous_args[@]}" \
+              --output "$pages_root"
+          }
 
-          cargo run --quiet --bin sitegen -- build \
-            --inputs "$pages_root/inputs.json" \
-            --output "$current"
+          project_inputs "${web_args[@]}"
+
+          # The two evidence sets project together or not at all, so a browser
+          # summary this generator cannot read would take the whole native
+          # render evidence down with it and publish a page with no frames on
+          # it. When the native job declared evidence and nothing projected,
+          # the browser summary is withdrawn from a private copy of the web
+          # artifact and the native evidence is projected on its own. The
+          # packaged game is untouched by that copy, so a green playable build
+          # is still promoted from it.
+          declared_native=0
+          if [[ -f "$RUNNER_TEMP/native/result.json" ]] \
+            && jq -e '.evidence != null' "$RUNNER_TEMP/native/result.json" >/dev/null; then
+            declared_native=1
+          fi
+          if (( declared_native == 1 )) && (( ${#web_args[@]} > 0 )) \
+            && ! jq -e '.verification != null' "$pages_root/inputs.json" >/dev/null; then
+            echo "retrying the projection without this run's browser evidence" >&2
+            retry_web="$RUNNER_TEMP/web-without-browser"
+            rm -rf "$retry_web"
+            cp -R "$RUNNER_TEMP/web" "$retry_web"
+            rm -f "$retry_web/browser/browser-gate.json"
+            project_inputs --web "$retry_web"
+            # The retry is not a silent one: the refused browser evidence is
+            # published as its own failed row, so the site says the frames it
+            # shows came from the native run alone.
+            jq '.gates += [{"name":"Published browser evidence","status":"failed","passed":0,"failed":1,"duration_ms":0,"artifact_url":null}]' \
+              "$pages_root/workflow.json" >"$pages_root/workflow.retry.json"
+            mv "$pages_root/workflow.retry.json" "$pages_root/workflow.json"
+          fi
+
+          publication_args=()
+          if [[ "$PUBLISH_HISTORY" == "success" ]]; then
+            cargo run --quiet --bin sitegen -- build \
+              --inputs "$pages_root/inputs.json" \
+              --output "$current"
+          else
+            # The strict generator must not be handed an incomplete repository
+            # and told those missing commits are valid. Publish a deliberately
+            # reduced current page instead, carrying only the sanitized
+            # workflow result. It copies nothing: the assembly below is the one
+            # place a previously verified domain is carried forward, and
+            # `--publication degraded` is how this page says it is not the
+            # replacement for one. Without it a green run would be told to
+            # publish a game this page never built, and would refuse.
+            python3 scripts/history_failure_site.py \
+              --workflow "$pages_root/workflow.json" \
+              "${previous_args[@]}" \
+              --output "$current"
+            publication_args=(--publication degraded)
+          fi
 
           cargo run --quiet --bin sitegen -- assemble \
             "${previous_args[@]}" \
             --current "$current" \
             --result "$pages_root/workflow.json" \
+            "${publication_args[@]}" \
             --output "$output"
 
           touch "$output/.nojekyll"
           cp .github/pages-live-README.md "$output/README.md"
 
+      # The generated branch carries the packaged game, and that package is a
+      # ~34 MB WebAssembly module. Republishing an identical tree would send
+      # the whole thing again and leave another unreferenced root commit behind
+      # on every run. Git names a tree by its content, so an unchanged
+      # publication is recognised exactly and skipped: the deployment below
+      # still runs, so a run that changes nothing still publishes its status.
       - name: Push generated Pages branch
         env:
           GH_TOKEN: ${{ github.token }}
+          PREVIOUS_CHECKOUT: ${{ steps.previous.outcome }}
         run: |
           set -euo pipefail
 
@@ -382,6 +643,16 @@ jobs:
           git --git-dir="$git_dir" --work-tree="$output" config user.name github-actions[bot]
           git --git-dir="$git_dir" --work-tree="$output" config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git --git-dir="$git_dir" --work-tree="$output" add -A
+
+          if [[ "$PREVIOUS_CHECKOUT" == "success" ]]; then
+            published="$(git -C "$GITHUB_WORKSPACE/previous-pages" rev-parse 'HEAD^{tree}')"
+            staged="$(git --git-dir="$git_dir" --work-tree="$output" write-tree)"
+            if [[ "$staged" == "$published" ]]; then
+              echo "pages-live already carries tree $staged; nothing to push"
+              exit 0
+            fi
+          fi
+
           git --git-dir="$git_dir" --work-tree="$output" commit \
             -m "docs: publish status for ${GITHUB_SHA}"
           git --git-dir="$git_dir" remote add origin \

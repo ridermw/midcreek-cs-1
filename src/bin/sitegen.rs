@@ -16,13 +16,13 @@ mod native {
 
     use midcreek_cs_1::{
         sitegen::{
-            BrowserGateReport, CommitSummary, GalleryManifest, GateStatus, GateSummary, JobOutcome,
-            JobReport, JobResult, PlayableBuild, ProgressDocument, ProgressStatus, REPOSITORY_URL,
-            RESULT_FILE, ReferenceManifest, RepoFacts, SiteInputs, VerificationEvidence,
-            WorkflowSummary, assemble_site_in, build_site_in, check_readme_status,
-            default_repository, gate_verdict, merge_job_results, missing_playable_parts,
-            plan_task_ids_from_markdown, read_gate_records, render_readme_status,
-            replace_readme_status, validate_job_result, validate_progress,
+            BrowserGateReport, CommitSummary, CurrentPublication, GalleryManifest, GateStatus,
+            GateSummary, JobOutcome, JobReport, JobResult, PlayableBuild, ProgressDocument,
+            ProgressStatus, REPOSITORY_URL, RESULT_FILE, ReferenceManifest, RepoFacts, SiteInputs,
+            VerificationEvidence, WorkflowSummary, assemble_site_in, build_site_in,
+            check_readme_status, default_repository, gate_verdict, merge_job_results,
+            missing_playable_parts, plan_task_ids_from_markdown, read_gate_records,
+            render_readme_status, replace_readme_status, validate_job_result, validate_progress,
             validate_reference_manifest, validate_workflow_summary,
         },
         verification::VerificationReport,
@@ -61,6 +61,7 @@ mod native {
             previous: Option<PathBuf>,
             current: PathBuf,
             result: PathBuf,
+            publication: CurrentPublication,
             output: PathBuf,
         },
         Result {
@@ -106,8 +107,9 @@ mod native {
                 previous,
                 current,
                 result,
+                publication,
                 output,
-            } => assemble(previous.as_deref(), &current, &result, &output),
+            } => assemble(previous.as_deref(), &current, &result, publication, &output),
             Command::Result { job, gates, output } => result(&job, &gates, &output),
             Command::Inputs {
                 repository,
@@ -171,12 +173,23 @@ mod native {
                 let values = parse_options(
                     &remaining,
                     &["--current", "--result", "--output"],
-                    &["--previous"],
+                    &["--previous", "--publication"],
                 )?;
+                let publication = match values.optional("--publication") {
+                    Some(value) => CurrentPublication::parse(&value).ok_or_else(|| {
+                        format!(
+                            "--publication must be {} or {}, not {value:?}",
+                            CurrentPublication::GENERATED,
+                            CurrentPublication::DEGRADED
+                        )
+                    })?,
+                    None => CurrentPublication::Generated,
+                };
                 Ok(Command::Assemble {
                     previous: values.optional_path("--previous"),
                     current: values.required_path("--current")?,
                     result: values.required_path("--result")?,
+                    publication,
                     output: values.required_path("--output")?,
                 })
             }
@@ -439,6 +452,7 @@ mod native {
         previous: Option<&Path>,
         current: &Path,
         result_path: &Path,
+        publication: CurrentPublication,
         output: &Path,
     ) -> ExitCode {
         let workflow = match read_json::<WorkflowSummary>(result_path) {
@@ -448,7 +462,14 @@ mod native {
         if let Err(error) = validate_workflow_summary(&workflow) {
             return content_error(error.to_string());
         }
-        match assemble_site_in(&runtime_repository(), previous, current, &workflow, output) {
+        match assemble_site_in(
+            &runtime_repository(),
+            previous,
+            current,
+            &workflow,
+            publication,
+            output,
+        ) {
             Ok(disposition) => {
                 println!("{disposition}");
                 ExitCode::SUCCESS

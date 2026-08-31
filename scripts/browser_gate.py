@@ -9,12 +9,18 @@ The gate proves, independently:
 
 * every packaged URL is served with HTTP 200;
 * the game reports ``data-game-state="ready"`` within the readiness budget;
-* ``#browser-errors`` captured no error and no unhandled rejection;
+* ``#browser-errors`` exists and captured no error and no unhandled rejection;
 * the canvas is visible and 16:9 within one pixel;
 * trusted Arrow/Q/E/Space input while the canvas is focused does not scroll a
   page that a neutral focus probe has just proved is genuinely scrollable;
 * the canvas region of a real screenshot is nonblank and carries at least
   three approved palette classes with real variance.
+
+Every one of those assertions is then made a second time against the same
+package embedded in the homepage the site generator really produced, through
+the single ``iframe.play-embed`` that page carries. Nothing about that element
+is copied out of the generator's source: it is discovered on the generated
+page and required to point at the package this run just served.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass
@@ -36,6 +43,16 @@ from pathlib import Path
 
 READY_TIMEOUT_SECONDS = 30
 BROWSER_TIMEOUT_SECONDS = 30
+# One absolute deadline bounds the whole gate, and it starts before the first
+# socket is opened rather than after a session exists. Every phase below has
+# its own budget too, but a browser that answers each call slowly and none of
+# them slowly enough to trip one — or that trickles a single message a byte at
+# a time forever — would otherwise keep the gate alive indefinitely. Past this
+# the run is over, whatever it was doing.
+SESSION_BUDGET_SECONDS = 600
+# The DevTools upgrade response is a handful of short headers. A server that
+# sends more than this before the blank line is not answering the handshake.
+MAX_HANDSHAKE_BYTES = 16 * 1024
 # A DevTools answer is a JSON document; a screenshot is the largest one the
 # gate ever asks for. Anything past this is a confused browser, not a message.
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -77,6 +94,35 @@ class GateFailure(Exception):
     """A browser gate assertion that did not hold."""
 
 
+class Deadline:
+    """One absolute instant the whole gate has to be finished by.
+
+    It is created before anything connects, so the DNS-free loopback dial, the
+    HTTP requests, the WebSocket handshake, every framed read, and every
+    DevTools call all spend the same budget. Nothing here can refresh it, which
+    is the point: a stream that keeps arriving slowly must not be able to buy
+    itself more time simply by never stopping.
+    """
+
+    def __init__(self, budget: float = SESSION_BUDGET_SECONDS) -> None:
+        self.budget = budget
+        self._expires = time.monotonic() + budget
+
+    def remaining(self) -> float:
+        """Seconds left, which may be zero or negative."""
+        return self._expires - time.monotonic()
+
+    def require(self, doing: str) -> float:
+        """The seconds left, or a failure naming what ran out of them."""
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise GateFailure(
+                f"the browser gate ran past its {self.budget:.0f}s budget while "
+                f"{doing}"
+            )
+        return remaining
+
+
 # ---------------------------------------------------------------------------
 # WebSocket client
 # ---------------------------------------------------------------------------
@@ -104,14 +150,29 @@ class WebSocket:
         url: str,
         timeout: float = BROWSER_TIMEOUT_SECONDS,
         max_message_bytes: int = MAX_MESSAGE_BYTES,
+        deadline: Deadline | None = None,
     ) -> None:
         match = re.match(r"ws://([^/:]+):(\d+)(/.*)", url)
         if not match:
             raise GateFailure(f"unsupported DevTools endpoint: {url}")
         self._max_message_bytes = max_message_bytes
+        self._timeout = timeout
+        self._deadline = Deadline() if deadline is None else deadline
         host, port, resource = match.group(1), int(match.group(2)), match.group(3)
-        self._socket = socket.create_connection((host, port), timeout=timeout)
-        self._socket.settimeout(timeout)
+        # Connecting is a network operation like any other, so it spends the
+        # same budget: a host that accepts slowly cannot buy the gate more time
+        # than it has left.
+        remaining = self._deadline.require("connecting to the DevTools endpoint")
+        try:
+            self._socket = socket.create_connection(
+                (host, port), timeout=min(timeout, remaining)
+            )
+        except OSError as failure:
+            self._deadline.require("connecting to the DevTools endpoint")
+            raise GateFailure(
+                f"the DevTools endpoint at {host}:{port} could not be reached: {failure}"
+            ) from failure
+        self._socket.settimeout(min(timeout, remaining))
         self._buffer = b""
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
@@ -122,17 +183,74 @@ class WebSocket:
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n"
         )
-        self._socket.sendall(request.encode("ascii"))
+        self._sendall(request.encode("ascii"), "sending the DevTools handshake")
+        # The upgrade response is read under the same deadline as everything
+        # else, and its headers are capped: a server that answers with an
+        # endless header block is not completing a handshake.
         while b"\r\n\r\n" not in self._buffer:
+            if len(self._buffer) > MAX_HANDSHAKE_BYTES:
+                raise GateFailure(
+                    f"the DevTools handshake sent {len(self._buffer)} header bytes "
+                    f"without finishing, over the {MAX_HANDSHAKE_BYTES} byte limit"
+                )
             self._read_more()
-        head, self._buffer = self._buffer.split(b"\r\n\r\n", 1)
+        header_end = self._buffer.index(b"\r\n\r\n")
+        if header_end > MAX_HANDSHAKE_BYTES:
+            self.close()
+            raise GateFailure(
+                f"the DevTools handshake sent {header_end} header bytes, over the "
+                f"{MAX_HANDSHAKE_BYTES} byte limit"
+            )
+        head, self._buffer = (
+            self._buffer[:header_end],
+            self._buffer[header_end + 4 :],
+        )
         if b"101" not in head.split(b"\r\n", 1)[0]:
             raise GateFailure(f"DevTools refused the WebSocket upgrade: {head!r}")
 
+    def _bound(self, doing: str) -> float:
+        """Clamps the socket to what is left of the whole gate, and says so.
+
+        Every blocking operation on this socket goes through here, so no read
+        and no write can outlive the budget by staying just inside a per-call
+        timeout that resets on every byte.
+        """
+        remaining = self._deadline.require(doing)
+        bounded = min(self._timeout, remaining)
+        try:
+            self._socket.settimeout(bounded)
+        except OSError:
+            pass
+        return bounded
+
+    def _sendall(self, data: bytes, doing: str) -> None:
+        self._bound(doing)
+        try:
+            self._socket.sendall(data)
+        except TimeoutError as failure:
+            # A write that timed out because the budget clamped it is a budget
+            # failure, not a slow peer; say which one it was.
+            self._deadline.require(doing)
+            raise GateFailure(
+                f"the DevTools WebSocket stopped accepting {len(data)} bytes "
+                f"while {doing}: {failure}"
+            ) from failure
+        except OSError as failure:
+            raise GateFailure(
+                f"the DevTools WebSocket could not be written while {doing}: {failure}"
+            ) from failure
+
     def _read_more(self) -> None:
+        # Every read is bounded by what is left of the whole gate, so a stream
+        # that trickles one byte at a time can never outlive the budget by
+        # staying just inside a per-read timeout forever.
+        self._bound("reading from the DevTools WebSocket")
         try:
             chunk = self._socket.recv(65536)
         except TimeoutError as failure:
+            # A read that timed out because the gate's own budget clamped it is
+            # a budget failure, not a quiet browser; say which one it was.
+            self._deadline.require("reading from the DevTools WebSocket")
             raise GateFailure(
                 "the DevTools WebSocket stopped answering with "
                 f"{len(self._buffer)} bytes buffered: {failure}"
@@ -160,7 +278,7 @@ class WebSocket:
             header += struct.pack(">Q", length)
         header += mask
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
-        self._socket.sendall(bytes(header) + masked)
+        self._sendall(bytes(header) + masked, "sending a DevTools command")
 
     def receive(self) -> str:
         """Returns the next complete message, reassembled across fragments."""
@@ -231,7 +349,7 @@ class WebSocket:
         mask = os.urandom(4)
         header = bytearray([0x80 | self.PONG, 0x80 | len(payload)]) + mask
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        self._socket.sendall(bytes(header) + masked)
+        self._sendall(bytes(header) + masked, "answering a DevTools ping")
 
     def _need(self, count: int) -> None:
         while len(self._buffer) < count:
@@ -276,19 +394,34 @@ class WebSocket:
         except OSError:
             pass
 
+    def set_timeout(self, timeout: float) -> None:
+        """Bounds how long one read may block, in seconds."""
+        self._timeout = max(timeout, 0.0)
+
 
 class DevTools:
     """A single-target Chrome DevTools Protocol session."""
 
-    def __init__(self, websocket_url: str) -> None:
-        self._socket = WebSocket(websocket_url)
+    def __init__(self, websocket_url: str, deadline: Deadline | None = None) -> None:
+        self.deadline = Deadline() if deadline is None else deadline
+        self._socket = WebSocket(websocket_url, deadline=self.deadline)
         self._next_id = 0
 
+    def remaining(self) -> float:
+        """Seconds left in the whole gate, which may be negative."""
+        return self.deadline.remaining()
+
     def call(self, method: str, params: dict | None = None, timeout: float = BROWSER_TIMEOUT_SECONDS) -> dict:
+        # No single call may outlive the gate it belongs to. Without this a
+        # browser that answers every call just inside its own timeout keeps
+        # the gate alive for as long as it likes.
+        remaining = self.deadline.require(f"waiting for {method}")
+        bounded = min(timeout, remaining)
         self._next_id += 1
         message_id = self._next_id
         self._socket.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
-        deadline = time.monotonic() + timeout
+        self._socket.set_timeout(bounded)
+        deadline = time.monotonic() + bounded
         while time.monotonic() < deadline:
             message = json.loads(self._socket.receive())
             if message.get("id") != message_id:
@@ -296,7 +429,7 @@ class DevTools:
             if "error" in message:
                 raise GateFailure(f"{method} failed: {message['error']}")
             return message.get("result", {})
-        raise GateFailure(f"{method} did not answer within {timeout:.0f}s")
+        raise GateFailure(f"{method} did not answer within {bounded:.0f}s")
 
     def evaluate(self, expression: str) -> object:
         result = self.call(
@@ -412,7 +545,14 @@ def _paeth(left: int, up: int, upper_left: int) -> int:
 
 
 def read_palette(design_source: Path) -> dict[str, tuple[int, int, int]]:
-    """Reads the approved cel-shift palette straight from the Rust source."""
+    """Reads the approved cel-shift palette straight from the Rust source.
+
+    The roster is derived, never assumed: ``PaletteRole::ALL`` is the game's
+    own declaration of which roles exist, so the constants parsed here have to
+    be exactly the ones it names. A role added to the enum and forgotten in the
+    constants — or the reverse — fails here instead of quietly shrinking the
+    set of colours the canvas is allowed to be judged against.
+    """
     text = design_source.read_text(encoding="utf-8")
     pattern = re.compile(
         r"pub const (?P<name>[A-Z0-9_]+): Srgba = srgba_u8!\("
@@ -426,11 +566,36 @@ def read_palette(design_source: Path) -> dict[str, tuple[int, int, int]]:
         )
         for match in pattern.finditer(text)
     }
-    if len(palette) != 17:
+    declared = read_palette_roles(design_source, text)
+    missing = sorted(declared - set(palette))
+    extra = sorted(set(palette) - declared)
+    if missing or extra:
         raise GateFailure(
-            f"expected the 17 approved palette roles in {design_source}, found {len(palette)}"
+            f"the approved palette in {design_source} does not match the roles "
+            f"PaletteRole::ALL declares: missing {missing}, unexpected {extra}"
         )
     return palette
+
+
+def read_palette_roles(design_source: Path, text: str | None = None) -> set[str]:
+    """The constant names ``PaletteRole::ALL`` declares, in the game's source.
+
+    ``Self::WorkerHiVis`` names the ``WORKER_HI_VIS`` constant, so the enum
+    roster is translated into constant names rather than counted.
+    """
+    text = design_source.read_text(encoding="utf-8") if text is None else text
+    match = re.search(
+        r"pub const ALL: \[Self; (?P<count>\d+)\] = \[(?P<body>.*?)\];", text, re.DOTALL
+    )
+    if not match:
+        raise GateFailure(f"{design_source} declares no PaletteRole::ALL roster")
+    variants = re.findall(r"Self::([A-Za-z0-9]+)", match.group("body"))
+    if len(variants) != int(match.group("count")):
+        raise GateFailure(
+            f"PaletteRole::ALL in {design_source} claims {match.group('count')} "
+            f"roles and lists {len(variants)}"
+        )
+    return {re.sub(r"(?<!^)(?=[A-Z])", "_", variant).upper() for variant in variants}
 
 
 # ---------------------------------------------------------------------------
@@ -438,14 +603,96 @@ def read_palette(design_source: Path) -> dict[str, tuple[int, int, int]]:
 # ---------------------------------------------------------------------------
 
 
-def require_http_200(base_url: str, relative: str) -> None:
-    url = f"{base_url.rstrip('/')}/{relative.lstrip('/')}"
+def resolve_url(base_url: str, relative: str) -> str:
+    """Joins a served path onto a base URL with every segment quoted.
+
+    A packaged file name is a file-system name, not a URL: a space or a `#` in
+    one would silently address a different resource, or none at all.
+    """
+    quoted = "/".join(
+        urllib.parse.quote(segment, safe="") for segment in relative.lstrip("/").split("/")
+    )
+    return f"{base_url.rstrip('/')}/{quoted}" if quoted else f"{base_url.rstrip('/')}/"
+
+
+def response_socket(response: object) -> object | None:
+    """The socket underneath an ``http.client`` response, when it is reachable.
+
+    urllib does not publish it, so it is walked defensively — but it is not
+    optional: without it a body that stops arriving blocks on the timeout the
+    connection was opened with, which was clamped to a budget that has since
+    shrunk. A test proves this lookup really finds it on the Python that runs.
+    """
+    fp = getattr(response, "fp", None)
+    for holder in (getattr(fp, "raw", None), fp, response):
+        found = getattr(holder, "_sock", None)
+        if found is not None and hasattr(found, "settimeout"):
+            return found
+    return None
+
+
+def read_bounded(response: object, limit: int, deadline: Deadline, doing: str) -> bytes:
+    """Reads at most ``limit`` bytes, spending the whole gate's budget.
+
+    A socket timeout is an inactivity timer: a server that sends one byte
+    whenever it is about to expire resets it forever. So the deadline is
+    checked between chunks, and the socket is re-clamped to what is left of it
+    before each one — otherwise a body that trickles and then stops dead would
+    block on a timeout set when the budget was much larger.
+    """
+    data = bytearray()
+    connection = response_socket(response)
+    if connection is None:
+        raise GateFailure(
+            f"the response body cannot be re-clamped while {doing}: "
+            "urllib exposed no socket"
+        )
+    reader = getattr(response, "read1", None) or response.read
+    while len(data) < limit:
+        remaining = deadline.require(doing)
+        try:
+            connection.settimeout(min(BROWSER_TIMEOUT_SECONDS, remaining))
+        except OSError as failure:
+            raise GateFailure(
+                f"the response body could not be re-clamped while {doing}: {failure}"
+            ) from failure
+        chunk = read_chunk(reader, min(4096, limit - len(data)), deadline, doing)
+        if not chunk:
+            break
+        data += chunk
+        is_closed = getattr(response, "isclosed", None)
+        if callable(is_closed) and is_closed():
+            break
+    return bytes(data)
+
+
+def read_chunk(reader: object, size: int, deadline: Deadline, doing: str) -> bytes:
+    """One clamped read, with a timeout reported as what it really was."""
+    try:
+        return reader(size)
+    except TimeoutError as failure:
+        # The clamp above is what ended this read, so an expired budget is the
+        # honest explanation; a peer that went quiet inside a live budget is
+        # the other one.
+        deadline.require(doing)
+        raise GateFailure(
+            f"the response stopped arriving while {doing}: {failure}"
+        ) from failure
+    except OSError as failure:
+        raise GateFailure(
+            f"the response could not be read while {doing}: {failure}"
+        ) from failure
+
+
+def require_http_200(base_url: str, relative: str, deadline: Deadline) -> None:
+    url = resolve_url(base_url, relative)
+    timeout = min(BROWSER_TIMEOUT_SECONDS, deadline.require(f"fetching {relative}"))
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=BROWSER_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             if response.status != 200:
                 raise GateFailure(f"{relative} returned HTTP {response.status}")
-            response.read(1024)
+            read_bounded(response, 1024, deadline, f"reading {relative}")
     except urllib.error.URLError as failure:
         raise GateFailure(f"{relative} could not be fetched: {failure}") from failure
 
@@ -459,122 +706,258 @@ def packaged_urls(package: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Document scopes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Scope:
+    """One document the gate drives, and how JavaScript reaches into it.
+
+    Every phase below is written once, against `__DOC__` and `__WIN__`, so the
+    standalone play page and the same package embedded in the published
+    homepage are proved by the same code rather than by two assertions that can
+    drift apart. `__ORIGIN__` is where that document's viewport sits inside a
+    screenshot of the top-level page, and `__CLIP__` is the region of that
+    screenshot the document can actually be seen in, so a canvas inside a frame
+    is judged in the pixels that were really captured.
+    """
+
+    label: str
+    doc: str
+    win: str
+    origin: str
+    clip: str
+
+    def render(self, template: str) -> str:
+        return (
+            template.replace("__DOC__", self.doc)
+            .replace("__WIN__", self.win)
+            .replace("__ORIGIN__", self.origin)
+            .replace("__CLIP__", self.clip)
+        )
+
+
+#: The top-level document: its viewport is the screenshot, so nothing offsets.
+TOP_SCOPE = Scope(
+    label="the standalone play page",
+    doc="document",
+    win="window",
+    origin="({ x: 0, y: 0 })",
+    clip="({ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight })",
+)
+
+#: The single playable iframe on the published homepage. The gate never writes
+#: this element out of the generator's source; it finds the one the generated
+#: page really carries and refuses anything else.
+EMBED_ELEMENT_JS = "document.getElementsByTagName('iframe')[0]"
+
+EMBED_SCOPE = Scope(
+    label="the embedded player on the published homepage",
+    doc=f"({EMBED_ELEMENT_JS}.contentDocument)",
+    win=f"({EMBED_ELEMENT_JS}.contentWindow)",
+    origin=f"({EMBED_ELEMENT_JS}.getBoundingClientRect())",
+    clip=f"({EMBED_ELEMENT_JS}.getBoundingClientRect())",
+)
+
+
+class Page:
+    """One document, bound to the session that drives it.
+
+    Binding the scope here rather than passing it beside the session is what
+    stops a phase from ever being run against the wrong document: there is no
+    call that can name one and mean the other.
+    """
+
+    def __init__(self, session: DevTools, scope: Scope) -> None:
+        self.session = session
+        self.scope = scope
+        self.label = scope.label
+
+    def evaluate(self, template: str) -> object:
+        return self.session.evaluate(self.scope.render(template))
+
+    def evaluate_top(self, expression: str) -> object:
+        """Evaluates in the top-level document, whatever this page is.
+
+        The screenshot belongs to the top-level page, so the scale between CSS
+        pixels and captured pixels is read from there even when the canvas
+        being measured lives inside a frame.
+        """
+        return self.session.evaluate(expression)
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        return self.session.call(method, params)
+
+
+# ---------------------------------------------------------------------------
 # Browser session
 # ---------------------------------------------------------------------------
 
 
-def open_page(cdp_port: int, url: str) -> DevTools:
-    deadline = time.monotonic() + BROWSER_TIMEOUT_SECONDS
+def open_page(cdp_port: int, url: str, deadline: Deadline) -> DevTools:
+    opened_by = time.monotonic() + min(
+        BROWSER_TIMEOUT_SECONDS,
+        deadline.require("waiting for a DevTools endpoint"),
+    )
     version_url = f"http://127.0.0.1:{cdp_port}/json/version"
-    while time.monotonic() < deadline:
+    while True:
+        remaining = min(
+            deadline.require("waiting for a DevTools endpoint"),
+            opened_by - time.monotonic(),
+        )
+        if remaining <= 0.0:
+            break
         try:
-            with urllib.request.urlopen(version_url, timeout=2) as response:
-                json.loads(response.read())
+            with urllib.request.urlopen(version_url, timeout=min(2.0, remaining)) as response:
+                json.loads(read_bounded(response, 64 * 1024, deadline, "reading the DevTools version"))
                 break
         except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout):
-            time.sleep(0.25)
-    else:
-        raise GateFailure(f"the browser never opened a DevTools endpoint on port {cdp_port}")
+            time.sleep(min(0.25, max(0.0, opened_by - time.monotonic())))
 
+    if remaining <= 0.0:
+        deadline.require("waiting for a DevTools endpoint")
+        raise GateFailure(
+            f"the browser never opened a DevTools endpoint on port {cdp_port}"
+        )
+
+    timeout = min(BROWSER_TIMEOUT_SECONDS, deadline.require("opening a browser target"))
     new_target = urllib.request.Request(
-        f"http://127.0.0.1:{cdp_port}/json/new?{url}", method="PUT"
+        f"http://127.0.0.1:{cdp_port}/json/new?{urllib.parse.quote(url, safe=':/?&=%')}",
+        method="PUT",
     )
-    with urllib.request.urlopen(new_target, timeout=BROWSER_TIMEOUT_SECONDS) as response:
-        target = json.loads(response.read())
-    return DevTools(target["webSocketDebuggerUrl"])
+    with urllib.request.urlopen(new_target, timeout=timeout) as response:
+        target = json.loads(
+            read_bounded(response, 64 * 1024, deadline, "reading the new browser target")
+        )
+    session = DevTools(target["webSocketDebuggerUrl"], deadline=deadline)
+    session.call("Page.enable")
+    session.call("Runtime.enable")
+    return session
 
 
-def wait_for_ready(session: DevTools, diagnostics: Path) -> float:
-    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
-    state = "missing"
-    while time.monotonic() < deadline:
-        state = session.evaluate("document.body ? document.body.dataset.gameState : 'missing'")
-        observed_at = time.monotonic()
-        if state == "ready" and observed_at <= deadline:
-            return READY_TIMEOUT_SECONDS - (deadline - observed_at)
-        if state in ("ready", "error"):
-            break
-        time.sleep(0.25)
-    errors = session.evaluate(
-        "(document.getElementById('browser-errors') || {}).textContent || ''"
-    )
-    write_diagnostics(session, diagnostics)
-    raise GateFailure(
-        f"the game reported data-game-state={state!r} instead of 'ready' "
-        f"within {READY_TIMEOUT_SECONDS}s; captured: {errors!r}"
-    )
+GAME_STATE_JS = "__DOC__ && __DOC__.body ? __DOC__.body.dataset.gameState : 'missing'"
+
+# A missing sink is not an empty one. The play page owns `#browser-errors`, and
+# a document that lost it would report "no errors" for the rest of the run
+# however loudly it was failing, so its presence is asserted before its text.
+BROWSER_ERRORS_JS = """
+(() => {
+  const doc = __DOC__;
+  const sink = doc ? doc.getElementById("browser-errors") : null;
+  return { present: sink !== null, text: sink ? sink.textContent || "" : "" };
+})()
+"""
 
 
-def write_diagnostics(session: DevTools, diagnostics: Path) -> None:
+def write_diagnostics(session: Page, diagnostics: Path) -> None:
     diagnostics.mkdir(parents=True, exist_ok=True)
+    prefix = "page" if session.scope is TOP_SCOPE else "embed"
+    # Diagnostics are written from a session that has already failed, so every
+    # capture is best effort: whatever went wrong with the browser must not
+    # also swallow the page and the screenshot that explain it.
     try:
-        html = session.evaluate("document.documentElement.outerHTML")
-        (diagnostics / "page.html").write_text(str(html), encoding="utf-8")
-    except GateFailure:
+        html = session.evaluate_top("document.documentElement.outerHTML")
+        (diagnostics / f"{prefix}.html").write_text(str(html), encoding="utf-8")
+    except Exception:  # noqa: BLE001 - a failed capture is never the failure
         pass
     try:
         shot = session.call("Page.captureScreenshot", {"format": "png"})
-        (diagnostics / "page.png").write_bytes(base64.b64decode(shot["data"]))
-    except GateFailure:
+        (diagnostics / f"{prefix}.png").write_bytes(base64.b64decode(shot["data"]))
+    except Exception:  # noqa: BLE001 - a failed capture is never the failure
         pass
 
 
-def canvas_geometry(session: DevTools) -> dict:
-    geometry = session.evaluate(
-        """
-        (() => {
-          const canvas = document.getElementById("game-canvas");
-          if (!canvas) return null;
-          const rect = canvas.getBoundingClientRect();
-          const style = window.getComputedStyle(canvas);
-          return {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-            bufferWidth: canvas.width,
-            bufferHeight: canvas.height,
-            visible: style.visibility !== "hidden" && style.display !== "none",
-            devicePixelRatio: window.devicePixelRatio,
-          };
-        })()
-        """
+def wait_for_ready(session: Page, diagnostics: Path) -> float:
+    started = time.monotonic()
+    budget = min(READY_TIMEOUT_SECONDS, session.session.remaining())
+    deadline = started + budget
+    state = "missing"
+    while time.monotonic() < deadline:
+        state = session.evaluate(GAME_STATE_JS)
+        observed_at = time.monotonic()
+        if state == "ready" and observed_at <= deadline:
+            return observed_at - started
+        if state in ("ready", "error"):
+            break
+        time.sleep(0.25)
+    errors = session.evaluate(BROWSER_ERRORS_JS)
+    write_diagnostics(session, diagnostics)
+    raise GateFailure(
+        f"{session.label} reported data-game-state={state!r} instead of 'ready' "
+        f"within {budget:.0f}s; captured: {errors!r}"
     )
+
+
+def check_no_browser_errors(session: Page) -> None:
+    captured = dict(session.evaluate(BROWSER_ERRORS_JS))
+    if not captured.get("present"):
+        raise GateFailure(
+            f"{session.label} has no #browser-errors element, so nothing was "
+            "watching for the errors this gate reports on"
+        )
+    if str(captured.get("text", "")).strip():
+        raise GateFailure(f"{session.label} captured errors: {captured['text']!r}")
+
+
+CANVAS_GEOMETRY_JS = """
+(() => {
+  const doc = __DOC__;
+  if (!doc) return null;
+  const canvas = doc.getElementById("game-canvas");
+  if (!canvas) return null;
+  const rect = canvas.getBoundingClientRect();
+  const origin = __ORIGIN__;
+  const clip = __CLIP__;
+  const style = __WIN__.getComputedStyle(canvas);
+  return {
+    x: rect.x + origin.x,
+    y: rect.y + origin.y,
+    width: rect.width,
+    height: rect.height,
+    clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height },
+    bufferWidth: canvas.width,
+    bufferHeight: canvas.height,
+    visible: style.visibility !== "hidden" && style.display !== "none",
+  };
+})()
+"""
+
+
+def canvas_geometry(session: Page) -> dict:
+    geometry = session.evaluate(CANVAS_GEOMETRY_JS)
     if not geometry:
-        raise GateFailure("the play page has no #game-canvas element")
+        raise GateFailure(f"{session.label} has no #game-canvas element")
     return geometry
 
 
-def check_canvas(geometry: dict) -> None:
+def check_canvas(session: Page, geometry: dict) -> None:
     if not geometry["visible"]:
-        raise GateFailure("the canvas is not visible")
+        raise GateFailure(f"the canvas in {session.label} is not visible")
     width = float(geometry["width"])
     height = float(geometry["height"])
     if width <= 0 or height <= 0:
-        raise GateFailure(f"the canvas has no size: {width}x{height}")
+        raise GateFailure(f"the canvas in {session.label} has no size: {width}x{height}")
     expected = height * 16.0 / 9.0
     if abs(width - expected) > ASPECT_TOLERANCE_PIXELS:
         raise GateFailure(
-            f"the canvas is {width}x{height}, which is not 16:9 within "
-            f"{ASPECT_TOLERANCE_PIXELS} pixel (expected width {expected:.2f})"
+            f"the canvas in {session.label} is {width}x{height}, which is not 16:9 "
+            f"within {ASPECT_TOLERANCE_PIXELS} pixel (expected width {expected:.2f})"
         )
     if int(geometry["bufferWidth"]) <= 0 or int(geometry["bufferHeight"]) <= 0:
-        raise GateFailure("the canvas has an empty drawing buffer")
+        raise GateFailure(f"the canvas in {session.label} has an empty drawing buffer")
 
 
-def check_no_browser_errors(session: DevTools) -> None:
-    captured = session.evaluate(
-        "(document.getElementById('browser-errors') || {}).textContent || ''"
-    )
-    if str(captured).strip():
-        raise GateFailure(f"the browser captured errors: {captured!r}")
+SCROLL_OFFSET_JS = "__WIN__.scrollY"
 
+SCROLL_TO_TOP_JS = "__WIN__.scrollTo(0, 0)"
 
-SCROLL_OFFSET_JS = "window.scrollY"
+SCROLL_RESERVE_JS = "__DOC__.documentElement.scrollHeight - __WIN__.innerHeight"
 
-SCROLL_TO_TOP_JS = "window.scrollTo(0, 0)"
-
-SCROLL_RESERVE_JS = "document.documentElement.scrollHeight - window.innerHeight"
+SCROLL_CANVAS_INTO_VIEW_JS = (
+    "__DOC__.getElementById('game-canvas')"
+    ".scrollIntoView({ block: 'center', behavior: 'instant' })"
+)
 
 # A scroll animation advances once per rendered frame, so frames are the only
 # clock it can be measured against. A wall clock reads a janky renderer as a
@@ -582,22 +965,24 @@ SCROLL_RESERVE_JS = "document.documentElement.scrollHeight - window.innerHeight"
 NEXT_FRAMES_JS = """
 new Promise((resolve) => {
   let remaining = 2;
-  const step = () => (remaining-- > 0 ? requestAnimationFrame(step) : resolve(true));
+  const step = () => (remaining-- > 0 ? __WIN__.requestAnimationFrame(step) : resolve(true));
   step();
 })
 """
 
 SCROLL_REPORT_JS = """
 (() => {
-  const node = document.activeElement;
+  const doc = __DOC__;
+  const win = __WIN__;
+  const node = doc.activeElement;
   const name = node
     ? node.tagName.toLowerCase() + (node.id ? "#" + node.id : "")
     : "none";
   return {
     activeElement: name,
-    scrollY: window.scrollY,
-    scrollHeight: document.documentElement.scrollHeight,
-    innerHeight: window.innerHeight,
+    scrollY: win.scrollY,
+    scrollHeight: doc.documentElement.scrollHeight,
+    innerHeight: win.innerHeight,
   };
 })()
 """
@@ -607,9 +992,11 @@ SCROLL_REPORT_JS = """
 # region and the gate refuses to continue unless that region really owns focus.
 FOCUS_SCROLL_PROBE_JS = """
 (() => {
-  const probe = document.querySelector("[data-scroll-probe]");
+  const doc = __DOC__;
+  const win = __WIN__;
+  const probe = doc.querySelector("[data-scroll-probe]");
   if (!probe) return { probe: null };
-  const canvas = document.getElementById("game-canvas");
+  const canvas = doc.getElementById("game-canvas");
   if (canvas) {
     if (canvas.contains(probe) || probe === canvas) {
       return { probe: probe.id || "unnamed", insideCanvas: true };
@@ -617,38 +1004,51 @@ FOCUS_SCROLL_PROBE_JS = """
     canvas.blur();
   }
   probe.focus({ preventScroll: true });
-  window.scrollTo(0, 0);
+  win.scrollTo(0, 0);
   return {
     probe: probe.id || "unnamed",
     insideCanvas: false,
-    owned: document.activeElement === probe,
+    owned: doc.activeElement === probe,
   };
 })()
 """
 
 FOCUS_CANVAS_JS = """
 (() => {
-  const canvas = document.getElementById("game-canvas");
+  const doc = __DOC__;
+  const canvas = doc.getElementById("game-canvas");
   if (!canvas) return false;
   canvas.focus({ preventScroll: true });
-  window.scrollTo(0, 0);
-  return document.activeElement === canvas;
+  __WIN__.scrollTo(0, 0);
+  return doc.activeElement === canvas;
 })()
 """
 
 CANVAS_STILL_FOCUSED_JS = (
-    "document.activeElement === document.getElementById('game-canvas')"
+    "__DOC__.activeElement === __DOC__.getElementById('game-canvas')"
 )
 
+# The positive control only proves anything about an unfocused canvas while the
+# neutral probe is still the element receiving the keys. A page that moved
+# focus part way through the sequence measured something else entirely.
+PROBE_STILL_FOCUSED_JS = """
+(() => {
+  const doc = __DOC__;
+  const probe = doc.querySelector("[data-scroll-probe]");
+  return probe !== null && doc.activeElement === probe;
+})()
+"""
 
-def scroll_report(session: DevTools) -> dict:
+
+def scroll_report(session: Page) -> dict:
     """Active element, scroll offset, and the two heights, for diagnostics."""
     return dict(session.evaluate(SCROLL_REPORT_JS))
 
 
-def describe_scroll(session: DevTools, deltas: dict[str, float] | None = None) -> str:
+def describe_scroll(session: Page, deltas: dict[str, float] | None = None) -> str:
     report = scroll_report(session)
     detail = (
+        f"in {session.label}: "
         f"active element {report['activeElement']}, "
         f"scrollY {report['scrollY']}, "
         f"scrollHeight {report['scrollHeight']}, "
@@ -660,7 +1060,7 @@ def describe_scroll(session: DevTools, deltas: dict[str, float] | None = None) -
     return detail
 
 
-def wait_for_scroll_to_settle(session: DevTools, before: float | None = None) -> float:
+def wait_for_scroll_to_settle(session: Page, before: float | None = None) -> float:
     """Waits out an animated scroll and returns where the page came to rest.
 
     Frames are the clock, because a scroll animation advances once per rendered
@@ -684,7 +1084,7 @@ def wait_for_scroll_to_settle(session: DevTools, before: float | None = None) ->
     return current
 
 
-def reset_scroll(session: DevTools) -> None:
+def reset_scroll(session: Page) -> None:
     """Returns the page to the top and proves it stayed there.
 
     A keyboard scroll is an animation that outlives a single ``scrollTo``, so
@@ -696,13 +1096,13 @@ def reset_scroll(session: DevTools) -> None:
         if wait_for_scroll_to_settle(session) == 0.0:
             return
     raise GateFailure(
-        "the play page would not come to rest at the top of the document: "
+        "the page would not come to rest at the top of the document "
         + describe_scroll(session)
     )
 
 
 def press_control_key(
-    session: DevTools, code: str, key_code: int, key: str, text: str | None
+    session: Page, code: str, key_code: int, key: str, text: str | None
 ) -> float:
     """Dispatches one trusted keystroke and reports how far the page scrolled.
 
@@ -723,7 +1123,7 @@ def press_control_key(
     return wait_for_scroll_to_settle(session, before) - before
 
 
-def press_control_keys(session: DevTools) -> dict[str, float]:
+def press_control_keys(session: Page) -> dict[str, float]:
     """Runs the whole reviewed key sequence and records a delta for each key.
 
     Both phases of the assertion call this and nothing else, so the focused
@@ -736,13 +1136,13 @@ def press_control_keys(session: DevTools) -> dict[str, float]:
     return deltas
 
 
-def check_control_keys_do_not_scroll(session: DevTools) -> dict:
+def check_control_keys_do_not_scroll(session: Page) -> dict:
     reserve = float(session.evaluate(SCROLL_RESERVE_JS))
     if reserve < MINIMUM_SCROLL_RESERVE_PIXELS:
         raise GateFailure(
-            f"the play page reserves {reserve} scrollable pixels, fewer than the "
+            f"{session.label} reserves {reserve} scrollable pixels, fewer than the "
             f"{MINIMUM_SCROLL_RESERVE_PIXELS} the no-scroll assertion needs to be "
-            "worth making: " + describe_scroll(session)
+            "worth making " + describe_scroll(session)
         )
 
     # Positive control. The same trusted keys must really scroll this page while
@@ -751,56 +1151,65 @@ def check_control_keys_do_not_scroll(session: DevTools) -> dict:
     probe = dict(session.evaluate(FOCUS_SCROLL_PROBE_JS))
     if not probe.get("probe"):
         raise GateFailure(
-            "the play page has no [data-scroll-probe] element, so there is no "
-            "neutral focus target to prove the control keys against: "
+            f"{session.label} has no [data-scroll-probe] element, so there is no "
+            "neutral focus target to prove the control keys against "
             + describe_scroll(session)
         )
     if probe.get("insideCanvas"):
         raise GateFailure(
             f"the scroll probe {probe['probe']} is inside the canvas, so focusing "
-            "it would not prove anything about an unfocused page: "
+            "it would not prove anything about an unfocused page "
             + describe_scroll(session)
         )
     if not probe.get("owned"):
         raise GateFailure(
             f"the scroll probe {probe['probe']} did not take keyboard focus, so "
-            "the control keys would not be proved against an unfocused canvas: "
+            "the control keys would not be proved against an unfocused canvas "
             + describe_scroll(session)
         )
 
     unfocused = press_control_keys(session)
+    if not session.evaluate(PROBE_STILL_FOCUSED_JS):
+        raise GateFailure(
+            f"the scroll probe {probe['probe']} did not still own keyboard focus "
+            "after the positive control, so the keys that moved the page were "
+            "not the ones an unfocused canvas is judged against "
+            + describe_scroll(session, unfocused)
+        )
     inert = [code for code in POSITIVE_CONTROL_KEYS if unfocused.get(code, 0.0) <= 0.0]
     if inert:
         raise GateFailure(
-            f"the trusted control keys {inert} did not scroll the page while the "
-            "neutral scroll probe held focus, so the focused no-scroll assertion "
-            "would prove nothing: " + describe_scroll(session, unfocused)
+            f"the trusted control keys {inert} did not scroll {session.label} while "
+            "the neutral scroll probe held focus, so the focused no-scroll "
+            "assertion would prove nothing " + describe_scroll(session, unfocused)
         )
 
     reset_scroll(session)
     if not session.evaluate(FOCUS_CANVAS_JS):
-        raise GateFailure("the canvas refused keyboard focus: " + describe_scroll(session))
+        raise GateFailure(
+            f"the canvas in {session.label} refused keyboard focus "
+            + describe_scroll(session)
+        )
 
     focused = press_control_keys(session)
     moved = {code: delta for code, delta in focused.items() if delta != 0.0}
     if moved:
         raise GateFailure(
-            f"the focused control keys {sorted(moved)} scrolled the page; the "
-            "reviewed keys must be owned by the game: "
-            + describe_scroll(session, focused)
+            f"the focused control keys {sorted(moved)} scrolled {session.label}; the "
+            "reviewed keys must be owned by the game " + describe_scroll(session, focused)
         )
 
     resting = float(session.evaluate(SCROLL_OFFSET_JS))
     if resting != 0.0:
         raise GateFailure(
-            f"the page came to rest at {resting} after the focused key sequence: "
-            + describe_scroll(session, focused)
+            f"{session.label} came to rest at {resting} after the focused key "
+            "sequence " + describe_scroll(session, focused)
         )
 
     if not session.evaluate(CANVAS_STILL_FOCUSED_JS):
         raise GateFailure(
-            "the canvas lost focus while the game keys were pressed: "
-            + describe_scroll(session, focused)
+            f"the canvas in {session.label} lost focus while the game keys were "
+            "pressed " + describe_scroll(session, focused)
         )
 
     return {
@@ -811,39 +1220,62 @@ def check_control_keys_do_not_scroll(session: DevTools) -> dict:
     }
 
 
+def _intersect(canvas: dict, clip: dict) -> tuple[float, float, float, float]:
+    left = max(float(canvas["x"]), float(clip["x"]))
+    top = max(float(canvas["y"]), float(clip["y"]))
+    right = min(
+        float(canvas["x"]) + float(canvas["width"]),
+        float(clip["x"]) + float(clip["width"]),
+    )
+    bottom = min(
+        float(canvas["y"]) + float(canvas["height"]),
+        float(clip["y"]) + float(clip["height"]),
+    )
+    return left, top, max(right, left), max(bottom, top)
+
+
 def check_canvas_pixels(
-    session: DevTools,
+    session: Page,
     palette: dict[str, tuple[int, int, int]],
     diagnostics: Path,
+    artifact: str,
 ) -> dict:
     # Read the geometry again immediately before the capture: anything that
-    # scrolled the page would otherwise make the sampled region point at the
-    # page chrome instead of the canvas.
-    session.evaluate(
-        "document.getElementById('game-canvas')"
-        ".scrollIntoView({ block: 'center', behavior: 'instant' })"
-    )
+    # scrolled the document would otherwise make the sampled region point at
+    # the page chrome instead of the canvas. In a frame the canvas is scrolled
+    # into the frame's own viewport, which is also the region it can be seen in.
+    session.evaluate(SCROLL_CANVAS_INTO_VIEW_JS)
     time.sleep(0.2)
     geometry = canvas_geometry(session)
     shot = session.call("Page.captureScreenshot", {"format": "png", "fromSurface": True})
     png = base64.b64decode(shot["data"])
     diagnostics.mkdir(parents=True, exist_ok=True)
-    (diagnostics / "canvas.png").write_bytes(png)
+    (diagnostics / artifact).write_bytes(png)
     image = decode_png(png)
 
-    ratio = image.width / max(float(session.evaluate("window.innerWidth")), 1.0)
-    left = max(int(round(float(geometry["x"]) * ratio)), 0)
-    top = max(int(round(float(geometry["y"]) * ratio)), 0)
-    right = min(int(round((float(geometry["x"]) + float(geometry["width"])) * ratio)), image.width)
-    bottom = min(
-        int(round((float(geometry["y"]) + float(geometry["height"])) * ratio)), image.height
-    )
+    # The canvas is only judged where it can actually be seen: a frame clips
+    # its document, so the region is the part of the canvas inside that frame.
+    css_left, css_top, css_right, css_bottom = _intersect(geometry, geometry["clip"])
+    visible = (css_right - css_left) * (css_bottom - css_top)
+    drawn = float(geometry["width"]) * float(geometry["height"])
+    if drawn <= 0 or visible < drawn * 0.9:
+        raise GateFailure(
+            f"only {visible:.0f} of {drawn:.0f} canvas pixels are inside "
+            f"{session.label}; the canvas has to be visible to be judged"
+        )
+
+    ratio = image.width / max(float(session.evaluate_top("window.innerWidth")), 1.0)
+    left = max(int(round(css_left * ratio)), 0)
+    top = max(int(round(css_top * ratio)), 0)
+    right = min(int(round(css_right * ratio)), image.width)
+    bottom = min(int(round(css_bottom * ratio)), image.height)
     captured = (right - left) * (bottom - top)
-    expected = float(geometry["width"]) * float(geometry["height"]) * ratio * ratio
+    expected = visible * ratio * ratio
     if expected <= 0 or captured < expected * 0.9:
         raise GateFailure(
             f"the canvas region {left},{top}..{right},{bottom} captures "
-            f"{captured} of {expected:.0f} canvas pixels in the screenshot"
+            f"{captured} of {expected:.0f} canvas pixels in the screenshot of "
+            f"{session.label}"
         )
 
     names = list(palette)
@@ -874,13 +1306,13 @@ def check_canvas_pixels(
                 counts[best_name] += 1
 
     if total == 0:
-        raise GateFailure("the canvas region contained no sampled pixels")
+        raise GateFailure(f"the canvas region of {session.label} contained no pixels")
 
     variances = [squares[i] / total - (sums[i] / total) ** 2 for i in range(3)]
     if max(variances) < MINIMUM_CHANNEL_VARIANCE:
         raise GateFailure(
-            f"the canvas is effectively blank: channel variance {variances} is below "
-            f"{MINIMUM_CHANNEL_VARIANCE}"
+            f"the canvas in {session.label} is effectively blank: channel variance "
+            f"{variances} is below {MINIMUM_CHANNEL_VARIANCE}"
         )
 
     present = sorted(
@@ -889,8 +1321,8 @@ def check_canvas_pixels(
     )
     if len(present) < MINIMUM_PALETTE_CLASSES:
         raise GateFailure(
-            f"the canvas shows {len(present)} approved palette classes "
-            f"({present}), fewer than {MINIMUM_PALETTE_CLASSES}; "
+            f"the canvas in {session.label} shows {len(present)} approved palette "
+            f"classes ({present}), fewer than {MINIMUM_PALETTE_CLASSES}; "
             f"unmatched share {unmatched / total:.3f}"
         )
 
@@ -904,44 +1336,102 @@ def check_canvas_pixels(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# The published homepage embed
 # ---------------------------------------------------------------------------
 
+# The homepage is the one the site generator really produced, so the embed is
+# discovered on it rather than reconstructed from the generator's source. The
+# published contract is one playable frame, carrying the `play-embed` class,
+# pointing at the package this run just packaged and served.
+DISCOVER_EMBED_JS = """
+(() => {
+  const frames = Array.from(document.getElementsByTagName("iframe"));
+  const readyState = document.readyState;
+  if (frames.length !== 1) return { count: frames.length, readyState };
+  const frame = frames[0];
+  const rect = frame.getBoundingClientRect();
+  return {
+    count: 1,
+    readyState,
+    class: frame.className,
+    classes: Array.from(frame.classList),
+    src: frame.getAttribute("src"),
+    resolved: frame.src,
+    readable: frame.contentDocument !== null,
+    width: rect.width,
+    height: rect.height,
+  };
+})()
+"""
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--cdp-port", type=int, required=True)
-    parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--design-source", type=Path, required=True)
-    parser.add_argument("--diagnostics", type=Path, required=True)
-    arguments = parser.parse_args()
+#: The class the generated homepage has to give its playable frame.
+PUBLISHED_EMBED_CLASS = "play-embed"
 
-    palette = read_palette(arguments.design_source)
 
-    for relative in ["", *packaged_urls(arguments.package)]:
-        require_http_200(arguments.base_url, relative)
+def discover_embed(session: Page, expected_url: str) -> dict:
+    """Finds the published playable frame and proves it is the published one."""
+    started = time.monotonic()
+    budget = min(BROWSER_TIMEOUT_SECONDS, session.session.remaining())
+    ready_by = started + budget
+    while True:
+        report = dict(session.evaluate(DISCOVER_EMBED_JS))
+        observed_at = time.monotonic()
+        if (
+            report.get("count") != 0
+            or report.get("readyState") == "complete"
+            or observed_at >= ready_by
+        ):
+            break
+        time.sleep(min(0.25, ready_by - observed_at))
+    if report.get("count") != 1:
+        raise GateFailure(
+            f"the generated homepage carries {report.get('count')} iframes; the "
+            "published embed has to be exactly one for this gate to prove it"
+        )
+    if PUBLISHED_EMBED_CLASS not in report.get("classes", []):
+        raise GateFailure(
+            f"the homepage embed is {report.get('class')!r}, not the published "
+            f"{PUBLISHED_EMBED_CLASS!r} contract"
+        )
+    if report.get("resolved") != expected_url:
+        raise GateFailure(
+            f"the homepage embed resolves to {report.get('resolved')!r}, not to "
+            f"the published package at {expected_url!r}"
+        )
+    if not report.get("readable"):
+        raise GateFailure(
+            "the homepage embed has no reachable document, so the published game "
+            "cannot be proved inside it"
+        )
+    if float(report.get("width", 0)) <= 0 or float(report.get("height", 0)) <= 0:
+        raise GateFailure(
+            f"the homepage embed is laid out at {report.get('width')}x"
+            f"{report.get('height')}, so nothing in it can be seen"
+        )
+    return report
 
-    session = open_page(arguments.cdp_port, arguments.base_url.rstrip("/") + "/")
-    try:
-        session.call("Page.enable")
-        session.call("Runtime.enable")
-        elapsed = wait_for_ready(session, arguments.diagnostics)
-        check_no_browser_errors(session)
-        geometry = canvas_geometry(session)
-        check_canvas(geometry)
-        scroll = check_control_keys_do_not_scroll(session)
-        check_no_browser_errors(session)
-        pixels = check_canvas_pixels(session, palette, arguments.diagnostics)
-    except GateFailure as failure:
-        write_diagnostics(session, arguments.diagnostics)
-        print(f"browser gate failed: {failure}", file=sys.stderr)
-        session.close()
-        return 1
-    finally:
-        pass
 
-    summary = {
+def prove_page(
+    session: Page,
+    palette: dict[str, tuple[int, int, int]],
+    diagnostics: Path,
+    artifact: str,
+) -> dict:
+    """Every assertion this gate makes, against one document.
+
+    The standalone page and the embedded player go through this same function,
+    so the published homepage is held to the readiness, error-sink, canvas,
+    keyboard-ownership, and rendered-pixel contracts the direct link is, rather
+    than to a weaker version of them.
+    """
+    elapsed = wait_for_ready(session, diagnostics)
+    check_no_browser_errors(session)
+    geometry = canvas_geometry(session)
+    check_canvas(session, geometry)
+    scroll = check_control_keys_do_not_scroll(session)
+    check_no_browser_errors(session)
+    pixels = check_canvas_pixels(session, palette, diagnostics, artifact)
+    return {
         "ready_seconds": round(elapsed, 2),
         "canvas": {
             "width": geometry["width"],
@@ -951,12 +1441,126 @@ def main() -> int:
         "pixels": pixels,
         "scroll": scroll,
     }
-    arguments.diagnostics.mkdir(parents=True, exist_ok=True)
-    (arguments.diagnostics / "browser-gate.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def gate_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--cdp-port", type=int, required=True)
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--design-source", type=Path, required=True)
+    parser.add_argument("--diagnostics", type=Path, required=True)
+    parser.add_argument(
+        "--hub-url",
+        required=True,
+        help="the generated site homepage that embeds the packaged game",
     )
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    session.close()
+    return parser.parse_args(argv)
+
+
+def run_gate(
+    arguments: argparse.Namespace, pages: list[Page], deadline: Deadline
+) -> tuple[dict, dict]:
+    """Proves the package standalone, then again inside the published page."""
+    palette = read_palette(arguments.design_source)
+
+    for relative in ["", *packaged_urls(arguments.package)]:
+        require_http_200(arguments.base_url, relative, deadline)
+    require_http_200(arguments.hub_url, "", deadline)
+
+    standalone = Page(
+        open_page(arguments.cdp_port, resolve_url(arguments.base_url, ""), deadline),
+        TOP_SCOPE,
+    )
+    pages.append(standalone)
+    summary = prove_page(standalone, palette, arguments.diagnostics, "canvas.png")
+
+    hub = open_page(arguments.cdp_port, resolve_url(arguments.hub_url, ""), deadline)
+    homepage = Page(hub, TOP_SCOPE)
+    embedded = Page(hub, EMBED_SCOPE)
+    pages.append(embedded)
+    expected = resolve_url(arguments.base_url, "index.html")
+    embed = discover_embed(homepage, expected)
+    proof = prove_page(embedded, palette, arguments.diagnostics, "embed-canvas.png")
+    return summary, {
+        "class": PUBLISHED_EMBED_CLASS,
+        "src": embed["src"],
+        "frame": {"width": embed["width"], "height": embed["height"]},
+        **proof,
+    }
+
+
+def report_failure(pages: list[Page], diagnostics: Path, message: str) -> int:
+    """Captures whatever the failed session can still show, then gives up."""
+    if pages:
+        write_diagnostics(pages[-1], diagnostics)
+    print(f"browser gate failed: {message}", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = gate_arguments(argv)
+    # The budget starts here, before a socket exists, so the handshake, the
+    # HTTP checks, and every framed read all spend the same one.
+    deadline = Deadline()
+    pages: list[Page] = []
+    try:
+        summary, embed = run_gate(arguments, pages, deadline)
+    except GateFailure as failure:
+        return report_failure(pages, arguments.diagnostics, str(failure))
+    # A driver defect is not a passing gate. Anything the phases above did not
+    # anticipate is reported like any other failure, with the same diagnostics
+    # written and the same sessions closed below.
+    except Exception as failure:  # noqa: BLE001
+        return report_failure(
+            pages,
+            arguments.diagnostics,
+            f"unexpected {type(failure).__name__}: {failure}",
+        )
+    finally:
+        for page in pages:
+            page.session.close()
+
+    # Closing the sessions and writing the reports are the last things this run
+    # does, and running out of time during either of them is still running out
+    # of time. The budget is therefore checked after the cleanup and after each
+    # report, and anything already written is taken back: a partial report left
+    # behind by an expired run is evidence the site would otherwise publish.
+    #
+    # `browser-gate.json` is a schema the site generator reads strictly and
+    # refuses to grow, so the embed proof is kept beside it rather than added
+    # to it. A field this gate invented would make the whole browser evidence
+    # unreadable and silently drop it from the published run.
+    reports = (
+        (arguments.diagnostics / "browser-gate.json", summary),
+        (arguments.diagnostics / "embed-gate.json", embed),
+    )
+    try:
+        deadline.require("closing the browser sessions")
+        arguments.diagnostics.mkdir(parents=True, exist_ok=True)
+        for path, document in reports:
+            path.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            deadline.require(f"writing {path.name}")
+        deadline.require("serializing the combined result")
+        combined = json.dumps(
+            {"standalone": summary, "embedded": embed}, indent=2, sort_keys=True
+        )
+        deadline.require("serializing the combined result")
+        print(combined, flush=True)
+        deadline.require("writing the combined result")
+    except (GateFailure, OSError) as failure:
+        for path, _ in reports:
+            path.unlink(missing_ok=True)
+        print(f"browser gate failed: {failure}", file=sys.stderr)
+        return 1
+
     return 0
 
 
