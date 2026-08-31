@@ -19,6 +19,20 @@
 set -euo pipefail
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+python=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+    && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' \
+      >/dev/null 2>&1; then
+    python="$candidate"
+    break
+  fi
+done
+if [[ -z "$python" ]]; then
+  echo "Python 3.8 or newer is required by the browser gate" >&2
+  exit 1
+fi
 package="${1:-}"
 if [[ -z "$package" ]]; then
   echo "usage: scripts/web-smoke.sh <packaged-directory> [diagnostics-directory]" >&2
@@ -26,7 +40,7 @@ if [[ -z "$package" ]]; then
 fi
 
 real_path() {
-  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+  "$python" -c 'import os, sys; print(os.path.realpath(sys.argv[1]).replace(os.sep, "/"))' "$1"
 }
 
 # 1. Contain the diagnostics directory before anything can be removed.
@@ -110,7 +124,7 @@ browser="$(find_browser)" || {
 }
 
 free_port() {
-  python3 - <<'PY'
+  "$python" - <<'PY'
 import socket
 with socket.socket() as probe:
     probe.bind(("127.0.0.1", 0))
@@ -189,7 +203,7 @@ if [[ ! -f "$site_root/index.html" || ! -f "$site_root/play/index.html" ]]; then
   exit 1
 fi
 
-python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$serve_root" \
+"$python" -m http.server "$http_port" --bind 127.0.0.1 --directory "$serve_root" \
   >"$diagnostics/server.log" 2>&1 &
 server_pid=$!
 
@@ -229,7 +243,7 @@ fi
   >"$diagnostics/browser.log" 2>&1 &
 browser_pid=$!
 
-python3 "$repository/scripts/browser_gate.py" \
+"$python" "$repository/scripts/browser_gate.py" \
   --base-url "$base_url" \
   --cdp-port "$cdp_port" \
   --package "$package" \

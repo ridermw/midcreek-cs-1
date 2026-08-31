@@ -24,8 +24,38 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }
 
-fn link_privilege_missing(error: &std::io::Error) -> bool {
-    cfg!(windows) && matches!(error.raw_os_error(), Some(50 | 1314))
+fn bash_command() -> PathBuf {
+    if cfg!(windows) {
+        if let Ok(output) = std::process::Command::new("git")
+            .arg("--exec-path")
+            .output()
+            && output.status.success()
+        {
+            let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            for ancestor in exec_path.ancestors() {
+                for relative in ["bin/bash.exe", "usr/bin/bash.exe"] {
+                    let candidate = ancestor.join(relative);
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+            if let Some(root) = std::env::var_os(variable) {
+                let candidate = PathBuf::from(root).join(if variable == "LocalAppData" {
+                    "Programs/Git/bin/bash.exe"
+                } else {
+                    "Git/bin/bash.exe"
+                });
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        panic!("Git Bash should be installed on Windows");
+    }
+    PathBuf::from("bash")
 }
 
 #[test]
@@ -1145,14 +1175,8 @@ fn a_nested_symlink_inside_the_current_tree_is_refused_rather_than_followed() {
         ],
     );
     let link = current.path().join("evidence/deep/secret.txt");
-    if let Err(error) = symlink_file(&outside.path().join("secret.txt"), &link) {
-        assert!(link_privilege_missing(&error), "{error}");
-        eprintln!(
-            "skipping the nested symbolic-link contract: this Windows session may not create \
-             symbolic links ({error}). The contract is exercised on every Unix run and in CI."
-        );
-        return;
-    }
+    symlink_file(&outside.path().join("secret.txt"), &link)
+        .expect("symbolic link support is required for containment contracts");
     assert_eq!(
         fs::read_to_string(&link).unwrap(),
         "not ours",
@@ -2135,7 +2159,8 @@ mod workflow_contract {
     }
 
     fn run_actionlint(targets: &[String]) -> std::process::Output {
-        Command::new(repository().join("scripts/actionlint.sh"))
+        Command::new(bash_command())
+            .arg(repository().join("scripts/actionlint.sh"))
             .args(targets)
             .current_dir(repository())
             .output()
@@ -2162,6 +2187,8 @@ mod workflow_contract {
     fn workflow_source() -> String {
         fs::read_to_string(repository().join(".github/workflows/pages.yml"))
             .expect("Pages workflow should be checked in")
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
     }
 
     fn repository() -> PathBuf {
@@ -3676,7 +3703,7 @@ mod gate_runner {
     }
 
     fn run_gate(results: &Path, name: &str, command: &[&str]) -> std::process::Output {
-        Command::new("bash")
+        Command::new(bash_command())
             .arg(repository().join("scripts/run-gate.sh"))
             .arg(results)
             .arg(name)

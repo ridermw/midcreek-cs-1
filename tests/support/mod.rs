@@ -31,6 +31,89 @@ pub fn sha256(path: impl AsRef<Path>) -> String {
         .collect()
 }
 
+pub fn sha256_text(path: impl AsRef<Path>) -> String {
+    let source = read(path);
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    Sha256::digest(normalized.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn relative_url(path: impl AsRef<Path>) -> String {
+    path.as_ref().to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(unix)]
+pub fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+pub fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+pub fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+pub fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+pub fn bash_command() -> PathBuf {
+    if cfg!(windows) {
+        if let Ok(output) = std::process::Command::new("git")
+            .arg("--exec-path")
+            .output()
+            && output.status.success()
+        {
+            let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            for ancestor in exec_path.ancestors() {
+                for relative in ["bin/bash.exe", "usr/bin/bash.exe"] {
+                    let candidate = ancestor.join(relative);
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+            if let Some(root) = std::env::var_os(variable) {
+                let candidate = PathBuf::from(root).join(if variable == "LocalAppData" {
+                    "Programs/Git/bin/bash.exe"
+                } else {
+                    "Git/bin/bash.exe"
+                });
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        panic!("Git Bash should be installed on Windows");
+    }
+    PathBuf::from("bash")
+}
+
+pub fn python_command() -> PathBuf {
+    for candidate in ["python3", "python"] {
+        if std::process::Command::new(candidate)
+            .args([
+                "-c",
+                "import sys; raise SystemExit(sys.version_info < (3, 8))",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return PathBuf::from(candidate);
+        }
+    }
+    panic!("Python 3.8 or newer should be installed");
+}
+
 pub fn fixture(name: &str) -> ProgressDocument {
     let path = fixture_root().join(name);
     serde_json::from_str(&read(path)).expect("fixture should match the progress schema")

@@ -8,6 +8,27 @@ Items here were considered and deferred during the plan-exit review of
 
 ---
 
+## Discover installed Windows browsers in the clean gate
+
+**What.** Teach `scripts/check.sh` and `scripts/web-smoke.sh` to locate standard
+Windows Chrome and Edge installations when no browser command is supplied.
+
+**Why.** The clean gate now runs under Git Bash on Windows, but its browser
+lookup only checks Unix and macOS locations. A Windows machine can therefore
+have Chrome or Edge installed while the gate reports that no browser exists and
+skips browser verification.
+
+**Context.** Found during the U0 portability review after the Windows shell path
+was enabled. This is outside U0, which is limited to lint cleanup, render
+contract diagnosis, and binding the Phase 1 baseline. The future change must
+preserve the existing rule that a missing renderer or display cannot look like
+a passing render gate.
+
+**Depends on / blocked by.** Coordinate this with U2's Windows gate script so
+browser discovery has one owner and one documented override.
+
+---
+
 ## Scope `OutlineHull` to silhouette-defining meshes
 
 **What.** Emit reversed-winding outline hulls only for the meshes that carry the

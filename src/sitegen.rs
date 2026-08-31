@@ -1620,10 +1620,11 @@ impl std::error::Error for ReadmeStatusError {}
 /// task and challenge counts, and how many task IDs the reviewed plan declares
 /// — are read from the parsed `progress` document and from `plan_markdown`, so
 /// the block states what the project actually claims. The identity rows are
-/// digests of the stored bytes of those same two files, so a change to either
-/// source that the facts happen not to move — a reworded summary, a new plan
-/// paragraph, reindented JSON — still makes a stored block stale. The result
-/// is a function of its three arguments alone: no clock, no host, no Git.
+/// digests of the newline-normalized contents of those same two files, so a
+/// meaningful change that the facts happen not to move — a reworded summary,
+/// a new plan paragraph, reindented JSON — still makes a stored block stale
+/// without making the status host-dependent. The result is a function of its
+/// three arguments alone: no clock, no host, no Git.
 pub fn render_readme_status(
     progress: &ProgressDocument,
     progress_json: &str,
@@ -1683,7 +1684,8 @@ pub fn render_readme_status(
 const SOURCE_DIGEST_BYTES: usize = 8;
 
 fn source_digest(source: &str) -> String {
-    Sha256::digest(source.as_bytes())
+    let normalized = normalize_newlines(source);
+    Sha256::digest(normalized.as_bytes())
         .iter()
         .take(SOURCE_DIGEST_BYTES)
         .map(|byte| format!("{byte:02x}"))
@@ -1753,7 +1755,7 @@ fn readme_status_span(readme: &str) -> Result<(usize, usize), ReadmeStatusError>
 /// Proves a README carries exactly the block the canonical sources generate.
 pub fn check_readme_status(readme: &str, expected: &str) -> Result<(), ReadmeStatusError> {
     let actual = readme_status_block(readme)?;
-    if actual == expected {
+    if normalize_newlines(actual) == normalize_newlines(expected) {
         return Ok(());
     }
     Err(ReadmeStatusError::Stale {
@@ -1765,11 +1767,24 @@ pub fn check_readme_status(readme: &str, expected: &str) -> Result<(), ReadmeSta
 /// Replaces the generated block, preserving every byte outside it.
 pub fn replace_readme_status(readme: &str, block: &str) -> Result<String, ReadmeStatusError> {
     let (start, end) = readme_status_span(readme)?;
+    if normalize_newlines(&readme[start..end]) == normalize_newlines(block) {
+        return Ok(readme.to_owned());
+    }
+    let normalized = normalize_newlines(block);
+    let block = if readme.contains("\r\n") {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    };
     let mut updated = String::with_capacity(readme.len() - (end - start) + block.len());
     updated.push_str(&readme[..start]);
-    updated.push_str(block);
+    updated.push_str(&block);
     updated.push_str(&readme[end..]);
     Ok(updated)
+}
+
+fn normalize_newlines(source: &str) -> String {
+    source.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub fn validate_reference_manifest(
@@ -3641,6 +3656,10 @@ fn copy_reference_assets(
     Ok(paths)
 }
 
+fn relative_url(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), SitegenError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| SitegenError::Io {
@@ -4022,10 +4041,10 @@ fn render_comparison(
     };
     let key_path = reference_paths
         .get(&key_art.public_path)
-        .map_or_else(String::new, |path| path.display().to_string());
+        .map_or_else(String::new, |path| relative_url(path));
     let character_path = reference_paths
         .get(&character_sheet.public_path)
-        .map_or_else(String::new, |path| path.display().to_string());
+        .map_or_else(String::new, |path| relative_url(path));
     let current = evidence.and_then(|published| published.current.get("center"));
     let worker = evidence.and_then(|published| published.current.get(WORKER_FRAME_LABEL));
 

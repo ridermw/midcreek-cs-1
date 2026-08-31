@@ -33,6 +33,20 @@ step() {
   printf '\n=== %s ===\n' "$1"
 }
 
+python=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+    && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' \
+      >/dev/null 2>&1; then
+    python="$candidate"
+    break
+  fi
+done
+if [[ -z "$python" ]]; then
+  echo "Python 3.8 or newer is required by the local clean gate" >&2
+  exit 1
+fi
+
 # The rendered contract launches the compiled game, so it needs the assets to
 # resolve from the repository rather than from the test binary's directory.
 export BEVY_ASSET_ROOT="$repository"
@@ -48,7 +62,7 @@ step "workflow lint"
 ./scripts/actionlint.sh
 
 step "browser gate unit tests"
-python3 scripts/browser_gate_test.py
+"$python" scripts/browser_gate_test.py
 
 step "rustfmt"
 cargo fmt --all --check
@@ -75,7 +89,7 @@ cargo run --quiet --bin sitegen -- validate \
 # The history suite composes the degraded publication fallback with the real
 # assembler, so it runs once the step above has built `sitegen` for it.
 step "history bound tests"
-python3 scripts/ensure_history_test.py
+"$python" scripts/ensure_history_test.py
 
 step "pure and integration tests"
 cargo test --lib --bins
@@ -101,7 +115,7 @@ case "$(uname -s)" in
       render_command=(xvfb-run -a "${render_command[@]}")
     fi
     ;;
-  Darwin) ;;
+  Darwin|MINGW*|MSYS*|CYGWIN*) ;;
   *)
     echo "unsupported platform $(uname -s) for the rendered contract" >&2
     exit 1
