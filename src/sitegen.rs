@@ -4424,10 +4424,20 @@ fn validate_local_target(
 /// rule: [`validate_local_target`] refuses an absolute or `file:` target in
 /// any `href` or `src` whatever it names.
 ///
-/// This reads the generated HTML. The JSON this build publishes beside it is
-/// not scanned here and does not need to be: it is serialized from strict
-/// typed projections whose only path-shaped fields are artifact paths already
-/// proven relative and contained by [`resolve_artifact`].
+/// This reads the generated HTML only. The JSON this build publishes beside
+/// it — `verification.json` and its kin — is a different document under a
+/// different, narrower guarantee, not a stronger one this scan happens to
+/// also cover. `#[serde(deny_unknown_fields)]` fixes the *shape* of that JSON
+/// so an undeclared field is refused, but a declared string or map key can
+/// still hold any bytes its type allows. Of its path-shaped content, only
+/// `PublicFrame::artifact` and `PublicBrowser::screenshot` are actually
+/// proven relative, traversal-free, symlink-free, and contained: each is
+/// resolved by [`resolve_artifact`] before it is assigned into the
+/// projection at all. The repository-relative path keys of `PublicHashes`'s
+/// four maps, and the free strings a frame, the camera, or the stage list
+/// carry, are copied straight from the verifier's own report; they stay
+/// "relative" only by that report's schema and convention, never because
+/// this scan or `resolve_artifact` checked them.
 fn published_host_path(repository: &Path, output: &Path, html: &str) -> Option<String> {
     for root in publication_paths(repository, output) {
         if html.contains(&root) || html.contains(&escape_html(&root)) {
