@@ -591,28 +591,51 @@ is moved, not removed.
 
 **U1 (reference authority)**
 
-- Migrate all fifteen policy constants from `src/metrics.rs:395-443`
-  (`LUMINANCE_RANGE`, `LUMINANCE_REFERENCE_TOLERANCE`, `PALETTE_MIN`,
-  `FLOOR_MIN`, `RACK_MIN`, `YELLOW_MIN`, `INK_RANGE`, `DIAGONAL_BAND_MIN`,
-  `HISTOGRAM_MAX`, `EDGE_DENSITY_RANGE`, `WORKER_ROLE_MIN`, `BADGE_ROLE_MIN`,
-  `HUD_STATE_MIN`, `CLIP_DIFFERENCE_RANGE`, `OUTSIDE_CROP_MAX`) into
+- Migrate all sixteen policy constants from `src/metrics.rs:395-443`
+  (`SENTINEL_MAX`, `LUMINANCE_RANGE`, `LUMINANCE_REFERENCE_TOLERANCE`,
+  `PALETTE_MIN`, `FLOOR_MIN`, `RACK_MIN`, `YELLOW_MIN`, `INK_RANGE`,
+  `DIAGONAL_BAND_MIN`, `HISTOGRAM_MAX`, `EDGE_DENSITY_RANGE`,
+  `WORKER_ROLE_MIN`, `BADGE_ROLE_MIN`, `HUD_STATE_MIN`,
+  `CLIP_DIFFERENCE_RANGE`, `OUTSIDE_CROP_MAX`) into
   `docs/reference/fidelity.json`, and rewire their use sites in
   `src/verification.rs:4347-4448`. The plan states the "metrics is policy-free"
-  principle twice but never booked this migration.
+  principle twice but never booked this migration. *(Amended 2026-09-01: this
+  bullet said fifteen and omitted `SENTINEL_MAX`, which sits in the same block
+  and is gate policy by the same test. Leaving it behind would have defeated
+  the principle the migration exists for, so sixteen were migrated. No
+  threshold value changed.)*
 - Remove the duplicated `KEY_ART_SHA256` at `src/design.rs:152`; the manifest is
   the single source.
 - Widen `reference_metrics()` (`src/metrics.rs:377-382`) to accept the union of
   all contract regions. It currently caches with `&BTreeMap::new()`, so
   role-specific analyzers would each recompute the authority image, defeating
   the `&'static` cache and the module's own "one traversal, per pixel" contract.
-- Specify `build.rs`: output path, whether generated code is checked in and how
+- **No `build.rs`.** *(Amended 2026-09-01. This bullet previously required
+  specifying one: output path, whether generated code is checked in and how
   that interacts with `assetgen -- --check` byte-stability, whether the frozen
-  G0 hash is verified at build time or test time, behavior for the
+  G0 hash is verified at build time or test time, behaviour for the
   `wasm32-unknown-unknown` target and out-of-tree builds, and conformance to
-  `cargo fmt --check` and `clippy -D warnings`. No `build.rs` exists today.
+  `cargo fmt --check` and `clippy -D warnings`.)* The question is settled by
+  deciding one is not needed. `src/reference.rs` embeds
+  `docs/reference/fidelity.json` with `include_str!` and parses it once behind
+  a `OnceLock`. That is not a shortcut around the requirements above, it
+  removes them: an embedded copy cannot drift from the file it was built from,
+  so there is no generated output to check in and no byte-stability interaction
+  with `assetgen`; `metrics` also compiles for `wasm32-unknown-unknown`, where
+  there is no filesystem to read the contract from at runtime; and there is no
+  codegen output whose formatting or lint conformance could diverge. The frozen
+  G0 hash is therefore a **test-time** property of the committed document. The
+  reasoning is recorded in the `src/reference.rs` module documentation so it
+  travels with the code.
 - **New test scenarios:** the migrated constants round-trip and agree with the
-  frozen contract; generated constants match `fidelity.json` and drift fails a
-  gate; `reference_metrics()` computes every contract region in one traversal.
+  frozen contract; the contract's bounds match their calibrated values and
+  drift fails a gate; the embedded contract matches the document on disk; a
+  contract with an inverted window, a bound carrying neither side, or an
+  unsupported schema version is refused; `reference_metrics()` computes every
+  contract region in one traversal. *(Amended 2026-09-01: "generated constants
+  match `fidelity.json`" replaced, since there is no codegen. The literal pin
+  lives in `src/reference.rs` and is what makes a silent edit to the contract
+  fail.)*
 
 **U2 (continuous loop)**
 
