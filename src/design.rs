@@ -21,18 +21,10 @@ pub const ROOM_SIZE: Vec2 = Vec2::new(40.0, 40.0);
 ///
 /// The camera follows the technician anywhere in the walkable room, so its
 /// widest footprint on the apron plane may overhang the room by
-/// `hypot(13, 12.40915 + 0.06861) = 18.02083` m on either side. Covering that
-/// needs `2 * (20 + 18.02083) = 76.04166` m; 77 m is the next whole metre and
-/// leaves about 0.47917 m of slack on every edge.
-///
-/// This grew with U3. The half-depth term is the ground footprint of the
-/// orthographic viewport, `ORTHOGRAPHIC_HEIGHT / (2 sin(elevation))`, and
-/// [`camera_elevation_degrees`] is now derived from the authority image rather
-/// than from the 57-degree literal the POC shipped. A shallower camera sees
-/// further across the floor, so the apron it can reach is larger.
-/// `the_authored_apron_covers_the_widest_camera_footprint` re-derives this and
-/// fails if the two ever disagree.
-pub const RENDER_COVERAGE_SIZE: Vec2 = Vec2::new(77.0, 77.0);
+/// `hypot(13, 8.71916 + 0.03247) = 15.6714` m on either side. Covering that
+/// needs `2 * (20 + 15.6714) = 71.3428` m; 72 m is the next whole metre and
+/// leaves about 0.3286 m of slack on every edge.
+pub const RENDER_COVERAGE_SIZE: Vec2 = Vec2::new(72.0, 72.0);
 
 /// How far below the walkable floor the visual apron sits, in metres. The
 /// apron and the floor are coplanar quads of different sizes, so without this
@@ -133,36 +125,16 @@ pub const INITIAL_CAMERA_YAW_DEGREES: f32 = 45.0;
 ///   visible  iff  h_t + dx * sqrt(2) * tan(elevation) >= h_r
 /// ```
 ///
-/// The camera elevation, derived from the authority image.
-///
-/// This is not a chosen number. `projected_row_angle` in
-/// `docs/reference/fidelity.json` is the ground-axis angle measured from the
-/// approved key art, and a ground axis lands on screen at
-/// `arctan(sin(elevation))`, so the elevation that reproduces the authority's
-/// projection follows from inverting that. The POC shipped a literal 57
-/// degrees, which is far steeper than the approved art and is the single
-/// largest reason a capture does not look like the reference.
-///
-/// At the derived elevation a technician is clear at aisle centre and hidden
-/// while working at a rack the camera is on the same side of. Orbiting 180
-/// degrees puts the opposite row in front instead and clears them. That is why
-/// orbit, not camera height, is the answer to occlusion here.
-#[must_use]
-pub fn camera_elevation_degrees() -> f32 {
-    let row_angle = crate::reference::bounds().projected_row_angle.value();
-    crate::metrics::elevation_from_row_angle(row_angle)
-        .expect("the calibrated row angle must imply a physical elevation") as f32
-}
-
-/// Normalized camera offset proportions, derived from the same elevation.
-///
-/// The vertical component is `sqrt(2) * tan(elevation)`, so normalization
-/// reproduces [`camera_elevation_degrees`] with equal X and Z components.
-#[must_use]
-pub fn camera_offset_proportions() -> Vec3 {
-    let elevation = camera_elevation_degrees().to_radians();
-    Vec3::new(1.0, std::f32::consts::SQRT_2 * elevation.tan(), 1.0)
-}
+/// At 57 degrees a technician is clear at aisle centre and hidden while
+/// working at a rack the camera is on the same side of. Orbiting 180 degrees
+/// puts the opposite row in front instead and clears them. That is why orbit,
+/// not camera height, is the answer to occlusion here.
+pub const CAMERA_ELEVATION_DEGREES: f32 = 57.0;
+/// Normalized camera offset proportions. The vertical component is
+/// `sqrt(2) * tan(57 degrees)`, so normalization produces the reviewed
+/// 57-degree elevation with equal X/Z components.
+#[allow(clippy::excessive_precision)]
+pub const CAMERA_OFFSET_DIRECTION: Vec3 = Vec3::new(1.0, 2.177_697_9, 1.0);
 pub const CAMERA_ORBIT_DURATION_SECONDS: f32 = 0.30;
 
 pub const FAULT_INTERVAL_SECONDS: f32 = 4.0;

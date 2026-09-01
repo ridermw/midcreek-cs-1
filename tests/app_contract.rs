@@ -41,7 +41,8 @@ use midcreek_cs_1::{
     },
     design::{
         AISLE_CENTER_X, AISLE_CHECKPOINT_SPACING, AISLE_HALF_WIDTH, AISLE_Z_MAX, AISLE_Z_MIN,
-        AssetKind, CAMERA_ORBIT_DURATION_SECONDS, CHARACTER_SHEET_REFERENCE_PATH, ColliderSpec,
+        AssetKind, CAMERA_ELEVATION_DEGREES, CAMERA_OFFSET_DIRECTION,
+        CAMERA_ORBIT_DURATION_SECONDS, CHARACTER_SHEET_REFERENCE_PATH, ColliderSpec,
         DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, FAULT_INTERVAL_SECONDS, FAULT_RED,
         FLOOR_LIGHT, FLOOR_MARKING_HEIGHT, FLOOR_MARKING_WIDTH, FLOOR_SHADOW, HEALTHY_GREEN,
         HOSE_CHARCOAL, HOSE_DROP_HEIGHT, HOSE_DROP_Z, INITIAL_CAMERA_YAW_DEGREES, INK,
@@ -52,8 +53,7 @@ use midcreek_cs_1::{
         RESOLVED_DISPLAY_SECONDS, ROOM_SIZE, SIGNATURE_YELLOW, SKY_BOUNCE_BLUE, SceneBlueprint,
         SceneValidationError, TEAL_ACCENT, VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
         VisualSpec, WALKABLE_CELL_SIZE, WALL_HEIGHT, WALL_THICKNESS, WORKER_BOOTS, WORKER_HARD_HAT,
-        WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS, camera_elevation_degrees,
-        camera_offset_proportions,
+        WORKER_HI_VIS, WORKER_SKIN, WORKER_SLATE, WORKER_TROUSERS,
     },
     hud::{
         BADGE_HEIGHT, BADGE_WIDTH, BadgeKind, BadgeVisibility, CONTROLS_PANEL_HEIGHT,
@@ -167,16 +167,8 @@ fn design_constants_match_the_reviewed_product_contract() {
     assert_eq!(ROOM_SIZE, Vec2::new(40.0, 40.0));
     assert_eq!((ORTHOGRAPHIC_WIDTH, ORTHOGRAPHIC_HEIGHT), (26.0, 14.625));
     assert_eq!(INITIAL_CAMERA_YAW_DEGREES, 45.0);
-    // The elevation and the offset proportions are no longer authored numbers.
-    // U3 derives both from `projected_row_angle` in the fidelity contract,
-    // which is measured from the approved key art. The POC shipped 57 degrees,
-    // far steeper than the reference; these pins are what the authority
-    // implies, so a recalibration has to move them deliberately.
-    assert!((camera_elevation_degrees() - 36.098_49).abs() < 1.0e-4);
-    let proportions = camera_offset_proportions();
-    assert_eq!(proportions.x, 1.0);
-    assert_eq!(proportions.z, 1.0);
-    assert!((proportions.y - 1.031_205).abs() < 1.0e-4);
+    assert_eq!(CAMERA_ELEVATION_DEGREES, 57.0);
+    assert_eq!(CAMERA_OFFSET_DIRECTION, Vec3::new(1.0, 2.177_697_9, 1.0));
     assert_eq!(CAMERA_ORBIT_DURATION_SECONDS, 0.30);
     assert_eq!(FAULT_INTERVAL_SECONDS, 4.0);
     assert_eq!(MAX_ACTIVE_TICKETS, 3);
@@ -2649,7 +2641,7 @@ fn keyboard_movement_slides_along_racks_and_stops_at_the_room_boundary() {
 
 #[test]
 fn keyboard_movement_clamps_to_the_active_blueprint_room_size() {
-    let mut blueprint = blueprint_with_coverage(Vec2::splat(84.0));
+    let mut blueprint = blueprint_with_coverage(Vec2::splat(80.0));
     blueprint.room.size = Vec2::splat(44.0);
     assert_eq!(blueprint.validate(), Vec::<SceneValidationError>::new());
     let mut app = walking_hall_with_blueprint(&repo_assets(), blueprint);
@@ -3444,7 +3436,7 @@ fn camera_orbit_projects_the_authored_metre_scale_onto_the_real_viewport() {
         &mut app,
         focus
             + basis.forward() * ORTHOGRAPHIC_HEIGHT * 0.5
-                / camera_elevation_degrees().to_radians().sin(),
+                / CAMERA_ELEVATION_DEGREES.to_radians().sin(),
     );
     assert!(
         (far_edge.y).abs() < 0.5 && (far_edge.x - size.x * 0.5).abs() < 0.5,
@@ -3525,7 +3517,7 @@ fn assert_heading(app: &mut App, expected: CameraHeading) {
     );
     let elevation = (-transform.forward().y).asin().to_degrees();
     assert!(
-        (elevation - camera_elevation_degrees()).abs() < 1.0e-2,
+        (elevation - CAMERA_ELEVATION_DEGREES).abs() < 1.0e-2,
         "{expected:?} elevation drifted to {elevation}"
     );
     assert!(
@@ -4191,14 +4183,14 @@ fn camera_framing_margin_is_calibrated_against_the_real_pixel_to_world_scale() {
     // by the fixed elevation, which is why the two offsets differ.
     let across = (size.x * 0.5 - FRAMING_MARGIN_PIXELS) / pixels_per_metre;
     let along = (size.y * 0.5 - FRAMING_MARGIN_PIXELS)
-        / (pixels_per_metre * camera_elevation_degrees().to_radians().sin());
+        / (pixels_per_metre * CAMERA_ELEVATION_DEGREES.to_radians().sin());
     assert!(
         (across - 12.35).abs() < 1.0e-3,
         "608 px of half viewport is 12.35 m across, got {across}"
     );
     assert!(
-        (along - 11.308_2).abs() < 1.0e-3,
-        "328 px of half viewport is 11.3082 m along the ground, got {along}"
+        (along - 7.944_1).abs() < 1.0e-3,
+        "328 px of half viewport is 7.9441 m along the ground, got {along}"
     );
 
     for heading in CameraHeading::ALL {
@@ -4475,7 +4467,7 @@ fn camera_follow_clamps_against_the_active_blueprint_coverage_not_the_constant()
     // Three halls: the authored one the camera falls back to when no blueprint
     // resource exists, and two valid overrides whose coverage is neither the
     // constant nor each other.
-    let overrides = [Vec2::new(82.0, 82.0), Vec2::new(88.0, 84.0)];
+    let overrides = [Vec2::new(76.0, 76.0), Vec2::new(88.0, 80.0)];
     for coverage in overrides {
         assert_ne!(coverage, RENDER_COVERAGE_SIZE);
         assert!(coverage_holds_room(ROOM_SIZE, coverage, 0.0));
@@ -4656,16 +4648,16 @@ fn camera_orbit_geometry_covers_the_apron_over_every_reachable_position() {
     // footprint by `drop / tan(elevation)`, so the rendered coverage must
     // include that amount as well as the Y=0 ground rectangle.
     let apron_depth =
-        ground_half_depth() + RENDER_APRON_DROP / camera_elevation_degrees().to_radians().tan();
+        ground_half_depth() + RENDER_APRON_DROP / CAMERA_ELEVATION_DEGREES.to_radians().tan();
     let widest = (ORTHOGRAPHIC_WIDTH * 0.5).hypot(apron_depth);
     assert!(
-        (widest - 18.020_83).abs() < 1.0e-3,
-        "the widest camera overhang should be 18.02083 m, got {widest}"
+        (widest - 15.671_4).abs() < 1.0e-3,
+        "the widest camera overhang should be 15.6714 m, got {widest}"
     );
     let required = 2.0 * (ROOM_SIZE.x * 0.5 + widest);
     assert!(
-        (required - 76.041_66).abs() < 1.0e-2,
-        "the rendered coverage must be at least 76.04166 m, got {required}"
+        (required - 71.342_8).abs() < 1.0e-2,
+        "the rendered coverage must be at least 71.3428 m, got {required}"
     );
     assert!(
         RENDER_COVERAGE_SIZE.x >= required && RENDER_COVERAGE_SIZE.y >= required,

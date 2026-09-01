@@ -74,8 +74,8 @@ use bevy::{
 use crate::{
     CellShiftSet,
     design::{
-        CAMERA_ORBIT_DURATION_SECONDS, INITIAL_CAMERA_YAW_DEGREES, ORTHOGRAPHIC_HEIGHT,
-        ORTHOGRAPHIC_WIDTH, RENDER_APRON_DROP, RENDER_COVERAGE_SIZE, camera_elevation_degrees,
+        CAMERA_ELEVATION_DEGREES, CAMERA_ORBIT_DURATION_SECONDS, INITIAL_CAMERA_YAW_DEGREES,
+        ORTHOGRAPHIC_HEIGHT, ORTHOGRAPHIC_WIDTH, RENDER_APRON_DROP, RENDER_COVERAGE_SIZE,
     },
     player::{Technician, ViewBasis},
     world::HallBlueprint,
@@ -343,7 +343,7 @@ pub fn ground_half_width() -> f32 {
 /// Half the depth of the orthographic rectangle once cast onto `Y = 0`. The
 /// fixed elevation foreshortens screen vertical by `sin(elevation)`.
 pub fn ground_half_depth() -> f32 {
-    ORTHOGRAPHIC_HEIGHT * 0.5 / camera_elevation_degrees().to_radians().sin()
+    ORTHOGRAPHIC_HEIGHT * 0.5 / CAMERA_ELEVATION_DEGREES.to_radians().sin()
 }
 
 /// The four viewport corners cast onto `Y = 0`, around `target`.
@@ -370,7 +370,7 @@ pub fn ground_footprint_extents(yaw_radians: f32) -> Vec2 {
 /// the camera rectangle where it intersects the lowered render apron.
 fn render_apron_center_offset(yaw_radians: f32) -> Vec2 {
     ViewBasis::from_yaw_radians(yaw_radians).forward()
-        * (RENDER_APRON_DROP / camera_elevation_degrees().to_radians().tan())
+        * (RENDER_APRON_DROP / CAMERA_ELEVATION_DEGREES.to_radians().tan())
 }
 
 /// The four viewport corners cast onto the actual lowered render-apron plane.
@@ -456,7 +456,7 @@ pub fn active_coverage(blueprint: Option<&HallBlueprint>) -> Vec2 {
 
 /// Unit direction from the followed ground point towards the camera.
 pub fn camera_offset_direction(yaw_radians: f32) -> Vec3 {
-    let elevation = camera_elevation_degrees().to_radians();
+    let elevation = CAMERA_ELEVATION_DEGREES.to_radians();
     let offset = ViewBasis::from_yaw_radians(yaw_radians).camera_offset();
     Vec3::new(
         elevation.cos() * offset.x,
@@ -581,7 +581,7 @@ fn follow_player(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::design::{PLAYER_RADIUS, ROOM_SIZE, camera_offset_proportions};
+    use crate::design::{CAMERA_OFFSET_DIRECTION, PLAYER_RADIUS, ROOM_SIZE};
 
     const YAW_TOLERANCE_DEGREES: f32 = 1.0e-3;
 
@@ -1041,16 +1041,12 @@ mod tests {
     fn camera_ground_rectangle_is_the_projected_orthographic_viewport() {
         assert_eq!(ground_half_width(), ORTHOGRAPHIC_WIDTH * 0.5);
         let expected_depth =
-            ORTHOGRAPHIC_HEIGHT * 0.5 / camera_elevation_degrees().to_radians().sin();
+            ORTHOGRAPHIC_HEIGHT * 0.5 / CAMERA_ELEVATION_DEGREES.to_radians().sin();
         assert!((ground_half_depth() - expected_depth).abs() < 1.0e-6);
-        // The old pin here was 8.71916 m, the depth the 57-degree literal
-        // produced. U3 replaced that literal with a derivation, so the
-        // meaningful pin is the elevation the authority image implies: get
-        // that wrong and every projected metric moves with it.
         assert!(
-            (camera_elevation_degrees() - 36.098_49).abs() < 1.0e-4,
-            "elevation should follow the authority row angle, got {}",
-            camera_elevation_degrees()
+            (ground_half_depth() - 8.719_16).abs() < 1.0e-4,
+            "half ground depth should be 8.71916 m, got {}",
+            ground_half_depth()
         );
 
         for heading in CameraHeading::ALL {
@@ -1073,14 +1069,13 @@ mod tests {
 
     #[test]
     fn camera_ground_footprint_extents_match_the_rotated_rectangle() {
-        let depth = ground_half_depth();
         for (degrees, expected) in [
-            (0.0_f32, Vec2::new(13.0, depth)),
-            (90.0, Vec2::new(depth, 13.0)),
-            (180.0, Vec2::new(13.0, depth)),
+            (0.0_f32, Vec2::new(13.0, 8.719_16)),
+            (90.0, Vec2::new(8.719_16, 13.0)),
+            (180.0, Vec2::new(13.0, 8.719_16)),
             (
                 45.0,
-                Vec2::splat((13.0 + depth) * 0.5 * std::f32::consts::SQRT_2),
+                Vec2::splat((13.0 + 8.719_16) * 0.5 * std::f32::consts::SQRT_2),
             ),
         ] {
             let extents = ground_footprint_extents(degrees.to_radians());
@@ -1092,15 +1087,11 @@ mod tests {
 
         // The footprint is widest between the headings, not at one, so the
         // smallest legal rectangle of a whole orbit is never sampled by the
-        // four settled views alone. The old pin here was 15.6532 m, the value
-        // the 57-degree literal produced; the widest extent is now whatever
-        // the derived elevation implies, and what matters is that the apron
-        // covers it, which `the_authored_apron_covers_the_widest_camera_footprint`
-        // asserts.
+        // four settled views alone.
         let widest = ground_half_width().hypot(ground_half_depth());
         assert!(
-            widest > ground_half_width() && widest > ground_half_depth(),
-            "the diagonal reach must exceed either axis alone, got {widest}"
+            (widest - 15.653_2).abs() < 1.0e-3,
+            "the widest footprint extent should be 15.6532 m, got {widest}"
         );
         for yaw in widest_footprint_yaws() {
             let extents = ground_footprint_extents(yaw);
@@ -1110,14 +1101,9 @@ mod tests {
                 yaw.to_degrees()
             );
         }
-        // The widest yaw is where the rotated rectangle's diagonal aligns with
-        // an axis, which is `atan(depth / width)`. That was 33.851 degrees
-        // under the 57-degree literal; it moves with the derived elevation, so
-        // it is asserted as the geometry rather than as the old number.
-        let expected_yaw = ground_half_depth().atan2(ground_half_width()).to_degrees();
         assert!(
-            (widest_footprint_yaws()[0].to_degrees() - expected_yaw).abs() < 1.0e-2,
-            "the widest yaw should be {expected_yaw} degrees, got {}",
+            (widest_footprint_yaws()[0].to_degrees() - 33.851).abs() < 1.0e-2,
+            "the widest yaw should be 33.851 degrees, got {}",
             widest_footprint_yaws()[0].to_degrees()
         );
 
@@ -1332,12 +1318,12 @@ mod tests {
         let offset = camera_offset_direction(INITIAL_CAMERA_YAW_DEGREES.to_radians());
 
         assert!(
-            (offset - camera_offset_proportions().normalize())
+            (offset - CAMERA_OFFSET_DIRECTION.normalize())
                 .abs()
                 .max_element()
                 < 1.0e-6,
             "initial offset {offset:?} should match the reviewed {:?}",
-            camera_offset_proportions().normalize()
+            CAMERA_OFFSET_DIRECTION.normalize()
         );
         assert!((offset.length() - 1.0).abs() < 1.0e-6);
     }
@@ -1357,10 +1343,9 @@ mod tests {
             );
             let forward = *transform.forward();
             let elevation = (-forward.y).asin().to_degrees();
-            let expected = camera_elevation_degrees();
             assert!(
-                (elevation - expected).abs() < 1.0e-3,
-                "yaw {degrees} elevation should be {expected}, got {elevation}"
+                (elevation - CAMERA_ELEVATION_DEGREES).abs() < 1.0e-3,
+                "yaw {degrees} elevation should be {CAMERA_ELEVATION_DEGREES}, got {elevation}"
             );
             assert!(
                 transform.right().y.abs() < 1.0e-6,
