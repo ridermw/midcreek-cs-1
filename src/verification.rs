@@ -84,9 +84,9 @@ use crate::{
         CellShiftCamera, clamp_follow_target, ground_quadrilateral,
     },
     design::{
-        AssetKind, CHARACTER_SHEET_REFERENCE_PATH, KEY_ART_REFERENCE_PATH, MAX_ACTIVE_TICKETS,
-        PLAYER_RADIUS, PaletteRole, RACK_ROW_X, RENDER_COVERAGE_SIZE, ROOM_SIZE, SceneBlueprint,
-        VERIFICATION_WINDOW_HEIGHT, VERIFICATION_WINDOW_WIDTH,
+        AssetKind, MAX_ACTIVE_TICKETS, PLAYER_RADIUS, PaletteRole, RACK_ROW_X,
+        RENDER_COVERAGE_SIZE, ROOM_SIZE, SceneBlueprint, VERIFICATION_WINDOW_HEIGHT,
+        VERIFICATION_WINDOW_WIDTH,
     },
     hud::{
         BadgeKind, BadgeVisibility, ControlsPanel, HudReport, HudStatus, QueueRowNode,
@@ -3510,10 +3510,14 @@ fn report_inputs() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         .iter()
         .map(|name| format!("assets/source/{name}.ron"))
         .collect();
-    let references = vec![
-        KEY_ART_REFERENCE_PATH.to_owned(),
-        CHARACTER_SHEET_REFERENCE_PATH.to_owned(),
-    ];
+    // The references the report pins come from the manifest rather than from
+    // a pair of constants, so adding an approved reference to the manifest is
+    // enough to make every run pin it.
+    let references = crate::reference::approved_references()
+        .assets
+        .iter()
+        .map(|asset| asset.public_path.clone())
+        .collect();
     let code = [
         "src/verification.rs",
         "src/metrics.rs",
