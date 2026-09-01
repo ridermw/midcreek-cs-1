@@ -8,6 +8,30 @@ Items here were considered and deferred during the plan-exit review of
 
 ---
 
+## Widen reference_metrics to the union of contract regions
+
+**What.** Make `reference_metrics()` (`src/metrics.rs`) compute the approved key
+art once with every named region the role-specific analyzers read, instead of
+with `&BTreeMap::new()`. Probably also add an equivalent for the character
+sheet, which the technician analyzers will measure against.
+
+**Why.** U1 books this. It currently caches a region-free measurement, so the
+first analyzer that needs a region on the authority image has to recompute the
+whole 1536x1024 traversal, defeating both the `&'static` cache and the module's
+own "one traversal, per pixel" contract.
+
+**Context.** Deferred deliberately rather than skipped. The union it needs to
+compute is the set of regions the role-specific analyzers define, and those
+analyzers are U3 through U7's output: scene composition, equipment, technician,
+interface, and operational state. Widening the function now would mean
+inventing a region set before the work that determines it, which is the
+speculative version of this task rather than the booked one.
+
+**Depends on.** The first role-specific analyzer that needs a region on the
+authority image. Do it then, with the real region set, not before.
+
+---
+
 ## Amend U1 for the build.rs decision and the constant count
 
 **What.** Two edits to unit U1 in
