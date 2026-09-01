@@ -841,21 +841,24 @@ the render contract runs the whole journey twice with different values and
 requires the canonical report to match byte for byte and all fourteen decoded
 pixel rasters to match exactly.
 
-Windows DX12 WARP has two remaining contract failures tracked in issue #7. One
-is equipment-category masking isolation. The other is pixel reproducibility:
-two journeys that differ only in injected readback cost produce one to two
-differing pixels on roughly four of the fourteen frames, and the affected set
-moves between runs. With `Msaa::Off` these are binary coverage flips on
-silhouette edges, where a pixel takes `INK` instead of the neighbouring fill.
-Those two tests are reported as ignored on Windows rather than passed, and they
-still execute on every other platform.
+Two contract failures are tracked in issue #7. One is equipment-category
+masking isolation. The other is pixel reproducibility: two journeys that differ
+only in injected readback cost produce one to two differing pixels on roughly
+four of the fourteen frames, and the affected set moves between runs. With
+`Msaa::Off` these are binary coverage flips on silhouette edges, where a pixel
+takes `INK` instead of the neighbouring fill. Both reproduce on DX12 WARP and
+on Linux llvmpipe, so they are a property of software rasterization rather than
+of one adapter, and the two tests are reported as ignored everywhere rather
+than passed. A third contract,
+`animation_clips_change_the_worker_crop_without_changing_the_rest_of_the_frame`,
+is intermittently exposed to the same flips and is deliberately left active.
 
-Captured pixels are therefore not yet a pure function of game state on this
-adapter. That constrains what a baseline may claim rather than forbidding one:
-`docs/reference/phase-1-baseline.json` pins the composition vector, which is
-stable across journeys, and explicitly does not pin frame bytes, which are not.
-G0 must not freeze a *byte-exact* visual contract, or any gate whose pass
-depends on raster equality, until issue #7 is resolved.
+Captured pixels are therefore not yet a pure function of game state on a
+software adapter. That constrains what a baseline may claim rather than
+forbidding one: `docs/reference/phase-1-baseline.json` pins the composition
+vector, which is stable across journeys, and explicitly does not pin frame
+bytes, which are not. G0 must not freeze a *byte-exact* visual contract, or any
+gate whose pass depends on raster equality, until issue #7 is resolved.
 
 ### The Phase 1 baseline
 

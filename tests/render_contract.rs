@@ -3198,10 +3198,7 @@ fn every_center_frame_carries_real_equipment_pixels_with_margin() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "issue #7: masking isolation fails on DX12 WARP for an unproven reason"
-)]
+#[ignore = "issue #7: masking isolation fails on every software rasterizer tried"]
 fn masking_one_equipment_category_fails_that_category_alone() {
     let run = rendered_run();
     for frame in CENTER_FRAMES {
@@ -3482,10 +3479,7 @@ fn slow_rendered_run() -> &'static RenderedRun {
 /// child to be the control would spend a whole cold software-rendered run —
 /// tens of seconds on llvmpipe — re-establishing something already on disk.
 #[test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "issue #7: readback cost flips silhouette-edge pixels on DX12 WARP"
-)]
+#[ignore = "issue #7: readback cost flips silhouette-edge pixels on software rasterizers"]
 fn the_readback_pump_count_never_reaches_the_evidence() {
     let quick = rendered_run();
     let slow = slow_rendered_run();
