@@ -131,6 +131,12 @@ pub fn run_verification(
                 primary_window: Some(window),
                 ..default()
             })
+            .set(bevy::render::RenderPlugin {
+                render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
+                    verification_wgpu_settings(),
+                )),
+                ..default()
+            })
             .set(runtime_asset_plugin()),
     )
     .add_plugins(CellShiftPlugin)
@@ -143,6 +149,62 @@ pub fn run_verification(
     match app.run() {
         AppExit::Success => std::process::ExitCode::SUCCESS,
         AppExit::Error(code) => std::process::ExitCode::from(code.get()),
+    }
+}
+
+/// The render profile the verification journey captures through.
+///
+/// Software adapters that advertise compute support accept Bevy's GPU
+/// preprocessing path and then emit no mesh draw calls at all. DX12 WARP,
+/// llvmpipe, and SwiftShader each produced captures carrying the HUD and no
+/// hall, on two operating systems, which is why the render gate had never
+/// photographed a scene. Constraining the requested device limits makes
+/// `GpuPreprocessingSupport` report `GpuPreprocessingMode::None`, and the CPU
+/// mesh uniform path draws the world correctly.
+///
+/// This is the second render setting verification changes, after
+/// [`verification::VERIFICATION_MSAA`], and unlike MSAA it is not cosmetic: a
+/// captured frame is drawn through the software compatibility profile rather
+/// than through the native default path the shipped game uses on real
+/// hardware. The captured hall, camera, materials, and palette are the
+/// product's own; the pipeline that rasterizes them is constrained.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn verification_wgpu_settings() -> bevy::render::settings::WgpuSettings {
+    // `limits` is set explicitly rather than left to `..default()`: struct
+    // update syntax evaluates `default()` first, so it would compute limits
+    // from the *ambient* priority and then overwrite only the priority field,
+    // leaving the compute limits that let the GPU preprocessing path be
+    // selected. These are the limits `WGPU_SETTINGS_PRIO=webgl2` produces.
+    bevy::render::settings::WgpuSettings {
+        priority: bevy::render::settings::WgpuSettingsPriority::WebGL2,
+        limits: bevy::render::settings::WgpuLimits::downlevel_webgl2_defaults(),
+        ..default()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// The property Bevy actually keys off.
+    ///
+    /// `GpuPreprocessingSupport::from_world` reports
+    /// `GpuPreprocessingMode::None` when `max_compute_workgroup_size_x` is
+    /// zero, and only that mode keeps every mesh draw call on the CPU path
+    /// that software adapters render correctly. Asserting the limit rather
+    /// than the priority is what makes this a behavioural contract instead of
+    /// a restatement of the constructor.
+    #[test]
+    fn the_verification_profile_cannot_select_the_gpu_preprocessing_path() {
+        let settings = verification_wgpu_settings();
+        assert_eq!(
+            settings.limits.max_compute_workgroup_size_x, 0,
+            "a verification child that can run compute takes the mesh path that draws nothing"
+        );
+        assert_eq!(
+            settings.limits.max_storage_buffers_per_shader_stage, 0,
+            "storage buffer support is the other half of the path being avoided"
+        );
     }
 }
 

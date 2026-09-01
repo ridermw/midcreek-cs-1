@@ -938,7 +938,7 @@ pub const PROBE_SETTLE_FRAMES: u64 = 6;
 /// A lost callback still fails the run: it fails through [`CAPTURE_TIMEOUT`],
 /// naming the frame, the stage, and the artifact, which is strictly better
 /// evidence than a watchdog expiry could ever be.
-pub const APP_WATCHDOG: Duration = Duration::from_secs(90);
+pub const APP_WATCHDOG: Duration = Duration::from_secs(300);
 
 /// What the parent allows the child on top of its own budgets: process start,
 /// asset load, window creation, report write, and shutdown.
@@ -956,7 +956,7 @@ pub const LAUNCH_MARGIN: Duration = Duration::from_secs(25);
 /// finish; tying it to the equation rather than to a number means adding a
 /// fifteenth frame moves it automatically.
 ///
-/// With today's budgets: 90 s + 13 x 30 s + 150 s + 25 s = 655 s.
+/// With today's budgets: 300 s + 13 x 30 s + 150 s + 25 s = 865 s.
 pub const PARENT_WATCHDOG: Duration = Duration::from_secs(
     APP_WATCHDOG.as_secs()
         + CAPTURE_TIMEOUT.as_secs() * (FrameName::ALL.len() as u64 - 1)
@@ -5774,10 +5774,18 @@ mod tests {
     /// run whose clock ran past it only because of readbacks must survive.
     #[test]
     fn capture_waiting_never_expires_the_active_work_watchdog() {
-        const CAPTURES: u32 = 8;
         /// Comfortably inside [`CAPTURE_TIMEOUT`], so every readback here is
-        /// late rather than lost.
-        const WAIT: Duration = Duration::from_secs(APP_WATCHDOG.as_secs() / CAPTURES as u64 + 1);
+        /// late rather than lost. Deriving this from [`APP_WATCHDOG`] instead
+        /// silently produced a wait longer than the readback budget the moment
+        /// the watchdog was raised for software adapters, which made the
+        /// fixture prove the opposite of what its name claims.
+        const WAIT: Duration = Duration::from_secs(10);
+        const CAPTURES: u32 = APP_WATCHDOG.as_secs().div_ceil(WAIT.as_secs()) as u32 + 1;
+
+        assert!(
+            WAIT < CAPTURE_TIMEOUT,
+            "a readback this fixture waits out is a lost callback, not a late one"
+        );
 
         let mut world = capture_world();
         let (_scratch, mut run) = capture_run();
@@ -6083,7 +6091,7 @@ mod tests {
                 + LAUNCH_MARGIN,
             "active work + thirteen normal captures + the resized capture + startup and shutdown"
         );
-        assert_eq!(PARENT_WATCHDOG, Duration::from_secs(655));
+        assert_eq!(PARENT_WATCHDOG, Duration::from_secs(865));
         assert!(
             PARENT_WATCHDOG
                 > APP_WATCHDOG

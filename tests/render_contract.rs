@@ -1519,7 +1519,7 @@ fn cli_exits_with_code_two_for_every_unusable_output_path() {
 /// to sit above the longest life a *correct* child can have.
 #[test]
 fn the_parent_cap_is_the_sum_of_the_named_child_budgets() {
-    assert_eq!(APP_WATCHDOG, Duration::from_secs(90));
+    assert_eq!(APP_WATCHDOG, Duration::from_secs(300));
     assert_eq!(CAPTURE_TIMEOUT, Duration::from_secs(30));
     assert_eq!(LOW_RESOLUTION_CAPTURE_TIMEOUT, Duration::from_secs(150));
     assert_eq!(
@@ -1530,7 +1530,7 @@ fn the_parent_cap_is_the_sum_of_the_named_child_budgets() {
             + LAUNCH_MARGIN,
         "the parent cap is active work + thirteen normal readbacks + the resized readback + startup and shutdown"
     );
-    assert_eq!(PARENT_WATCHDOG, Duration::from_secs(655));
+    assert_eq!(PARENT_WATCHDOG, Duration::from_secs(865));
     assert_eq!(ARTIFACT_NAMES.len(), FrameName::ALL.len() + 1);
 }
 
@@ -1590,8 +1590,10 @@ fn launch_arguments(arguments: &[String], watchdog: Duration) -> Launch {
     command
         .args(arguments)
         .current_dir(repository())
-        .env("BEVY_ASSET_ROOT", repository())
-        .env("RUST_LOG", "error")
+        .envs([
+            ("BEVY_ASSET_ROOT", repository().to_string_lossy().as_ref()),
+            ("RUST_LOG", "error"),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4123,7 +4125,7 @@ fn the_parent_watchdog_kills_the_exact_child_and_keeps_its_artifacts() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("the render contract owns target/render-contract");
     // The cap here is a fast test override, not the production one. Production
-    // is `PARENT_WATCHDOG`, and waiting it out would add almost eleven minutes
+    // is `PARENT_WATCHDOG`, and waiting it out would add over fourteen minutes
     // to prove a kill that is provable in ten seconds: what is under
     // test is that the parent kills *that exact child process* and keeps its
     // artifacts, which is the same code path at any cap. The child has had its

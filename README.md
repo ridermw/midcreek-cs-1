@@ -674,13 +674,13 @@ requires every other one to be refused without moving the machine.
   clock really is lost, and fails the run naming the frame, the stage, the pump
   count, and what the artifact looked like on disk. A resize still costs
   exactly `RESIZE_FRAMES`;
-- MSAA off and the magenta clear colour, which are the *only* two render
-  settings verification changes. Bypassed tonemapping and disabled deband
-  dither are the shipped camera's own cel-shift display contract
-  (`CEL_SHIFT_TONEMAPPING`, `CEL_SHIFT_DEBAND_DITHER` in `src/camera.rs`), so
-  the analyzed frame is the frame the game draws. The run records the live
-  camera's settings in the report and fails in `validate-blueprint` if they
-  ever drift;
+- MSAA off, the magenta clear colour, and the software compatibility render
+  profile (`verification_wgpu_settings` in `src/lib.rs`), which are the *only*
+  three render settings verification changes. Bypassed tonemapping and
+  disabled deband dither are the shipped camera's own cel-shift display
+  contract (`CEL_SHIFT_TONEMAPPING`, `CEL_SHIFT_DEBAND_DITHER` in
+  `src/camera.rs`). The run records the live camera's settings in the report
+  and fails in `validate-blueprint` if they ever drift;
 - the canonical report sorts every map, rounds every float onto the `1e-6`
   grid, uses relative paths, and carries no wall clock, host, or environment
   value. Two runs in different output directories produce byte-identical
@@ -700,8 +700,8 @@ None of them is a round number chosen to feel safe.
 |---|---|---|
 | `CAPTURE_TIMEOUT` | 30 s | each normal screenshot readback, from request to landing |
 | `LOW_RESOLUTION_CAPTURE_TIMEOUT` | 150 s | the DX12 swapchain resize capture |
-| `APP_WATCHDOG` | 90 s | the child's *active, non-capture* wall time |
-| `PARENT_WATCHDOG` | 655 s | the parent's absolute cap on one child process |
+| `APP_WATCHDOG` | 300 s | the child's *active, non-capture* wall time |
+| `PARENT_WATCHDOG` | 865 s | the parent's absolute cap on one child process |
 
 The app watchdog exists to name a state machine that stopped moving, and it is
 deliberately **not** a budget for the run as a whole. Waiting on an
@@ -726,8 +726,8 @@ PARENT_WATCHDOG = APP_WATCHDOG
                 + 13 * CAPTURE_TIMEOUT
                 + LOW_RESOLUTION_CAPTURE_TIMEOUT
                 + LAUNCH_MARGIN
-                = 90 s + 13 * 30 s + 150 s + 25 s
-                = 655 s
+                = 300 s + 13 * 30 s + 150 s + 25 s
+                = 865 s
 ```
 
 `LAUNCH_MARGIN` covers what belongs to neither child budget: process start,
@@ -846,6 +846,24 @@ quarantined under issue #6. Six pixel-level tests are reported as ignored on
 Windows rather than passed; semantic journey, artifact, timeout, failure, and
 report reproducibility contracts remain active. G0 must not freeze a Phase 1
 visual baseline until issue #6 is resolved and those tests run normally.
+
+### The software compatibility render profile
+
+Bevy's GPU preprocessing path builds mesh uniforms and indirect draw parameters
+in compute shaders. Software adapters that advertise compute support accept
+that path and then emit no mesh draw calls at all: DX12 WARP, llvmpipe, and
+SwiftShader each captured the HUD over an empty hall, on two operating systems,
+which is why the render gate had never photographed a scene. The browser build
+renders correctly precisely because WebGL2 has no compute and cannot take that
+path.
+
+`verification_wgpu_settings` therefore requests `downlevel_webgl2_defaults`
+limits, so `GpuPreprocessingSupport` reports `GpuPreprocessingMode::None` and
+every mesh is drawn through the CPU uniform path. Verification captures are
+consequently rasterized through a constrained pipeline rather than the native
+default path the shipped game uses on real hardware. The hall, camera,
+materials, and palette in a captured frame are the product's own; the pipeline
+that draws them is not the one a hardware GPU would use.
 
 `--verify-flood <bytes>` is the pipe fixture: the binary writes that many bytes
 to *both* stdout and stderr and exits successfully. The parent drains both
