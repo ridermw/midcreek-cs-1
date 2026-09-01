@@ -99,9 +99,9 @@ use crate::{
         WORKER_REGION, WORKER_ROLE_MIN, YELLOW_MIN, palette_table, squared_distance,
     },
     operations::{
-        FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction, MovementLock,
-        OperationsClock, REPAIR_KEY, RackOperations, RackRoster, RackState, TicketQueue,
-        TicketSeverity,
+        FAULT_INTERVAL, FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction,
+        MovementLock, OperationsClock, REPAIR_KEY, RackOperations, RackRoster, RackState,
+        TicketQueue, TicketSeverity,
     },
     player::{
         PlayerAnimationState, PlayerAnimations, PlayerClip, PlayerParts, PlayerRigReport,
@@ -902,7 +902,17 @@ pub const SENTINEL_CLEAR: Srgba = Srgba::rgb(1.0, 0.0, 1.0);
 /// capture waiting entirely, so a genuinely lost callback is always named as a
 /// lost callback naming its own frame rather than swallowed by a global
 /// watchdog that would only ever say "stuck in some stage".
-pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Readback allowance for the capture that follows a DX12 swapchain resize.
+pub const LOW_RESOLUTION_CAPTURE_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Delay between zero-time render pumps while a screenshot is outstanding.
+///
+/// Without backpressure the app thread can queue hundreds of frames ahead of
+/// a software render thread, burying the requested readback behind work that
+/// exists only because the callback has not arrived yet.
+pub const CAPTURE_PUMP_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How many frames a window resize is allowed, and always costs.
 pub const RESIZE_FRAMES: u64 = 45;
@@ -928,7 +938,7 @@ pub const PROBE_SETTLE_FRAMES: u64 = 6;
 /// A lost callback still fails the run: it fails through [`CAPTURE_TIMEOUT`],
 /// naming the frame, the stage, and the artifact, which is strictly better
 /// evidence than a watchdog expiry could ever be.
-pub const APP_WATCHDOG: Duration = Duration::from_secs(45);
+pub const APP_WATCHDOG: Duration = Duration::from_secs(90);
 
 /// What the parent allows the child on top of its own budgets: process start,
 /// asset load, window creation, report write, and shutdown.
@@ -946,10 +956,11 @@ pub const LAUNCH_MARGIN: Duration = Duration::from_secs(25);
 /// finish; tying it to the equation rather than to a number means adding a
 /// fifteenth frame moves it automatically.
 ///
-/// With today's budgets: 45 s + 14 x 10 s + 25 s = 210 s.
+/// With today's budgets: 90 s + 13 x 30 s + 150 s + 25 s = 655 s.
 pub const PARENT_WATCHDOG: Duration = Duration::from_secs(
     APP_WATCHDOG.as_secs()
-        + CAPTURE_TIMEOUT.as_secs() * FrameName::ALL.len() as u64
+        + CAPTURE_TIMEOUT.as_secs() * (FrameName::ALL.len() as u64 - 1)
+        + LOW_RESOLUTION_CAPTURE_TIMEOUT.as_secs()
         + LAUNCH_MARGIN.as_secs(),
 );
 
@@ -1574,7 +1585,7 @@ pub struct VerificationRun {
     /// This is what makes [`APP_WATCHDOG`] a measure of active work rather
     /// than of the run's whole lifetime.
     capture_excluded: Duration,
-    capture_timeout: Duration,
+    capture_timeout_override: Option<Duration>,
     capture_delay: u64,
     frame: u64,
     stage_frame: u64,
@@ -1604,7 +1615,7 @@ impl VerificationRun {
             started: Instant::now(),
             watchdog: APP_WATCHDOG,
             capture_excluded: Duration::ZERO,
-            capture_timeout: CAPTURE_TIMEOUT,
+            capture_timeout_override: None,
             capture_delay: 0,
             frame: 0,
             stage_frame: 0,
@@ -1659,8 +1670,18 @@ impl VerificationRun {
     /// [`CAPTURE_TIMEOUT`] in full.
     #[must_use]
     pub const fn with_capture_timeout(mut self, timeout: Duration) -> Self {
-        self.capture_timeout = timeout;
+        self.capture_timeout_override = Some(timeout);
         self
+    }
+
+    fn capture_timeout_for(&self, frame: FrameName) -> Duration {
+        if let Some(timeout) = self.capture_timeout_override {
+            return timeout;
+        }
+        match frame {
+            FrameName::LowResolutionQueue => LOW_RESOLUTION_CAPTURE_TIMEOUT,
+            _ => CAPTURE_TIMEOUT,
+        }
     }
 
     /// Wall time this run has spent doing anything other than waiting for a
@@ -2330,6 +2351,15 @@ fn pump_pending_capture(world: &mut World, run: &mut VerificationRun) -> Result<
         let stage = run.machine.stage().name();
         return Err(format!("the app watchdog expired in stage {stage}"));
     }
+    let callback_landed = run.pending.is_some_and(|pending| {
+        pending.landed_on.is_some()
+            || world
+                .get_resource::<CaptureInbox>()
+                .is_some_and(|inbox| inbox.completed.contains(&pending.frame))
+    });
+    if !callback_landed {
+        std::thread::sleep(CAPTURE_PUMP_INTERVAL);
+    }
     poll_capture(world, run)?;
     Ok(())
 }
@@ -2423,12 +2453,13 @@ fn poll_capture(world: &mut World, run: &mut VerificationRun) -> Result<bool, St
         return Ok(true);
     }
 
-    if pending.requested_at.elapsed() > run.capture_timeout {
+    let capture_timeout = run.capture_timeout_for(pending.frame);
+    if pending.requested_at.elapsed() > capture_timeout {
         let reason = format!(
             "the screenshot callback for {} never fired within {:?}: stage {}, simulated frame {}, \
              {} zero-time render pumps, artifact {}",
             pending.frame.file_name(),
-            run.capture_timeout,
+            capture_timeout,
             run.machine.stage().name(),
             pending.requested_on,
             pending.pumps,
@@ -2482,6 +2513,30 @@ fn artifact_state(path: &Path) -> String {
 /// Sets the simulated step every following frame advances by.
 fn set_simulated_step(world: &mut World, step: Duration) {
     world.insert_resource(TimeUpdateStrategy::ManualDuration(step));
+}
+
+fn remaining_fault_step(elapsed: Duration) -> Duration {
+    FAULT_INTERVAL
+        .saturating_sub(elapsed)
+        .max(Duration::from_secs_f64(FIXED_STEP_SECONDS))
+}
+
+fn fast_forward_to_next_fault(world: &mut World) {
+    let elapsed = world
+        .get_resource::<FaultScheduler>()
+        .map_or(Duration::ZERO, FaultScheduler::elapsed);
+    set_simulated_step(world, remaining_fault_step(elapsed));
+}
+
+fn verification_ticks(delta: Duration) -> u64 {
+    ((delta.as_secs_f64() / FIXED_STEP_SECONDS).round() as u64).max(1)
+}
+
+fn advance_verification_clock(time: Res<Time>, mut clock: ResMut<OperationsClock>) {
+    if time.delta().is_zero() {
+        return;
+    }
+    clock.skip_verification_ticks(verification_ticks(time.delta()).saturating_sub(1));
 }
 
 /// Spawns the real screenshot entity with the mandated observers.
@@ -3054,6 +3109,7 @@ fn step_stage(
                 return Err("the healthy capture ran with an open ticket".to_owned());
             }
             if capture(world, run, state, FrameName::HealthyCenterNorthEast)? {
+                fast_forward_to_next_fault(world);
                 advance(run)
             } else {
                 Ok(())
@@ -3062,8 +3118,10 @@ fn step_stage(
 
         VerificationStage::SeedThreeFaults => {
             if state.queue.len() >= MAX_ACTIVE_TICKETS {
+                set_simulated_step(world, Duration::from_secs_f64(FIXED_STEP_SECONDS));
                 advance(run)
             } else {
+                fast_forward_to_next_fault(world);
                 Ok(())
             }
         }
@@ -3669,7 +3727,16 @@ impl Plugin for VerificationPlugin {
         .insert_resource(self.run())
         .add_systems(
             Update,
-            configure_verification_camera.in_set(CellShiftSet::AssetReady),
+            advance_verification_clock.before(CellShiftSet::UpdateOperations),
+        )
+        .add_systems(
+            Update,
+            (
+                configure_verification_camera,
+                set_verification_camera_activity,
+            )
+                .chain()
+                .in_set(CellShiftSet::AssetReady),
         )
         .add_systems(
             Update,
@@ -3704,6 +3771,44 @@ fn configure_verification_camera(
             .entity(entity)
             .insert((VerificationCamera, VERIFICATION_MSAA));
     }
+}
+
+fn set_verification_camera_activity(
+    run: Res<VerificationRun>,
+    mut cameras: Query<&mut Camera, With<CellShiftCamera>>,
+) {
+    let active = if run.pending.is_some() {
+        false
+    } else if run.stage() == VerificationStage::LowResolutionCapture {
+        low_resolution_camera_active(run.frame, run.resize_frame)
+    } else {
+        stage_camera_active(run.stage())
+    };
+    for mut camera in &mut cameras {
+        camera.is_active = active;
+    }
+}
+
+const fn low_resolution_camera_active(frame: u64, resize_frame: Option<u64>) -> bool {
+    let Some(resize_frame) = resize_frame else {
+        return true;
+    };
+    frame.saturating_sub(resize_frame) + 1 >= RESIZE_FRAMES
+}
+
+const fn stage_camera_active(stage: VerificationStage) -> bool {
+    !matches!(
+        stage,
+        VerificationStage::SeedThreeFaults
+            | VerificationStage::KeyboardJourney
+            | VerificationStage::BeginRepair
+            | VerificationStage::CompleteRepair
+            | VerificationStage::OrbitSouthEast
+            | VerificationStage::OrbitSouthWest
+            | VerificationStage::OrbitNorthWest
+            | VerificationStage::AnalyzeReady
+            | VerificationStage::WriteReport
+    )
 }
 
 /// Marks a camera that has already been configured for capture.
@@ -4894,6 +4999,83 @@ mod tests {
         operations::{RackEntry, TicketId},
     };
 
+    #[test]
+    fn fault_seeding_fast_forwards_only_the_unelapsed_interval() {
+        let fixed = Duration::from_secs_f64(FIXED_STEP_SECONDS);
+        assert_eq!(remaining_fault_step(Duration::ZERO), FAULT_INTERVAL);
+        assert_eq!(remaining_fault_step(fixed * 2), FAULT_INTERVAL - fixed * 2);
+        assert_eq!(remaining_fault_step(FAULT_INTERVAL), fixed);
+        assert_eq!(verification_ticks(fixed), 1);
+        assert_eq!(verification_ticks(Duration::from_millis(250)), 15);
+        assert_eq!(verification_ticks(FAULT_INTERVAL), 240);
+    }
+
+    #[test]
+    fn capture_pumps_are_throttled_but_remain_inside_the_readback_budget() {
+        assert!(CAPTURE_PUMP_INTERVAL > Duration::ZERO);
+        assert!(CAPTURE_PUMP_INTERVAL < CAPTURE_TIMEOUT);
+        assert!(CAPTURE_PUMP_INTERVAL <= DROP_CAPTURE_TIMEOUT / 4);
+    }
+
+    #[test]
+    fn resized_capture_has_its_own_timeout_without_weakening_fault_fixtures() {
+        let scratch = Scratch::new();
+        let run = VerificationRun::new(scratch.output(), None);
+        assert_eq!(
+            run.capture_timeout_for(FrameName::LowResolutionQueue),
+            LOW_RESOLUTION_CAPTURE_TIMEOUT
+        );
+        assert_eq!(
+            run.capture_timeout_for(FrameName::HealthyCenterNorthEast),
+            CAPTURE_TIMEOUT
+        );
+
+        let overridden = run.with_capture_timeout(DROP_CAPTURE_TIMEOUT);
+        assert_eq!(
+            overridden.capture_timeout_for(FrameName::LowResolutionQueue),
+            DROP_CAPTURE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn transition_only_stages_suppress_the_camera() {
+        for stage in [
+            VerificationStage::SeedThreeFaults,
+            VerificationStage::KeyboardJourney,
+            VerificationStage::BeginRepair,
+            VerificationStage::CompleteRepair,
+            VerificationStage::OrbitSouthEast,
+            VerificationStage::OrbitSouthWest,
+            VerificationStage::OrbitNorthWest,
+            VerificationStage::AnalyzeReady,
+            VerificationStage::WriteReport,
+        ] {
+            assert!(!stage_camera_active(stage), "{stage:?} only advances state");
+        }
+        for stage in [
+            VerificationStage::HealthyCapture,
+            VerificationStage::FaultQueueCapture,
+            VerificationStage::WalkCapture,
+            VerificationStage::RepairCapture,
+            VerificationStage::ResolvedCapture,
+            VerificationStage::SettledSouthEastCapture,
+            VerificationStage::SettledSouthWestCapture,
+            VerificationStage::SettledNorthWestCapture,
+            VerificationStage::MidOrbitCapture,
+            VerificationStage::CornerProbes,
+            VerificationStage::LowResolutionCapture,
+        ] {
+            assert!(stage_camera_active(stage), "{stage:?} owns captured pixels");
+        }
+    }
+
+    #[test]
+    fn low_resolution_camera_reactivates_on_the_capture_update() {
+        assert!(low_resolution_camera_active(100, None));
+        assert!(!low_resolution_camera_active(143, Some(100)));
+        assert!(low_resolution_camera_active(144, Some(100)));
+    }
+
     /// A scratch output directory, removed when the test that owns it ends.
     ///
     /// The unit tests prepare real directories because [`VerifyOutput`] is the
@@ -5062,7 +5244,8 @@ mod tests {
     /// the scratch directory guard the caller has to keep alive.
     fn capture_run() -> (Scratch, VerificationRun) {
         let scratch = Scratch::new();
-        let mut run = VerificationRun::new(scratch.output(), None);
+        let mut run =
+            VerificationRun::new(scratch.output(), None).with_capture_timeout(CAPTURE_TIMEOUT);
         while run.stage() != VerificationStage::LowResolutionCapture {
             run.machine
                 .advance()
@@ -5247,7 +5430,7 @@ mod tests {
         let mut world = capture_world();
         let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
-        run.capture_timeout = Duration::ZERO;
+        run.capture_timeout_override = Some(Duration::ZERO);
 
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
         let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
@@ -5355,7 +5538,8 @@ mod tests {
             "the measured facts are staged against the frame they belong to"
         );
 
-        backdate(&mut run, CAPTURE_TIMEOUT + Duration::from_secs(1));
+        let timeout = run.capture_timeout_for(CAPTURE_TEST_FRAME);
+        backdate(&mut run, timeout + Duration::from_secs(1));
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
             .expect_err("a readback past its budget is lost");
         assert!(
@@ -5593,7 +5777,7 @@ mod tests {
         const CAPTURES: u32 = 8;
         /// Comfortably inside [`CAPTURE_TIMEOUT`], so every readback here is
         /// late rather than lost.
-        const WAIT: Duration = Duration::from_secs(9);
+        const WAIT: Duration = Duration::from_secs(APP_WATCHDOG.as_secs() / CAPTURES as u64 + 1);
 
         let mut world = capture_world();
         let (_scratch, mut run) = capture_run();
@@ -5746,15 +5930,15 @@ mod tests {
     /// that names only a stage.
     #[test]
     fn a_timed_out_capture_restores_the_clock_and_banks_its_wait() {
-        const WAIT: Duration = Duration::from_secs(11);
         let mut world = capture_world();
         let (_scratch, mut run) = capture_run();
         let state = capture_snapshot();
+        let wait = run.capture_timeout_for(CAPTURE_TEST_FRAME) + Duration::from_secs(1);
 
-        run.started = Instant::now() - WAIT;
+        run.started = Instant::now() - wait;
         capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME).expect("the request succeeds");
         let observing = Instant::now();
-        backdate(&mut run, WAIT);
+        backdate(&mut run, wait);
 
         let reason = capture(&mut world, &mut run, &state, CAPTURE_TEST_FRAME)
             .expect_err("a readback past its wall-clock budget is lost");
@@ -5769,7 +5953,7 @@ mod tests {
             "a failed capture still hands the clock back"
         );
         assert!(
-            (WAIT..=WAIT + overhead).contains(&run.capture_excluded),
+            (wait..=wait + overhead).contains(&run.capture_excluded),
             "a lost readback's wait is still the capture timeout's, banked {:?}",
             run.capture_excluded
         );
@@ -5848,7 +6032,8 @@ mod tests {
             "a run with no injected fault is a production run"
         );
         assert_eq!(
-            production.capture_timeout, CAPTURE_TIMEOUT,
+            production.capture_timeout_for(FrameName::HealthyCenterNorthEast),
+            CAPTURE_TIMEOUT,
             "a run with no injected fault gets the production readback budget"
         );
 
@@ -5859,7 +6044,8 @@ mod tests {
             "the stall fixture runs on its own short budget"
         );
         assert_eq!(
-            stall.capture_timeout, CAPTURE_TIMEOUT,
+            stall.capture_timeout_for(FrameName::HealthyCenterNorthEast),
+            CAPTURE_TIMEOUT,
             "the stall fixture has no business shortening the readback budget"
         );
 
@@ -5867,7 +6053,8 @@ mod tests {
             VerificationPlugin::new(scratch.output(), Some(VerificationFault::DropCapture), 0)
                 .run();
         assert_eq!(
-            drop.capture_timeout, DROP_CAPTURE_TIMEOUT,
+            drop.capture_timeout_for(FrameName::HealthyCenterNorthEast),
+            DROP_CAPTURE_TIMEOUT,
             "the drop fixture waits out its own short readback budget"
         );
         assert_eq!(
@@ -5890,12 +6077,18 @@ mod tests {
     fn the_parent_cap_is_derived_from_the_child_budgets() {
         assert_eq!(
             PARENT_WATCHDOG,
-            APP_WATCHDOG + CAPTURE_TIMEOUT * FrameName::ALL.len() as u32 + LAUNCH_MARGIN,
-            "active work + one capture timeout per frame + startup and shutdown margin"
+            APP_WATCHDOG
+                + CAPTURE_TIMEOUT * (FrameName::ALL.len() as u32 - 1)
+                + LOW_RESOLUTION_CAPTURE_TIMEOUT
+                + LAUNCH_MARGIN,
+            "active work + thirteen normal captures + the resized capture + startup and shutdown"
         );
-        assert_eq!(PARENT_WATCHDOG, Duration::from_secs(210));
+        assert_eq!(PARENT_WATCHDOG, Duration::from_secs(655));
         assert!(
-            PARENT_WATCHDOG > APP_WATCHDOG + CAPTURE_TIMEOUT * FrameName::ALL.len() as u32,
+            PARENT_WATCHDOG
+                > APP_WATCHDOG
+                    + CAPTURE_TIMEOUT * (FrameName::ALL.len() as u32 - 1)
+                    + LOW_RESOLUTION_CAPTURE_TIMEOUT,
             "the parent may never kill a child that is still inside its own budgets"
         );
     }

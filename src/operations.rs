@@ -987,6 +987,11 @@ impl OperationsClock {
     pub const fn tick(&self) -> u64 {
         self.tick
     }
+
+    /// Skips verification-only ticks before one large simulated update.
+    pub(crate) fn skip_verification_ticks(&mut self, ticks: u64) {
+        self.tick += ticks;
+    }
 }
 
 // ---------------------------------------------------------------------------

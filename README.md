@@ -698,9 +698,10 @@ None of them is a round number chosen to feel safe.
 
 | Budget | Value | Measures |
 |---|---|---|
-| `CAPTURE_TIMEOUT` | 10 s | one screenshot readback, from request to landing |
-| `APP_WATCHDOG` | 45 s | the child's *active, non-capture* wall time |
-| `PARENT_WATCHDOG` | 210 s | the parent's absolute cap on one child process |
+| `CAPTURE_TIMEOUT` | 30 s | each normal screenshot readback, from request to landing |
+| `LOW_RESOLUTION_CAPTURE_TIMEOUT` | 150 s | the DX12 swapchain resize capture |
+| `APP_WATCHDOG` | 90 s | the child's *active, non-capture* wall time |
+| `PARENT_WATCHDOG` | 655 s | the parent's absolute cap on one child process |
 
 The app watchdog exists to name a state machine that stopped moving, and it is
 deliberately **not** a budget for the run as a whole. Waiting on an
@@ -721,9 +722,12 @@ The parent's cap is therefore *derived* rather than chosen, because the longest
 a correct child can legitimately live is the sum of the budgets it is honouring:
 
 ```text
-PARENT_WATCHDOG = APP_WATCHDOG + FrameName::ALL.len() * CAPTURE_TIMEOUT + LAUNCH_MARGIN
-                = 45 s        + 14 * 10 s                              + 25 s
-                = 210 s
+PARENT_WATCHDOG = APP_WATCHDOG
+                + 13 * CAPTURE_TIMEOUT
+                + LOW_RESOLUTION_CAPTURE_TIMEOUT
+                + LAUNCH_MARGIN
+                = 90 s + 13 * 30 s + 150 s + 25 s
+                = 655 s
 ```
 
 `LAUNCH_MARGIN` covers what belongs to neither child budget: process start,
@@ -834,7 +838,14 @@ readback is held open for that many further zero-time render pumps after the
 observer has already recorded it. It changes only how many pumps a capture
 costs, which is exactly the quantity the evidence must be independent of, so
 the render contract runs the whole journey twice with different values and
-requires the canonical report and all fourteen frames to match byte for byte.
+requires the canonical report to match byte for byte and all fourteen decoded
+pixel rasters to match exactly.
+
+Windows DX12 WARP pixel fidelity and delayed-readback pixel reproducibility are
+quarantined under issue #6. Six pixel-level tests are reported as ignored on
+Windows rather than passed; semantic journey, artifact, timeout, failure, and
+report reproducibility contracts remain active. G0 must not freeze a Phase 1
+visual baseline until issue #6 is resolved and those tests run normally.
 
 `--verify-flood <bytes>` is the pipe fixture: the binary writes that many bytes
 to *both* stdout and stderr and exits successfully. The parent drains both
