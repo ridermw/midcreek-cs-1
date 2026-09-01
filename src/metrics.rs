@@ -445,6 +445,67 @@ pub const OUTSIDE_CROP_MAX: f64 = 0.01;
 /// The stable region name of the projected worker crop.
 pub const WORKER_REGION: &str = "worker";
 
+#[cfg(test)]
+mod policy_migration_tests {
+    use super::*;
+    use crate::reference::bounds;
+
+    /// The contract and the constants have to agree, bound for bound.
+    ///
+    /// U1 moves policy out of `metrics`, and the only safe way to move a
+    /// calibrated number is to prove the destination holds exactly what the
+    /// source held. This test is what makes the later deletion of these
+    /// constants a refactor rather than a recalibration: while both exist it
+    /// pins them together, and once the constants are gone the contract is
+    /// already the value every gate was measured against.
+    #[test]
+    fn the_fidelity_contract_carries_every_migrated_policy_constant() {
+        let bounds = bounds();
+
+        assert_eq!(bounds.sentinel.max(), SENTINEL_MAX);
+        assert_eq!(bounds.luminance.range(), LUMINANCE_RANGE);
+        assert_eq!(
+            bounds.luminance_reference_tolerance.max(),
+            LUMINANCE_REFERENCE_TOLERANCE
+        );
+        assert_eq!(bounds.palette.min(), PALETTE_MIN);
+        assert_eq!(bounds.floor.min(), FLOOR_MIN);
+        assert_eq!(bounds.rack.min(), RACK_MIN);
+        assert_eq!(bounds.yellow.min(), YELLOW_MIN);
+        assert_eq!(bounds.ink.range(), INK_RANGE);
+        assert_eq!(bounds.diagonal_band.min(), DIAGONAL_BAND_MIN);
+        assert_eq!(bounds.histogram.max(), HISTOGRAM_MAX);
+        assert_eq!(bounds.edge_density.range(), EDGE_DENSITY_RANGE);
+        assert_eq!(bounds.worker_role.min(), WORKER_ROLE_MIN);
+        assert_eq!(bounds.badge_role.min(), BADGE_ROLE_MIN);
+        assert_eq!(bounds.hud_state.min(), HUD_STATE_MIN);
+        assert_eq!(bounds.clip_difference.range(), CLIP_DIFFERENCE_RANGE);
+        assert_eq!(bounds.outside_crop.max(), OUTSIDE_CROP_MAX);
+    }
+
+    /// The embedded contract is the document on disk, not a stale copy.
+    ///
+    /// This proves what `include_str!` can prove and no more: the bytes the
+    /// binary carries are the bytes in the working tree it was built from. It
+    /// is deliberately not a claim about committed state, and it is not the
+    /// frozen G0 hash gate, which does not exist yet.
+    #[test]
+    fn the_embedded_contract_matches_the_document_on_disk() {
+        let committed = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(crate::reference::FIDELITY_CONTRACT_PATH),
+        )
+        .expect("the fidelity contract must be present");
+        let parsed: crate::reference::FidelityContract =
+            serde_json::from_str(&committed).expect("the document on disk must parse");
+        assert_eq!(
+            &parsed,
+            crate::reference::contract(),
+            "the embedded contract has drifted from the committed document"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Row angle and implied elevation
 // ---------------------------------------------------------------------------

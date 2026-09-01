@@ -6,6 +6,10 @@ pub mod hud;
 pub mod metrics;
 pub mod operations;
 pub mod player;
+/// The reference-policy boundary: every numeric bound a fidelity gate is
+/// derived from is read from `docs/reference/fidelity.json` through here, so
+/// `metrics` can measure images without carrying policy.
+pub mod reference;
 /// The site generator is a native publication tool: it reads the repository,
 /// decodes verified frames, and writes files. The browser build never carries
 /// it, so the packaged game stays free of the Markdown, HTML, and image

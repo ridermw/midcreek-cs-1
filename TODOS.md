@@ -8,6 +8,42 @@ Items here were considered and deferred during the plan-exit review of
 
 ---
 
+## Amend U1 for the build.rs decision and the constant count
+
+**What.** Two edits to unit U1 in
+`docs/plans/2026-08-31-1507-feat-phase-2-hill-climb-plan.md`. First, replace the
+"Specify `build.rs`" bullet and its "generated constants match `fidelity.json`"
+test scenario with the decision actually taken: there is no `build.rs`, the
+contract is embedded with `include_str!` and parsed once, and the frozen G0
+hash is verified at test time rather than build time. Second, correct the
+constant count from fifteen to sixteen.
+
+**Why.** U1 books a `build.rs` that does not exist, and the implementation
+settled the question by deciding one is not needed: `include_str!` cannot drift
+from the committed file, works on `wasm32-unknown-unknown` where `metrics` also
+compiles and there is no filesystem, and avoids a codegen step whose output
+would itself need byte-stability gating. That reasoning is recorded in the
+`src/reference.rs` module docs, but the plan still says otherwise, and a plan
+and an implementation that disagree is exactly what G0 must not freeze.
+
+The count is a separate discrepancy. U1 enumerates fifteen constants and says
+"all fifteen policy constants", but `SENTINEL_MAX` sits in the same block and is
+policy by the same test. Sixteen were migrated, because leaving one behind
+defeats the "metrics is policy-free" principle the plan states twice. Review
+judged fifteen to be a counting error rather than an intentional exclusion.
+
+**Context.** Raised by review of the first U1 increment. Not done here because
+the session brief reserves plan edits: "If a fix requires changing fidelity
+policy, reference thresholds, camera constants, or the plan itself, stop and
+report instead." No threshold value changed; every migrated bound equals the
+constant it replaced, which `the_fidelity_contract_carries_every_migrated_policy_constant`
+pins.
+
+**Depends on.** An owner decision on both edits. Blocks G0, which freezes the
+contract and would otherwise freeze a plan that disagrees with the code.
+
+---
+
 ## Pin focal placement in the Phase 1 baseline
 
 **What.** Add U3's fourth composition component, focal placement, to

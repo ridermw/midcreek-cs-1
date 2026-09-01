@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "description": "Every numeric bound the fidelity gates are derived from. src/metrics.rs measures images and holds no policy; src/verification.rs decides whether a measurement passes, reading these bounds through src/reference.rs. The document is embedded with include_str! and parsed once, so a run cannot disagree with the repository it is measuring. Not yet frozen: G0 will freeze this document and its hash, after which a change requires authority-only justification, a new near-boundary negative fixture, and a separate G0 recalibration.",
+  "bounds": {
+    "sentinel": {
+      "max": 0.001
+    },
+    "luminance": {
+      "min": 0.48,
+      "max": 0.88
+    },
+    "luminance_reference_tolerance": {
+      "max": 0.18
+    },
+    "palette": {
+      "min": 0.6
+    },
+    "floor": {
+      "min": 0.2
+    },
+    "rack": {
+      "min": 0.06
+    },
+    "yellow": {
+      "min": 0.005
+    },
+    "ink": {
+      "min": 0.03,
+      "max": 0.35
+    },
+    "diagonal_band": {
+      "min": 0.08
+    },
+    "histogram": {
+      "max": 0.9
+    },
+    "edge_density": {
+      "min": 0.35,
+      "max": 2.5
+    },
+    "worker_role": {
+      "min": 0.002
+    },
+    "badge_role": {
+      "min": 0.1
+    },
+    "hud_state": {
+      "min": 0.002
+    },
+    "clip_difference": {
+      "min": 0.02,
+      "max": 0.6
+    },
+    "outside_crop": {
+      "max": 0.01
+    }
+  }
+}
