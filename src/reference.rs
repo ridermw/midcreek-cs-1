@@ -22,10 +22,54 @@
 
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The committed contract, embedded at compile time.
 const FIDELITY_CONTRACT: &str = include_str!("../docs/reference/fidelity.json");
+
+/// The committed reference manifest, embedded at compile time.
+const REFERENCE_MANIFEST: &str = include_str!("../docs/reference/manifest.json");
+
+/// The repository-relative path of the manifest this module embeds.
+pub const REFERENCE_MANIFEST_PATH: &str = "docs/reference/manifest.json";
+
+/// One approved reference image, as the manifest declares it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceAsset {
+    pub name: String,
+    pub source_path: String,
+    pub public_path: String,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Every approved reference image this repository vendors and publishes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceManifest {
+    pub assets: Vec<ReferenceAsset>,
+}
+
+/// The approved references, parsed once for the process.
+///
+/// This is the single *runtime* source of the approved hashes. They used to be
+/// repeated as constants in `design`, which meant three copies of every hash:
+/// the constant, the manifest, and the image. The manifest now declares, and
+/// the image must match it. The literal pin in `sitegen_contract` remains on
+/// purpose as an independent approval record, so changing the approved art
+/// still requires a reviewer-visible edit rather than a coordinated swap of
+/// the manifest and the PNG together.
+#[must_use]
+pub fn approved_references() -> &'static ReferenceManifest {
+    static MANIFEST: OnceLock<ReferenceManifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        serde_json::from_str(REFERENCE_MANIFEST).unwrap_or_else(|error| {
+            panic!("{REFERENCE_MANIFEST_PATH} must be a valid reference manifest: {error}")
+        })
+    })
+}
 
 /// The repository-relative path of the contract this module embeds.
 pub const FIDELITY_CONTRACT_PATH: &str = "docs/reference/fidelity.json";
@@ -191,6 +235,21 @@ impl FidelityContract {
 #[must_use]
 pub fn bounds() -> &'static Bounds {
     &contract().bounds
+}
+
+/// The approved hash of one vendored reference image.
+///
+/// Panics on an unknown path: the manifest is committed repository data, so a
+/// caller naming a reference this repository does not vendor is a bug rather
+/// than a runtime condition.
+#[must_use]
+pub fn approved_reference_sha256(public_path: &str) -> &'static str {
+    approved_references()
+        .assets
+        .iter()
+        .find(|asset| asset.public_path == public_path)
+        .map(|asset| asset.sha256.as_str())
+        .unwrap_or_else(|| panic!("{public_path} is not an approved reference"))
 }
 
 #[cfg(test)]

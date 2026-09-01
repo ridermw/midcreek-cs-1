@@ -27,15 +27,15 @@ use image::RgbImage;
 use midcreek_cs_1::{
     camera::{CEL_SHIFT_DEBAND_DITHER, CEL_SHIFT_TONEMAPPING},
     design::{
-        AssetKind, CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, FLOOR_LIGHT,
-        KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, PaletteRole, SceneBlueprint,
+        AssetKind, CHARACTER_SHEET_REFERENCE_PATH, FLOOR_LIGHT, KEY_ART_REFERENCE_PATH,
+        PaletteRole, SceneBlueprint,
     },
     metrics::{
         FrameMetrics, MeasureSource, PALETTE_TOLERANCE, PixelRect, WORKER_REGION, measure,
         reference_metrics,
     },
     player::required_player_parts,
-    reference::bounds,
+    reference::{approved_reference_sha256, bounds},
     verification::{
         APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CAPTURE_DELAY_LIMIT,
         CAPTURE_TIMEOUT, CameraRenderFacts, DROP_CAPTURE_TIMEOUT, EQUIPMENT_REGION_MIN_PIXELS,
@@ -1987,11 +1987,11 @@ fn rendered_run_pins_every_source_asset_and_reference_hash() {
     }
     assert_eq!(
         run.report.references.get(KEY_ART_REFERENCE_PATH),
-        Some(&KEY_ART_SHA256.to_owned())
+        Some(&approved_reference_sha256(KEY_ART_REFERENCE_PATH).to_owned())
     );
     assert_eq!(
         run.report.references.get(CHARACTER_SHEET_REFERENCE_PATH),
-        Some(&CHARACTER_SHEET_SHA256.to_owned())
+        Some(&approved_reference_sha256(CHARACTER_SHEET_REFERENCE_PATH).to_owned())
     );
 }
 

@@ -11,10 +11,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    design::{
-        CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256, KEY_ART_REFERENCE_PATH,
-        KEY_ART_SHA256,
-    },
     metrics::PixelRect,
     verification::{FrameFacts, FrameName, VerificationReport, canonical_json, semantic_hash},
 };
@@ -128,22 +124,11 @@ pub struct CommitSummary {
     pub task_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReferenceAsset {
-    pub name: String,
-    pub source_path: String,
-    pub public_path: String,
-    pub sha256: String,
-    pub width: u32,
-    pub height: u32,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReferenceManifest {
-    pub assets: Vec<ReferenceAsset>,
-}
+/// The approved reference images are declared by
+/// `docs/reference/manifest.json` and reach the code through
+/// [`crate::reference`], which embeds it. These re-exports keep the manifest
+/// types where the publication code that consumes them already looks.
+pub use crate::reference::{ReferenceAsset, ReferenceManifest};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1791,34 +1776,28 @@ pub fn validate_reference_manifest(
     manifest: &ReferenceManifest,
     repository: &Path,
 ) -> Result<(), Vec<ReferenceError>> {
-    const EXPECTED_DIMENSIONS: (u32, u32) = (1536, 1024);
-    const EXPECTED: [(&str, &str, &str, &str); 2] = [
-        (
-            "Cel Shift key art",
-            "../midcreek-concept/themes/cel-shift/masters/key-art/04-diamond-bright.png",
-            KEY_ART_REFERENCE_PATH,
-            KEY_ART_SHA256,
-        ),
-        (
-            "Cel Shift character sheet",
-            "../midcreek-concept/themes/cel-shift/masters/animation/01-model-sheet.png",
-            CHARACTER_SHEET_REFERENCE_PATH,
-            CHARACTER_SHEET_SHA256,
-        ),
-    ];
+    let approved = crate::reference::approved_references();
 
     let mut errors = Vec::new();
-    if manifest.assets.len() != EXPECTED.len() {
+    if manifest.assets.len() != approved.assets.len() {
         errors.push(ReferenceError::AssetCount {
-            expected: EXPECTED.len(),
+            expected: approved.assets.len(),
             actual: manifest.assets.len(),
         });
     }
 
-    for (asset, (name, source_path, public_path, sha256)) in manifest.assets.iter().zip(EXPECTED) {
+    for (asset, expected) in manifest.assets.iter().zip(&approved.assets) {
+        let name = expected.name.as_str();
+        let public_path = expected.public_path.as_str();
+        let sha256 = expected.sha256.as_str();
+        let expected_dimensions = (expected.width, expected.height);
         for (field, expected, actual) in [
             ("name", name, asset.name.as_str()),
-            ("source_path", source_path, asset.source_path.as_str()),
+            (
+                "source_path",
+                expected.source_path.as_str(),
+                asset.source_path.as_str(),
+            ),
             ("public_path", public_path, asset.public_path.as_str()),
             ("sha256", sha256, asset.sha256.as_str()),
         ] {
@@ -1832,11 +1811,11 @@ pub fn validate_reference_manifest(
             }
         }
 
-        if (asset.width, asset.height) != EXPECTED_DIMENSIONS {
+        if (asset.width, asset.height) != expected_dimensions {
             errors.push(ReferenceError::ManifestFieldMismatch {
                 asset: name.to_owned(),
                 field: "dimensions".to_owned(),
-                expected: format!("{}x{}", EXPECTED_DIMENSIONS.0, EXPECTED_DIMENSIONS.1),
+                expected: format!("{}x{}", expected_dimensions.0, expected_dimensions.1),
                 actual: format!("{}x{}", asset.width, asset.height),
             });
         }
@@ -1874,10 +1853,10 @@ pub fn validate_reference_manifest(
             .map_err(|error| error.to_string())
             .and_then(|reader| reader.into_dimensions().map_err(|error| error.to_string()));
         match dimensions {
-            Ok(actual) if actual != EXPECTED_DIMENSIONS => {
+            Ok(actual) if actual != expected_dimensions => {
                 errors.push(ReferenceError::AssetDimensionsMismatch {
                     path: relative_path.to_path_buf(),
-                    expected: EXPECTED_DIMENSIONS,
+                    expected: expected_dimensions,
                     actual,
                 });
             }
@@ -1907,9 +1886,9 @@ impl VerificationEvidence {
     /// Every declared artifact is resolved inside the directory that declared
     /// it, refused if it is absolute, escapes with `..`, is a symbolic link,
     /// is missing, or is not the image its own report says it is. The approved
-    /// reference hashes are checked against the repository's own constants, so
-    /// a report that measured a different key art can never be published
-    /// beside it.
+    /// reference hashes are checked against the manifest this repository
+    /// vendors and publishes, so a report that measured a different key art
+    /// can never be published beside it.
     pub fn project(
         report: &VerificationReport,
         artifacts: &Path,
@@ -2032,15 +2011,15 @@ fn project_browser(gate: &BrowserGateReport, root: &Path) -> Result<PublicBrowse
 /// Refuses a report whose approved-reference hashes are not the ones this
 /// repository vendors and publishes.
 fn check_reference_provenance(report: &VerificationReport) -> Result<(), SitegenError> {
-    for (path, expected) in [
-        (KEY_ART_REFERENCE_PATH, KEY_ART_SHA256),
-        (CHARACTER_SHEET_REFERENCE_PATH, CHARACTER_SHEET_SHA256),
-    ] {
-        let actual = report.references.get(path).map(String::as_str);
-        if actual != Some(expected) {
+    for asset in &crate::reference::approved_references().assets {
+        let actual = report
+            .references
+            .get(&asset.public_path)
+            .map(String::as_str);
+        if actual != Some(asset.sha256.as_str()) {
             return Err(SitegenError::ReferenceProvenance {
-                path: path.to_owned(),
-                expected: expected.to_owned(),
+                path: asset.public_path.clone(),
+                expected: asset.sha256.clone(),
                 actual: actual.unwrap_or("nothing").to_owned(),
             });
         }

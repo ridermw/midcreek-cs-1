@@ -2593,7 +2593,8 @@ mod verification_publication_contract {
     };
     use super::*;
     use midcreek_cs_1::{
-        design::{CHARACTER_SHEET_SHA256, KEY_ART_SHA256},
+        design::{CHARACTER_SHEET_REFERENCE_PATH, KEY_ART_REFERENCE_PATH},
+        reference::approved_reference_sha256,
         sitegen::{
             BROWSER_FRAME_FILE, CURRENT_SCREENSHOTS, GALLERY_FILE, GALLERY_FRAMES, GalleryManifest,
             GateStatus, GateSummary, HISTORY_SCREENSHOTS, SCREENSHOTS_ROOT, VERIFICATION_FILE,
@@ -2711,7 +2712,7 @@ mod verification_publication_contract {
                 .hashes
                 .references
                 .get("docs/reference/cel-shift-key-art.png"),
-            Some(&KEY_ART_SHA256.to_owned())
+            Some(&approved_reference_sha256(KEY_ART_REFERENCE_PATH).to_owned())
         );
         assert!(summary.succeeded);
         assert!(
@@ -3489,8 +3490,11 @@ mod verification_publication_contract {
     fn comparison_page_includes_reference_provenance() {
         let html = build_fixture_site("verified-game").unwrap().index_html();
 
-        assert!(html.contains(KEY_ART_SHA256), "{html}");
-        assert!(html.contains(CHARACTER_SHEET_SHA256));
+        assert!(
+            html.contains(approved_reference_sha256(KEY_ART_REFERENCE_PATH)),
+            "{html}"
+        );
+        assert!(html.contains(approved_reference_sha256(CHARACTER_SHEET_REFERENCE_PATH)));
         assert!(html.contains("a30e12b63a36743015b1c73eeca6248"));
         assert!(html.contains("8a5a31e7bceb8ad16b3481d2bae89e7"));
         assert_text(&html, "#comparison", "docs/reference/cel-shift-key-art.png");

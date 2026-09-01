@@ -149,9 +149,6 @@ pub const RACK_COOLDOWN_SECONDS: f32 = 8.0;
 
 pub const KEY_ART_REFERENCE_PATH: &str = "docs/reference/cel-shift-key-art.png";
 pub const CHARACTER_SHEET_REFERENCE_PATH: &str = "docs/reference/cel-shift-character-sheet.png";
-pub const KEY_ART_SHA256: &str = "a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75";
-pub const CHARACTER_SHEET_SHA256: &str =
-    "8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25";
 
 macro_rules! srgba_u8 {
     ($red:expr, $green:expr, $blue:expr) => {
