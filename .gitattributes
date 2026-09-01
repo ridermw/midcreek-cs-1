@@ -1,0 +1,5 @@
+# The Phase 1 baseline's value rests entirely on its bytes surviving a
+# checkout on another platform, and the reference art is hashed by the
+# publication manifest. Git's binary detection already protects these in
+# practice; saying so is free and removes the question.
+*.png binary

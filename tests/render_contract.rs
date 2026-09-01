@@ -31,8 +31,8 @@ use midcreek_cs_1::{
         KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, PaletteRole, SceneBlueprint,
     },
     metrics::{
-        CLIP_DIFFERENCE_RANGE, FrameMetrics, OUTSIDE_CROP_MAX, PALETTE_TOLERANCE, PixelRect,
-        SENTINEL_MAX, WORKER_REGION, reference_metrics,
+        CLIP_DIFFERENCE_RANGE, FrameMetrics, MeasureSource, OUTSIDE_CROP_MAX, PALETTE_TOLERANCE,
+        PixelRect, SENTINEL_MAX, WORKER_REGION, measure, reference_metrics,
     },
     player::required_player_parts,
     verification::{
@@ -1504,6 +1504,147 @@ fn cli_exits_with_code_two_for_every_unusable_output_path() {
             "{arguments:?} must not print anything on stdout"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Phase 1 baseline
+// ---------------------------------------------------------------------------
+
+/// The committed Phase 1 composition vector M0.5 and M1 are measured against.
+const PHASE_ONE_BASELINE: &str = "docs/reference/phase-1-baseline.json";
+
+/// The committed Phase 1 frames the vector was measured from.
+const PHASE_ONE_FRAMES: &str = "docs/reference/phase-1-baseline";
+
+/// Every composition component the baseline pins and re-checks.
+///
+/// `rack_mass`, `floor_mass`, and `rack_to_floor` are U3's mass components,
+/// and the two diagonal band shares stand in for U3's diagonal angle: the
+/// sub-degree row-angle fit is withheld on captures because unmultisampled
+/// diagonals bias it, but the band shares are the coarse measurement the
+/// capture gates are already derived from. `focal_placement`, U3's fourth
+/// component, is *not* pinned here: it is the projected worker rectangle,
+/// which comes from the run report rather than from the frame. That shortfall
+/// is recorded in `TODOS.md` rather than quietly dropped.
+const BASELINE_COMPONENTS: [&str; 8] = [
+    "rack_mass",
+    "floor_mass",
+    "rack_to_floor",
+    "mean_linear_luminance",
+    "edge_density",
+    "palette_ratio",
+    "diagonal_band_low",
+    "diagonal_band_high",
+];
+
+/// How far a re-measured baseline frame may sit from its pinned vector.
+///
+/// This is not the inter-journey spread and must not be confused with it. This
+/// test re-reads a *committed* PNG, so the bytes are identical by construction
+/// and every mass component is a ratio of integer pixel counts: correctly
+/// rounded IEEE-754 arithmetic on integer inputs, and therefore bit-exact on
+/// every platform. Only `mean_linear_luminance` accumulates floats, whose one
+/// cross-platform wobble is the libm call behind the linear luminance table.
+/// A looser bound here would buy nothing except somewhere for corruption to
+/// hide. The tolerance a *milestone* gate needs against a fresh capture is a
+/// different number and belongs to U3.
+const BASELINE_REMEASURE_EPSILON: f64 = 1.0e-9;
+
+/// The Phase 1 baseline is a committed artifact, not a memory.
+///
+/// KTD8 requires M1 to be measurably closer to the approved reference than the
+/// checked-in Phase 1 baseline, and U3 requires the composition vector to be
+/// stored so rack mass, floor mass, and focal placement can be shown to have
+/// moved toward it. Neither claim is testable until the vector is on disk and
+/// every frame it was measured from is committed beside it.
+///
+/// The pinned authority is deliberately the vector rather than a frame hash.
+/// Raster bytes are not reproducible on a software adapter (issue #7), so a
+/// byte-exact baseline would encode which render pump each readback landed on
+/// and would fail for reasons that have nothing to do with the hall.
+#[test]
+fn the_phase_one_baseline_pins_a_composition_vector_for_every_frame() {
+    let document = fs::read_to_string(repository().join(PHASE_ONE_BASELINE))
+        .expect("the Phase 1 baseline must be committed");
+    let baseline: serde_json::Value =
+        serde_json::from_str(&document).expect("the Phase 1 baseline must be valid json");
+
+    let frames = baseline
+        .get("frames")
+        .and_then(serde_json::Value::as_object)
+        .expect("the baseline must carry a frame table");
+    assert_eq!(
+        frames.len(),
+        FrameName::ALL.len(),
+        "the baseline must cover every canonical frame"
+    );
+
+    let mut drifts = Vec::new();
+    for frame in FrameName::ALL {
+        let name = frame.file_name();
+        let pinned = frames
+            .get(name)
+            .unwrap_or_else(|| panic!("the baseline must pin {name}"));
+        let path = repository().join(PHASE_ONE_FRAMES).join(name);
+        assert!(
+            path.is_file(),
+            "the frame the vector was measured from must be committed: {}",
+            path.display()
+        );
+
+        // The committed bytes are the artifact. Checking the hash here is not
+        // a reproducibility claim about re-capturing, which issue #7 makes
+        // false; it is the guarantee that these numbers describe *these*
+        // pixels, and it catches a checkout that mangled them.
+        assert_eq!(
+            sha256(&path),
+            pinned
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name} must pin its sha256")),
+            "{name} bytes no longer match the vector recorded for them"
+        );
+
+        let image = image::open(&path)
+            .unwrap_or_else(|error| panic!("{name} must decode: {error}"))
+            .to_rgb8();
+        let (width, height) = frame.size();
+        assert_eq!(
+            (image.width(), image.height()),
+            (width, height),
+            "{name} must be the size the contract names"
+        );
+
+        let report = measure(&path, MeasureSource::Capture)
+            .unwrap_or_else(|error| panic!("{name} must still measure: {error}"));
+        let mut measured = serde_json::to_value(&report).expect("a measurement serializes");
+        // `MeasureReport` withholds the diagonal fit on captures, so the band
+        // shares are read from the frame metrics the gates themselves use.
+        let bands = metrics_of(&image);
+        measured["diagonal_band_low"] = bands.diagonal_band_low.into();
+        measured["diagonal_band_high"] = bands.diagonal_band_high.into();
+
+        for component in BASELINE_COMPONENTS {
+            let expected = pinned
+                .get(component)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_else(|| panic!("{name} must pin {component}"));
+            let actual = measured
+                .get(component)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_else(|| panic!("{name} must measure {component}"));
+            if (expected - actual).abs() > BASELINE_REMEASURE_EPSILON {
+                drifts.push(format!(
+                    "{name} {component}: pinned {expected}, measured {actual}"
+                ));
+            }
+        }
+    }
+    assert!(
+        drifts.is_empty(),
+        "the committed baseline no longer measures to its pinned vector:\n{}",
+        drifts.join("\n")
+    );
 }
 
 // ---------------------------------------------------------------------------

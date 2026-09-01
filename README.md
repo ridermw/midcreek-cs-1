@@ -851,9 +851,35 @@ Those two tests are reported as ignored on Windows rather than passed, and they
 still execute on every other platform.
 
 Captured pixels are therefore not yet a pure function of game state on this
-adapter. G0 must not freeze a Phase 1 visual baseline until issue #7 is
-resolved and those tests run normally, because a frozen baseline would encode
-which render pump each readback happened to land on.
+adapter. That constrains what a baseline may claim rather than forbidding one:
+`docs/reference/phase-1-baseline.json` pins the composition vector, which is
+stable across journeys, and explicitly does not pin frame bytes, which are not.
+G0 must not freeze a *byte-exact* visual contract, or any gate whose pass
+depends on raster equality, until issue #7 is resolved.
+
+### The Phase 1 baseline
+
+`docs/reference/phase-1-baseline.json` and `docs/reference/phase-1-baseline/`
+hold the composition vector M0.5 and M1 are measured against, and the fourteen
+frames it was measured from. KTD8 requires M1 to be measurably closer to the
+approved reference than the checked-in Phase 1 baseline, and U3 requires rack
+mass, floor mass, and focal placement to be shown moving toward it; neither
+claim is testable until the vector is on disk.
+
+The pinned authority is the vector, not the raster bytes. Each frame carries a
+`sha256`, which the test asserts: that is not a claim that re-capturing
+reproduces those bytes, which issue #7 makes false, but the guarantee that the
+pinned numbers describe *those* pixels and that a checkout has not mangled
+them. Re-measurement is checked to `BASELINE_REMEASURE_EPSILON`, which is tight
+because every mass component is a ratio of integer pixel counts and therefore
+bit-exact; the looser tolerance a milestone gate needs against a *fresh*
+capture is a separate number and belongs to U3.
+
+The vector covers three of U3's four composition components: the mass
+components, and the diagonal band shares standing in for diagonal angle.
+Focal placement is not pinned, because it is the projected worker rectangle and
+comes from the run report rather than from the frame. That shortfall is
+recorded in `TODOS.md`.
 
 ### The software compatibility render profile
 

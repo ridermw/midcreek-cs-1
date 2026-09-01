@@ -8,6 +8,30 @@ Items here were considered and deferred during the plan-exit review of
 
 ---
 
+## Pin focal placement in the Phase 1 baseline
+
+**What.** Add U3's fourth composition component, focal placement, to
+`docs/reference/phase-1-baseline.json` and to `BASELINE_COMPONENTS` in
+`tests/render_contract.rs`.
+
+**Why.** U3 names rack mass, floor mass, diagonal angle, and focal placement as
+the components M1 must be shown to have moved toward the reference. The
+committed baseline pins the first three, using the diagonal band shares for
+diagonal angle. Focal placement is absent, so an M1 gate built on this vector
+could declare victory with one camera-sensitive component unmeasured.
+
+**Context.** Focal placement is the projected worker rectangle, which the
+analyzers read from `FrameMetrics::regions` keyed by `WORKER_REGION`. Those
+rectangles are produced by the run and recorded in `report.json`, not derivable
+from a committed PNG alone, so pinning it means committing the baseline run's
+report beside the frames and cross-checking the two. That was out of scope for
+U0, which stores the vector; U3 owns the gate that consumes it.
+
+**Depends on.** Nothing. Best done as the first step of U3, before the camera
+model changes, so the pre-change value is captured.
+
+---
+
 ## Discover installed Windows browsers in the clean gate
 
 **What.** Teach `scripts/check.sh` and `scripts/web-smoke.sh` to locate standard
