@@ -76,13 +76,18 @@ pub const FIDELITY_CONTRACT_PATH: &str = "docs/reference/fidelity.json";
 
 /// One numeric bound a gate is derived from.
 ///
-/// A bound carries whichever of `min` and `max` its gate uses. Both are
-/// optional because the contract holds one-sided floors, one-sided ceilings,
-/// and two-sided windows, and spelling them with one shape keeps the document
-/// readable and the parse total.
+/// A bound carries whichever of `value`, `min` and `max` its gate uses. All
+/// are optional because the contract holds one-sided floors, one-sided
+/// ceilings, two-sided windows, and calibrated measurements that carry both a
+/// value and the tolerance around it. Spelling them with one shape keeps the
+/// document readable and the parse total.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Bound {
+    /// The calibrated measurement, for a bound taken from the authority image
+    /// rather than chosen as an engineering contract.
+    #[serde(default)]
+    pub value: Option<f64>,
     /// The inclusive floor, when the gate has one.
     #[serde(default)]
     pub min: Option<f64>,
@@ -92,6 +97,13 @@ pub struct Bound {
 }
 
 impl Bound {
+    /// The calibrated measurement, for a bound its gate derives from one.
+    #[must_use]
+    pub fn value(&self) -> f64 {
+        self.value
+            .expect("the contract must carry a calibrated value for this bound")
+    }
+
     /// The floor, for a bound its gate requires to have one.
     ///
     /// A missing floor is a malformed contract rather than a runtime
@@ -122,6 +134,16 @@ impl Bound {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Bounds {
+    /// The projected ground-axis angle measured from the authority image, and
+    /// the reviewed tolerance around it.
+    ///
+    /// This is the one bound the camera itself is derived from rather than
+    /// judged against: [`crate::design::CAMERA_ELEVATION_DEGREES`] follows from
+    /// it. The tolerance is the band
+    /// `the_approved_key_art_measures_a_shallow_isometric_row_angle` already
+    /// asserted before the value was frozen here, so it is a reviewed number
+    /// rather than one chosen to fit.
+    pub projected_row_angle: Bound,
     pub sentinel: Bound,
     pub luminance: Bound,
     pub luminance_reference_tolerance: Bound,
@@ -142,8 +164,9 @@ pub struct Bounds {
 
 impl Bounds {
     /// Every bound beside the name the contract spells it with.
-    fn named(&self) -> [(&'static str, Bound); 16] {
+    fn named(&self) -> [(&'static str, Bound); 17] {
         [
+            ("projected_row_angle", self.projected_row_angle),
             ("sentinel", self.sentinel),
             ("luminance", self.luminance),
             (
@@ -180,7 +203,7 @@ pub struct FidelityContract {
 }
 
 /// The contract version this module knows how to read.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// The committed contract, parsed once for the process.
 ///
@@ -218,13 +241,23 @@ impl FidelityContract {
             ));
         }
         for (name, bound) in self.bounds.named() {
-            if bound.min.is_none() && bound.max.is_none() {
-                return Err(format!("{name} carries neither a floor nor a ceiling"));
+            if bound.value.is_none() && bound.min.is_none() && bound.max.is_none() {
+                return Err(format!("{name} carries no value, floor, or ceiling"));
             }
             if let (Some(min), Some(max)) = (bound.min, bound.max)
                 && min > max
             {
                 return Err(format!("{name} has a floor {min} above its ceiling {max}"));
+            }
+            // A calibrated measurement outside its own tolerance is the one
+            // shape that looks fine field by field and is nonsense together.
+            if let Some(value) = bound.value
+                && (bound.min.is_some_and(|min| value < min)
+                    || bound.max.is_some_and(|max| value > max))
+            {
+                return Err(format!(
+                    "{name} has a calibrated value {value} outside its own tolerance"
+                ));
             }
         }
         Ok(())
@@ -269,6 +302,8 @@ mod tests {
     fn the_contract_pins_every_calibrated_bound() {
         let bounds = bounds();
 
+        assert_eq!(bounds.projected_row_angle.value(), 30.533_256_422_850_364);
+        assert_eq!(bounds.projected_row_angle.range(), (25.0, 35.0));
         assert_eq!(bounds.sentinel.max(), 0.001);
         assert_eq!(bounds.luminance.range(), (0.48, 0.88));
         assert_eq!(bounds.luminance_reference_tolerance.max(), 0.18);
@@ -314,6 +349,7 @@ mod tests {
     fn validation_refuses_an_unusable_contract() {
         let mut inverted = contract().clone();
         inverted.bounds.luminance = Bound {
+            value: None,
             min: Some(0.9),
             max: Some(0.1),
         };
@@ -324,12 +360,24 @@ mod tests {
 
         let mut empty = contract().clone();
         empty.bounds.palette = Bound {
+            value: None,
             min: None,
             max: None,
         };
         assert!(
             empty.validate().is_err(),
-            "a bound with neither side is a gate with nothing to judge against"
+            "a bound with no value, floor, or ceiling is a gate with nothing to judge against"
+        );
+
+        let mut outside = contract().clone();
+        outside.bounds.projected_row_angle = Bound {
+            value: Some(99.0),
+            min: Some(25.0),
+            max: Some(35.0),
+        };
+        assert!(
+            outside.validate().is_err(),
+            "a calibrated value outside its own tolerance is nonsense the fields hide"
         );
 
         let mut future = contract().clone();

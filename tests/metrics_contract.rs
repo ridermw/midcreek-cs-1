@@ -141,6 +141,30 @@ fn a_flat_frame_has_no_measurable_row_angle() {
 }
 
 #[test]
+fn the_contract_row_angle_is_what_the_authority_image_measures() {
+    let path = repo_root().join(KEY_ART_REFERENCE_PATH);
+    let image = load_frame(&path).expect("the approved key art is vendored");
+    let angle = dominant_row_angle(&image).expect("the key art is full of rack rows");
+    let calibrated = midcreek_cs_1::reference::bounds().projected_row_angle;
+
+    // Tight, because this is not a tolerance: it is the assertion that the
+    // number frozen in the contract is the number the authority image produces
+    // rather than one typed in beside it. The band below is the tolerance.
+    assert!(
+        (angle.low_degrees - calibrated.value()).abs() < 1.0e-9,
+        "the contract pins {} but the key art measures {}",
+        calibrated.value(),
+        angle.low_degrees
+    );
+    assert!(
+        (calibrated.min()..=calibrated.max()).contains(&angle.low_degrees),
+        "the measured row angle {} must lie inside its own reviewed tolerance {:?}",
+        angle.low_degrees,
+        calibrated.range()
+    );
+}
+
+#[test]
 fn the_approved_key_art_measures_a_shallow_isometric_row_angle() {
     let path = repo_root().join(KEY_ART_REFERENCE_PATH);
     let image = load_frame(&path).expect("the approved key art is vendored");

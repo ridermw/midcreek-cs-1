@@ -1,7 +1,12 @@
 {
-  "schema_version": 1,
-  "description": "Every numeric bound the fidelity gates are derived from. src/metrics.rs measures images and holds no policy; src/verification.rs decides whether a measurement passes, reading these bounds through src/reference.rs. The document is embedded with include_str! and parsed once, so a run cannot disagree with the repository it is measuring. Not yet frozen: G0 will freeze this document and its hash, after which a change requires authority-only justification, a new near-boundary negative fixture, and a separate G0 recalibration.",
+  "schema_version": 2,
+  "description": "Every numeric bound the fidelity gates are derived from. src/metrics.rs measures images and holds no policy; src/verification.rs decides whether a measurement passes, reading these bounds through src/reference.rs. projected_row_angle is the one bound the camera is derived from rather than judged against: its value is measured from the approved key art and CAMERA_ELEVATION_DEGREES follows from it. The document is embedded with include_str! and parsed once, so a run cannot disagree with the repository it is measuring. Not yet frozen: G0 will freeze this document and its hash, after which a change requires authority-only justification, a new near-boundary negative fixture, and a separate G0 recalibration.",
   "bounds": {
+    "projected_row_angle": {
+      "value": 30.533256422850364,
+      "min": 25.0,
+      "max": 35.0
+    },
     "sentinel": {
       "max": 0.001
     },
