@@ -875,11 +875,12 @@ because every mass component is a ratio of integer pixel counts and therefore
 bit-exact; the looser tolerance a milestone gate needs against a *fresh*
 capture is a separate number and belongs to U3.
 
-The vector covers three of U3's four composition components: the mass
-components, and the diagonal band shares standing in for diagonal angle.
-Focal placement is not pinned, because it is the projected worker rectangle and
-comes from the run report rather than from the frame. That shortfall is
-recorded in `TODOS.md`.
+The vector covers all four of U3's composition components: the mass
+components, the diagonal band shares standing in for diagonal angle, and focal
+placement. Focal placement is the projected worker rectangle, which the run
+computes rather than something a PNG can be measured for, so the baseline run's
+`report.json` is committed beside the frames and the pinned placement is
+checked against it.
 
 ### The software compatibility render profile
 

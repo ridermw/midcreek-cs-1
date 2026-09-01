@@ -1517,6 +1517,14 @@ const PHASE_ONE_BASELINE: &str = "docs/reference/phase-1-baseline.json";
 /// The committed Phase 1 frames the vector was measured from.
 const PHASE_ONE_FRAMES: &str = "docs/reference/phase-1-baseline";
 
+/// The committed report the baseline run produced.
+///
+/// Focal placement is the projected worker rectangle, which the run computes
+/// and records rather than something a PNG can be measured for. Committing the
+/// report beside the frames is what lets the pinned placement be checked
+/// against the run that produced it instead of against itself.
+const PHASE_ONE_REPORT: &str = "docs/reference/phase-1-baseline/report.json";
+
 /// Every composition component the baseline pins and re-checks.
 ///
 /// `rack_mass`, `floor_mass`, and `rack_to_floor` are U3's mass components,
@@ -1646,6 +1654,58 @@ fn the_phase_one_baseline_pins_a_composition_vector_for_every_frame() {
         "the committed baseline no longer measures to its pinned vector:\n{}",
         drifts.join("\n")
     );
+}
+
+/// The pinned focal placement is the one the baseline run actually produced.
+///
+/// This is U3's fourth composition component, and the only one that is not a
+/// property of the frame: it is the projected worker rectangle the run
+/// computes. Checking it against the committed report rather than against the
+/// baseline document is what stops the two drifting into agreeing with each
+/// other while describing different runs.
+#[test]
+fn the_phase_one_baseline_pins_the_focal_placement_its_run_recorded() {
+    let baseline: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository().join(PHASE_ONE_BASELINE))
+            .expect("the Phase 1 baseline must be committed"),
+    )
+    .expect("the Phase 1 baseline must be valid json");
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository().join(PHASE_ONE_REPORT))
+            .expect("the Phase 1 baseline report must be committed"),
+    )
+    .expect("the Phase 1 baseline report must be valid json");
+
+    assert_eq!(
+        report.get("result").and_then(serde_json::Value::as_str),
+        Some("success"),
+        "a baseline may only be taken from a run that completed its journey"
+    );
+
+    for frame in FrameName::ALL {
+        let name = frame.file_name();
+        let pinned = baseline
+            .pointer(&format!("/frames/{name}/focal_placement"))
+            .unwrap_or_else(|| panic!("the baseline must pin focal placement for {name}"));
+        let recorded = report
+            .pointer(&format!("/frames/{name}/worker_crop"))
+            .unwrap_or_else(|| panic!("the baseline report must record a worker crop for {name}"));
+
+        for component in ["x", "y", "width", "height"] {
+            let expected = pinned
+                .get(component)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_else(|| panic!("{name} focal placement must pin {component}"));
+            let actual = recorded
+                .get(component)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_else(|| panic!("{name} worker crop must record {component}"));
+            assert!(
+                (expected - actual).abs() <= BASELINE_REMEASURE_EPSILON,
+                "{name} focal placement {component}: pinned {expected}, recorded {actual}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

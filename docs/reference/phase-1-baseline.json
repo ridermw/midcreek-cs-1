@@ -21,7 +21,13 @@
       "edge_density": 0.21335828993055556,
       "palette_ratio": 0.9809125434027778,
       "diagonal_band_low": 0.27387758485676855,
-      "diagonal_band_high": 0.4210879403094685
+      "diagonal_band_high": 0.4210879403094685,
+      "focal_placement": {
+        "x": 581.783081,
+        "y": 251.218231,
+        "width": 116.434265,
+        "height": 161.255829
+      }
     },
     "02-fault-queue-ne.png": {
       "sha256": "c9b93f74bc22e21f61e9d28eeff6bbbff34ff07dda93b360f165f9a336690318",
@@ -34,7 +40,13 @@
       "edge_density": 0.21619791666666666,
       "palette_ratio": 0.9698773871527778,
       "diagonal_band_low": 0.26797091296787784,
-      "diagonal_band_high": 0.41296486533498666
+      "diagonal_band_high": 0.41296486533498666,
+      "focal_placement": {
+        "x": 581.783081,
+        "y": 251.218231,
+        "width": 116.434265,
+        "height": 161.255829
+      }
     },
     "03-walk-ne.png": {
       "sha256": "19138c6b075451878c05c9db05501a235e94dd9c4a43781c85b4e5750651d707",
@@ -47,7 +59,13 @@
       "edge_density": 0.2213064236111111,
       "palette_ratio": 0.9695638020833334,
       "diagonal_band_low": 0.228967681364797,
-      "diagonal_band_high": 0.44207810809525105
+      "diagonal_band_high": 0.44207810809525105,
+      "focal_placement": {
+        "x": 580.042542,
+        "y": 252.677979,
+        "width": 116.434204,
+        "height": 161.255829
+      }
     },
     "04-repairing-ne.png": {
       "sha256": "e8b20de3e529328454d8129c3328277aab16841b2baf898e91c7139200b8221e",
@@ -60,7 +78,13 @@
       "edge_density": 0.21886176215277778,
       "palette_ratio": 0.9688552517361111,
       "diagonal_band_low": 0.21697987186046921,
-      "diagonal_band_high": 0.45041670256651206
+      "diagonal_band_high": 0.45041670256651206,
+      "focal_placement": {
+        "x": 581.782959,
+        "y": 251.218262,
+        "width": 116.434204,
+        "height": 161.255829
+      }
     },
     "05-resolved-ne.png": {
       "sha256": "f9cb87150584548d5ed29dc445f2ef3bbed9673a31b5f8b82d307dae173b8c51",
@@ -73,7 +97,13 @@
       "edge_density": 0.2196115451388889,
       "palette_ratio": 0.9686143663194444,
       "diagonal_band_low": 0.2163072794667254,
-      "diagonal_band_high": 0.4487754713514703
+      "diagonal_band_high": 0.4487754713514703,
+      "focal_placement": {
+        "x": 581.782959,
+        "y": 251.218262,
+        "width": 116.434204,
+        "height": 161.255829
+      }
     },
     "06-settled-se.png": {
       "sha256": "ff2f511d8db23d74d9ef6ea563025fa165343f0acdf08c43f0fab91c1141da4a",
@@ -86,7 +116,13 @@
       "edge_density": 0.21937934027777778,
       "palette_ratio": 0.9736675347222222,
       "diagonal_band_low": 0.4472561818396516,
-      "diagonal_band_high": 0.21802570941250446
+      "diagonal_band_high": 0.21802570941250446,
+      "focal_placement": {
+        "x": 581.782959,
+        "y": 251.218414,
+        "width": 116.434204,
+        "height": 161.255829
+      }
     },
     "07-settled-sw.png": {
       "sha256": "4d840a6fb1034a4ad119087835f453f81dfb945051151142e2d3a3292639c853",
@@ -99,7 +135,13 @@
       "edge_density": 0.23810980902777779,
       "palette_ratio": 0.9725998263888889,
       "diagonal_band_low": 0.22944744982800777,
-      "diagonal_band_high": 0.4405351944275277
+      "diagonal_band_high": 0.4405351944275277,
+      "focal_placement": {
+        "x": 581.782959,
+        "y": 251.218384,
+        "width": 116.434204,
+        "height": 161.255859
+      }
     },
     "08-settled-nw.png": {
       "sha256": "94e2cb8544723d9e2111358fb60a124b309288025bc497b23c816c8561f90ea4",
@@ -112,7 +154,13 @@
       "edge_density": 0.24054253472222223,
       "palette_ratio": 0.9696940104166667,
       "diagonal_band_low": 0.4405633462189003,
-      "diagonal_band_high": 0.22326489455065074
+      "diagonal_band_high": 0.22326489455065074,
+      "focal_placement": {
+        "x": 581.782715,
+        "y": 251.218079,
+        "width": 116.434204,
+        "height": 161.255798
+      }
     },
     "09-mid-orbit.png": {
       "sha256": "e98d2143e7313ca95b33419fcfe5721cbd447b9bc23555e63981b3a958039292",
@@ -125,7 +173,13 @@
       "edge_density": 0.17598307291666668,
       "palette_ratio": 0.9704557291666667,
       "diagonal_band_low": 0.01298769452189429,
-      "diagonal_band_high": 0.013200362180674913
+      "diagonal_band_high": 0.013200362180674913,
+      "focal_placement": {
+        "x": 592.590576,
+        "y": 260.282623,
+        "width": 94.819031,
+        "height": 143.127747
+      }
     },
     "10-corner-ne.png": {
       "sha256": "e0fd17fce3a23ce7a77cecc6d20fc10b81d8666ead1820e953efc2774372306c",
@@ -138,7 +192,13 @@
       "edge_density": 0.20251844618055556,
       "palette_ratio": 0.9694411892361111,
       "diagonal_band_low": 0.34859857300408176,
-      "diagonal_band_high": 0.34709828202692855
+      "diagonal_band_high": 0.34709828202692855,
+      "focal_placement": {
+        "x": 581.78302,
+        "y": 251.218292,
+        "width": 116.434265,
+        "height": 161.255798
+      }
     },
     "11-corner-se.png": {
       "sha256": "96c8929c6c792702caf70c5759ea3afe3d49b1e0aebcfc256d563b6c6750e885",
@@ -151,7 +211,13 @@
       "edge_density": 0.2030544704861111,
       "palette_ratio": 0.9694021267361111,
       "diagonal_band_low": 0.34640523991012423,
-      "diagonal_band_high": 0.3491807463674775
+      "diagonal_band_high": 0.3491807463674775,
+      "focal_placement": {
+        "x": 581.782959,
+        "y": 251.218445,
+        "width": 116.434204,
+        "height": 161.255859
+      }
     },
     "12-corner-sw.png": {
       "sha256": "6347a38de1ae91e8e46cbcd2054ec80fa14d3c77537ef24986687fb569dd4ef8",
@@ -164,7 +230,13 @@
       "edge_density": 0.20126844618055556,
       "palette_ratio": 0.9727875434027777,
       "diagonal_band_low": 0.3518262421980441,
-      "diagonal_band_high": 0.3489182906839585
+      "diagonal_band_high": 0.3489182906839585,
+      "focal_placement": {
+        "x": 581.782715,
+        "y": 251.218445,
+        "width": 116.434204,
+        "height": 161.255859
+      }
     },
     "13-corner-nw.png": {
       "sha256": "c1b1330a3c819a09848d120229adb4845827c3dda68ba2d8541ee6590b0af674",
@@ -177,7 +249,13 @@
       "edge_density": 0.202158203125,
       "palette_ratio": 0.9725065104166667,
       "diagonal_band_low": 0.34845390220881106,
-      "diagonal_band_high": 0.3520985469000618
+      "diagonal_band_high": 0.3520985469000618,
+      "focal_placement": {
+        "x": 581.782654,
+        "y": 251.218445,
+        "width": 116.434265,
+        "height": 161.255859
+      }
     },
     "14-low-resolution-queue.png": {
       "sha256": "174fdb6c482fb4093b11b8a066c9e8b9dee3b9ed3135bddce1924dc9b326ffcc",
@@ -190,7 +268,13 @@
       "edge_density": 0.26665895061728395,
       "palette_ratio": 0.9447145061728395,
       "diagonal_band_low": 0.33254825174772823,
-      "diagonal_band_high": 0.3359990286109931
+      "diagonal_band_high": 0.3359990286109931,
+      "focal_placement": {
+        "x": 434.836975,
+        "y": 186.913834,
+        "width": 90.325745,
+        "height": 123.94191
+      }
     }
   }
 }
