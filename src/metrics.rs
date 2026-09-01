@@ -18,16 +18,16 @@
 //!                             │                  · edge orientation band
 //!                             ▼
 //!                        FrameMetrics ──▶ whole frame + named regions
-//!                             │
-//!                             ▼
-//!                    the gate constants below
 //! ```
 //!
-//! The gate constants come in two kinds and the distinction matters. Some are
-//! measured from the approved reference art; some are engineering contracts
-//! chosen for this hall. Mixing them is how a window ends up tuned to whatever
-//! the engine already produced, which is a gate that can only ever agree with
-//! itself.
+//! This module holds no gate policy. Every numeric bound a fidelity gate is
+//! derived from lives in `docs/reference/fidelity.json` and reaches the code
+//! through `crate::reference`, so a recalibration is a reviewed edit to a
+//! frozen document rather than a constant sitting inside the engine that
+//! measures the thing being judged. What remains here is measurement
+//! mechanics: the palette table, the matching tolerance the nearest-role
+//! classification is defined by, the Sobel threshold, and the stable region
+//! names.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
@@ -387,124 +387,8 @@ pub fn reference_metrics() -> &'static FrameMetrics {
 // Mandatory frame contracts
 // ---------------------------------------------------------------------------
 
-/// Largest share of magenta sentinel a frame may hold.
-///
-/// The sentinel is the clear colour, so any of it on screen means the camera's
-/// ground quadrilateral left the 72 m rendered apron. This is the
-/// rendered-coverage gate.
-pub const SENTINEL_MAX: f64 = 0.001;
-
-/// Absolute mean linear luminance window.
-pub const LUMINANCE_RANGE: (f64, f64) = (0.48, 0.88);
-
-/// How far a frame's mean linear luminance may sit from the approved key art.
-pub const LUMINANCE_REFERENCE_TOLERANCE: f64 = 0.18;
-
-/// Smallest share of pixels within [`PALETTE_TOLERANCE`] of the typed palette.
-pub const PALETTE_MIN: f64 = 0.60;
-
-/// Smallest share of floor tones.
-pub const FLOOR_MIN: f64 = 0.20;
-
-/// Smallest share of rack base and rack shadow tones.
-pub const RACK_MIN: f64 = 0.06;
-
-/// Smallest share of signature yellow.
-pub const YELLOW_MIN: f64 = 0.005;
-
-/// Allowed share of ink and hose charcoal.
-pub const INK_RANGE: (f64, f64) = (0.03, 0.35);
-
-/// Smallest share of strong-edge mass each diagonal band must hold at a
-/// settled heading.
-pub const DIAGONAL_BAND_MIN: f64 = 0.08;
-
-/// Largest nearest-palette histogram L1 distance from the key art.
-pub const HISTOGRAM_MAX: f64 = 0.90;
-
-/// Allowed edge density, as a multiple of the key art's edge density.
-pub const EDGE_DENSITY_RANGE: (f64, f64) = (0.35, 2.5);
-
-/// Smallest share of the projected worker crop each worker identity colour
-/// must cover.
-pub const WORKER_ROLE_MIN: f64 = 0.002;
-
-/// Smallest share of a drawn badge rectangle its own colour must cover.
-pub const BADGE_ROLE_MIN: f64 = 0.10;
-
-/// Smallest share of the queue panel each live state colour must cover.
-pub const HUD_STATE_MIN: f64 = 0.002;
-
-/// Allowed difference between two worker crops playing different clips.
-pub const CLIP_DIFFERENCE_RANGE: (f64, f64) = (0.02, 0.60);
-
-/// Largest share of a frame outside the worker crop that may change between
-/// two captures taken from the same position.
-pub const OUTSIDE_CROP_MAX: f64 = 0.01;
-
 /// The stable region name of the projected worker crop.
 pub const WORKER_REGION: &str = "worker";
-
-#[cfg(test)]
-mod policy_migration_tests {
-    use super::*;
-    use crate::reference::bounds;
-
-    /// The contract and the constants have to agree, bound for bound.
-    ///
-    /// U1 moves policy out of `metrics`, and the only safe way to move a
-    /// calibrated number is to prove the destination holds exactly what the
-    /// source held. This test is what makes the later deletion of these
-    /// constants a refactor rather than a recalibration: while both exist it
-    /// pins them together, and once the constants are gone the contract is
-    /// already the value every gate was measured against.
-    #[test]
-    fn the_fidelity_contract_carries_every_migrated_policy_constant() {
-        let bounds = bounds();
-
-        assert_eq!(bounds.sentinel.max(), SENTINEL_MAX);
-        assert_eq!(bounds.luminance.range(), LUMINANCE_RANGE);
-        assert_eq!(
-            bounds.luminance_reference_tolerance.max(),
-            LUMINANCE_REFERENCE_TOLERANCE
-        );
-        assert_eq!(bounds.palette.min(), PALETTE_MIN);
-        assert_eq!(bounds.floor.min(), FLOOR_MIN);
-        assert_eq!(bounds.rack.min(), RACK_MIN);
-        assert_eq!(bounds.yellow.min(), YELLOW_MIN);
-        assert_eq!(bounds.ink.range(), INK_RANGE);
-        assert_eq!(bounds.diagonal_band.min(), DIAGONAL_BAND_MIN);
-        assert_eq!(bounds.histogram.max(), HISTOGRAM_MAX);
-        assert_eq!(bounds.edge_density.range(), EDGE_DENSITY_RANGE);
-        assert_eq!(bounds.worker_role.min(), WORKER_ROLE_MIN);
-        assert_eq!(bounds.badge_role.min(), BADGE_ROLE_MIN);
-        assert_eq!(bounds.hud_state.min(), HUD_STATE_MIN);
-        assert_eq!(bounds.clip_difference.range(), CLIP_DIFFERENCE_RANGE);
-        assert_eq!(bounds.outside_crop.max(), OUTSIDE_CROP_MAX);
-    }
-
-    /// The embedded contract is the document on disk, not a stale copy.
-    ///
-    /// This proves what `include_str!` can prove and no more: the bytes the
-    /// binary carries are the bytes in the working tree it was built from. It
-    /// is deliberately not a claim about committed state, and it is not the
-    /// frozen G0 hash gate, which does not exist yet.
-    #[test]
-    fn the_embedded_contract_matches_the_document_on_disk() {
-        let committed = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(crate::reference::FIDELITY_CONTRACT_PATH),
-        )
-        .expect("the fidelity contract must be present");
-        let parsed: crate::reference::FidelityContract =
-            serde_json::from_str(&committed).expect("the document on disk must parse");
-        assert_eq!(
-            &parsed,
-            crate::reference::contract(),
-            "the embedded contract has drifted from the committed document"
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Row angle and implied elevation

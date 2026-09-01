@@ -31,10 +31,11 @@ use midcreek_cs_1::{
         KEY_ART_REFERENCE_PATH, KEY_ART_SHA256, PaletteRole, SceneBlueprint,
     },
     metrics::{
-        CLIP_DIFFERENCE_RANGE, FrameMetrics, MeasureSource, OUTSIDE_CROP_MAX, PALETTE_TOLERANCE,
-        PixelRect, SENTINEL_MAX, WORKER_REGION, measure, reference_metrics,
+        FrameMetrics, MeasureSource, PALETTE_TOLERANCE, PixelRect, WORKER_REGION, measure,
+        reference_metrics,
     },
     player::required_player_parts,
+    reference::bounds,
     verification::{
         APP_WATCHDOG, ARTIFACT_NAMES, BadgeFacts, BlueprintFacts, CAPTURE_DELAY_LIMIT,
         CAPTURE_TIMEOUT, CameraRenderFacts, DROP_CAPTURE_TIMEOUT, EQUIPMENT_REGION_MIN_PIXELS,
@@ -1063,7 +1064,7 @@ fn analyzer_rejects_a_magenta_sentinel_border() {
     let fixture = magenta_border_fixture(FIXTURE_WIDTH, FIXTURE_HEIGHT);
     assert_rejects(&fixture, "sentinel-ratio");
     assert!(
-        metrics_of(&fixture).sentinel_ratio > SENTINEL_MAX,
+        metrics_of(&fixture).sentinel_ratio > bounds().sentinel.max(),
         "the fixture must actually contain sentinel pixels"
     );
 }
@@ -1167,7 +1168,7 @@ fn clip_difference_separates_poses_and_ignores_position() {
         }
     }
     assert!(
-        clip_difference(&left, crop, &right, moved) < 0.02,
+        clip_difference(&left, crop, &right, moved) < bounds().clip_difference.min(),
         "the same pose in a different place must not read as a different clip"
     );
 
@@ -1185,9 +1186,9 @@ fn clip_difference_separates_poses_and_ignores_position() {
     }
     let difference = clip_difference(&left, crop, &right, moved);
     assert!(
-        difference > CLIP_DIFFERENCE_RANGE.0,
+        difference > bounds().clip_difference.min(),
         "a changed pose must exceed {}, got {difference}",
-        CLIP_DIFFERENCE_RANGE.0
+        bounds().clip_difference.min()
     );
 }
 
@@ -2184,10 +2185,10 @@ fn animation_clips_change_the_worker_crop_without_changing_the_rest_of_the_frame
             run.crop(right),
         );
         assert!(
-            (CLIP_DIFFERENCE_RANGE.0..=CLIP_DIFFERENCE_RANGE.1).contains(&difference),
+            (bounds().clip_difference.min()..=bounds().clip_difference.max()).contains(&difference),
             "{left:?} against {right:?} differed by {difference}, expected between {} and {}",
-            CLIP_DIFFERENCE_RANGE.0,
-            CLIP_DIFFERENCE_RANGE.1
+            bounds().clip_difference.min(),
+            bounds().clip_difference.max()
         );
     }
 
@@ -2204,8 +2205,9 @@ fn animation_clips_change_the_worker_crop_without_changing_the_rest_of_the_frame
         &[run.crop(repair), run.crop(idle)],
     );
     assert!(
-        change <= OUTSIDE_CROP_MAX,
-        "{change} of the frame outside the worker crop changed, expected at most {OUTSIDE_CROP_MAX}"
+        change <= bounds().outside_crop.max(),
+        "{change} of the frame outside the worker crop changed, expected at most {}",
+        bounds().outside_crop.max()
     );
 }
 

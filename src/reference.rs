@@ -192,3 +192,92 @@ impl FidelityContract {
 pub fn bounds() -> &'static Bounds {
     &contract().bounds
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The contract carries the calibrated number every gate is judged
+    /// against.
+    ///
+    /// These are the values the gates were calibrated with before U1 moved
+    /// them out of `metrics`, written literally on purpose. The contract is
+    /// data, and data with no independent copy can be edited without any test
+    /// noticing. An edit to `fidelity.json` is a recalibration, and after G0 it
+    /// needs authority-only justification and a new near-boundary fixture, so
+    /// it has to fail here first rather than quietly move a gate.
+    #[test]
+    fn the_contract_pins_every_calibrated_bound() {
+        let bounds = bounds();
+
+        assert_eq!(bounds.sentinel.max(), 0.001);
+        assert_eq!(bounds.luminance.range(), (0.48, 0.88));
+        assert_eq!(bounds.luminance_reference_tolerance.max(), 0.18);
+        assert_eq!(bounds.palette.min(), 0.60);
+        assert_eq!(bounds.floor.min(), 0.20);
+        assert_eq!(bounds.rack.min(), 0.06);
+        assert_eq!(bounds.yellow.min(), 0.005);
+        assert_eq!(bounds.ink.range(), (0.03, 0.35));
+        assert_eq!(bounds.diagonal_band.min(), 0.08);
+        assert_eq!(bounds.histogram.max(), 0.90);
+        assert_eq!(bounds.edge_density.range(), (0.35, 2.5));
+        assert_eq!(bounds.worker_role.min(), 0.002);
+        assert_eq!(bounds.badge_role.min(), 0.10);
+        assert_eq!(bounds.hud_state.min(), 0.002);
+        assert_eq!(bounds.clip_difference.range(), (0.02, 0.60));
+        assert_eq!(bounds.outside_crop.max(), 0.01);
+    }
+
+    /// The embedded contract is the document on disk, not a stale copy.
+    ///
+    /// This proves what [`include_str!`] can prove and no more: the bytes the
+    /// binary carries are the bytes in the working tree it was built from. It
+    /// is deliberately not a claim about committed state, and it is not the
+    /// frozen G0 hash gate, which does not exist yet.
+    #[test]
+    fn the_embedded_contract_matches_the_document_on_disk() {
+        let on_disk = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIDELITY_CONTRACT_PATH),
+        )
+        .expect("the fidelity contract must be present");
+        let parsed: FidelityContract =
+            serde_json::from_str(&on_disk).expect("the document on disk must parse");
+        assert_eq!(
+            &parsed,
+            contract(),
+            "the embedded contract has drifted from the document on disk"
+        );
+    }
+
+    /// A contract that cannot be honoured is a broken build, not a failing
+    /// gate.
+    #[test]
+    fn validation_refuses_an_unusable_contract() {
+        let mut inverted = contract().clone();
+        inverted.bounds.luminance = Bound {
+            min: Some(0.9),
+            max: Some(0.1),
+        };
+        assert!(
+            inverted.validate().is_err(),
+            "a floor above its ceiling rejects every measurement and must be refused"
+        );
+
+        let mut empty = contract().clone();
+        empty.bounds.palette = Bound {
+            min: None,
+            max: None,
+        };
+        assert!(
+            empty.validate().is_err(),
+            "a bound with neither side is a gate with nothing to judge against"
+        );
+
+        let mut future = contract().clone();
+        future.schema_version = SUPPORTED_SCHEMA_VERSION + 1;
+        assert!(
+            future.validate().is_err(),
+            "a version this code cannot read may carry a bound it never applies"
+        );
+    }
+}

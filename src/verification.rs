@@ -93,10 +93,8 @@ use crate::{
         TicketQueuePanel, badge_half_extents,
     },
     metrics::{
-        BADGE_ROLE_MIN, DIAGONAL_BAND_MIN, EDGE_DENSITY_RANGE, FLOOR_MIN, FrameMetrics,
-        HISTOGRAM_MAX, HUD_STATE_MIN, INK_RANGE, LUMINANCE_RANGE, LUMINANCE_REFERENCE_TOLERANCE,
-        MeasureSource, PALETTE_MIN, PALETTE_TOLERANCE, PixelRect, RACK_MIN, SENTINEL_MAX,
-        WORKER_REGION, WORKER_ROLE_MIN, YELLOW_MIN, palette_table, squared_distance,
+        FrameMetrics, MeasureSource, PALETTE_TOLERANCE, PixelRect, WORKER_REGION, palette_table,
+        squared_distance,
     },
     operations::{
         FAULT_INTERVAL, FAULT_SCHEDULER_SEED, FaultScheduler, InteractionOutcome, LastInteraction,
@@ -4427,6 +4425,26 @@ pub fn evaluate_frame(
     let mut failures = Vec::new();
     let (width, height) = frame.size();
 
+    // Every bound below is read from the committed fidelity contract rather
+    // than from a constant in `metrics`, which measures images and holds no
+    // policy. They are bound to locals so the failure messages can keep naming
+    // the number they were judged against inline.
+    let bounds = crate::reference::bounds();
+    let sentinel_max = bounds.sentinel.max();
+    let luminance_range = bounds.luminance.range();
+    let luminance_reference_tolerance = bounds.luminance_reference_tolerance.max();
+    let palette_min = bounds.palette.min();
+    let floor_min = bounds.floor.min();
+    let rack_min = bounds.rack.min();
+    let yellow_min = bounds.yellow.min();
+    let ink_range = bounds.ink.range();
+    let diagonal_band_min = bounds.diagonal_band.min();
+    let histogram_max = bounds.histogram.max();
+    let edge_density_range = bounds.edge_density.range();
+    let worker_role_min = bounds.worker_role.min();
+    let badge_role_min = bounds.badge_role.min();
+    let hud_state_min = bounds.hud_state.min();
+
     if metrics.width != width || metrics.height != height {
         failures.push(failure(
             name,
@@ -4440,95 +4458,95 @@ pub fn evaluate_frame(
         failures.push(failure(name, "artifact-name", 0.0, name.to_owned()));
     }
 
-    if metrics.sentinel_ratio > SENTINEL_MAX {
+    if metrics.sentinel_ratio > sentinel_max {
         failures.push(failure(
             name,
             "sentinel-ratio",
             metrics.sentinel_ratio,
-            format!("at most {SENTINEL_MAX}; the ground quadrilateral left the rendered apron"),
+            format!("at most {sentinel_max}; the ground quadrilateral left the rendered apron"),
         ));
     }
 
     let luminance = metrics.mean_linear_luminance;
-    if luminance < LUMINANCE_RANGE.0 || luminance > LUMINANCE_RANGE.1 {
+    if luminance < luminance_range.0 || luminance > luminance_range.1 {
         failures.push(failure(
             name,
             "mean-linear-luminance",
             luminance,
-            format!("between {} and {}", LUMINANCE_RANGE.0, LUMINANCE_RANGE.1),
+            format!("between {} and {}", luminance_range.0, luminance_range.1),
         ));
     }
     let drift = (luminance - reference.mean_linear_luminance).abs();
-    if drift > LUMINANCE_REFERENCE_TOLERANCE {
+    if drift > luminance_reference_tolerance {
         failures.push(failure(
             name,
             "luminance-drift-from-key-art",
             drift,
-            format!("at most {LUMINANCE_REFERENCE_TOLERANCE}"),
+            format!("at most {luminance_reference_tolerance}"),
         ));
     }
 
-    if metrics.palette_ratio < PALETTE_MIN {
+    if metrics.palette_ratio < palette_min {
         failures.push(failure(
             name,
             "palette-ratio",
             metrics.palette_ratio,
-            format!("at least {PALETTE_MIN}"),
+            format!("at least {palette_min}"),
         ));
     }
 
     let floor = metrics.nearest_of(&[PaletteRole::FloorLight, PaletteRole::FloorShadow]);
-    if floor < FLOOR_MIN {
+    if floor < floor_min {
         failures.push(failure(
             name,
             "floor-ratio",
             floor,
-            format!("at least {FLOOR_MIN}"),
+            format!("at least {floor_min}"),
         ));
     }
     let rack = metrics.nearest_of(&[PaletteRole::RackWhite, PaletteRole::RackShadow]);
-    if rack < RACK_MIN {
+    if rack < rack_min {
         failures.push(failure(
             name,
             "rack-ratio",
             rack,
-            format!("at least {RACK_MIN}"),
+            format!("at least {rack_min}"),
         ));
     }
     let yellow = metrics.nearest(PaletteRole::SignatureYellow);
-    if yellow < YELLOW_MIN {
+    if yellow < yellow_min {
         failures.push(failure(
             name,
             "signature-yellow-ratio",
             yellow,
-            format!("at least {YELLOW_MIN}"),
+            format!("at least {yellow_min}"),
         ));
     }
     let ink = metrics.nearest_of(&[PaletteRole::Ink, PaletteRole::HoseCharcoal]);
-    if ink < INK_RANGE.0 || ink > INK_RANGE.1 {
+    if ink < ink_range.0 || ink > ink_range.1 {
         failures.push(failure(
             name,
             "ink-and-hose-ratio",
             ink,
-            format!("between {} and {}", INK_RANGE.0, INK_RANGE.1),
+            format!("between {} and {}", ink_range.0, ink_range.1),
         ));
     }
 
     if frame.is_settled() {
-        if metrics.diagonal_band_low < DIAGONAL_BAND_MIN {
+        if metrics.diagonal_band_low < diagonal_band_min {
             failures.push(failure(
                 name,
                 "diagonal-edge-band-30-50",
                 metrics.diagonal_band_low,
-                format!("at least {DIAGONAL_BAND_MIN}"),
+                format!("at least {diagonal_band_min}"),
             ));
         }
-        if metrics.diagonal_band_high < DIAGONAL_BAND_MIN {
+        if metrics.diagonal_band_high < diagonal_band_min {
             failures.push(failure(
                 name,
                 "diagonal-edge-band-130-150",
                 metrics.diagonal_band_high,
-                format!("at least {DIAGONAL_BAND_MIN}"),
+                format!("at least {diagonal_band_min}"),
             ));
         }
     }
@@ -4538,23 +4556,23 @@ pub fn evaluate_frame(
     }
 
     let distance = metrics.histogram_distance(reference);
-    if distance > HISTOGRAM_MAX {
+    if distance > histogram_max {
         failures.push(failure(
             name,
             "key-art-histogram-distance",
             distance,
-            format!("at most {HISTOGRAM_MAX}"),
+            format!("at most {histogram_max}"),
         ));
     }
     let density = metrics.edge_density / reference.edge_density;
-    if density < EDGE_DENSITY_RANGE.0 || density > EDGE_DENSITY_RANGE.1 {
+    if density < edge_density_range.0 || density > edge_density_range.1 {
         failures.push(failure(
             name,
             "edge-density-vs-key-art",
             density,
             format!(
                 "between {} and {} times the key art",
-                EDGE_DENSITY_RANGE.0, EDGE_DENSITY_RANGE.1
+                edge_density_range.0, edge_density_range.1
             ),
         ));
     }
@@ -4564,12 +4582,12 @@ pub fn evaluate_frame(
         Some(worker) => {
             for role in [PaletteRole::WorkerHardHat, PaletteRole::WorkerHiVis] {
                 let share = worker.near(role);
-                if share < WORKER_ROLE_MIN {
+                if share < worker_role_min {
                     failures.push(failure(
                         name,
                         &format!("worker-crop-{role:?}"),
                         share,
-                        format!("at least {WORKER_ROLE_MIN} of the projected worker crop"),
+                        format!("at least {worker_role_min} of the projected worker crop"),
                     ));
                 }
             }
@@ -4588,12 +4606,12 @@ pub fn evaluate_frame(
             None => failures.push(failure(name, &region, 0.0, "a measured badge rectangle")),
             Some(measured) => {
                 let share = measured.near(role);
-                if share < BADGE_ROLE_MIN {
+                if share < badge_role_min {
                     failures.push(failure(
                         name,
                         &format!("{region}-{role:?}"),
                         share,
-                        format!("at least {BADGE_ROLE_MIN} of the badge rectangle"),
+                        format!("at least {badge_role_min} of the badge rectangle"),
                     ));
                 }
             }
@@ -4620,12 +4638,12 @@ pub fn evaluate_frame(
         states.dedup();
         for role in states {
             let share = queue.near(role);
-            if share < HUD_STATE_MIN {
+            if share < hud_state_min {
                 failures.push(failure(
                     name,
                     &format!("hud-queue-{role:?}"),
                     share,
-                    format!("at least {HUD_STATE_MIN} of the queue panel"),
+                    format!("at least {hud_state_min} of the queue panel"),
                 ));
             }
         }
