@@ -2004,10 +2004,6 @@ fn rendered_run_captured_the_documented_camera_and_hud_state() {
 
 #[test]
 // Issue #6: Windows DX12 WARP capture pixels are unstable, so this fidelity proof is unproven.
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "issue #6: DX12 WARP pixels are unstable, so Phase 1 fidelity is unproven"
-)]
 fn every_captured_frame_meets_every_mandatory_visual_contract() {
     let run = rendered_run();
     let reference = reference_metrics();
@@ -2939,10 +2935,6 @@ fn category_best_share(
 
 #[test]
 // Issue #6: Windows DX12 WARP capture pixels are unstable, so these margins are unproven.
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "issue #6: DX12 WARP pixels are unstable, so equipment margins are unproven"
-)]
 fn every_center_frame_carries_real_equipment_pixels_with_margin() {
     let run = rendered_run();
     let mut report = Vec::new();
@@ -3003,10 +2995,9 @@ fn every_center_frame_carries_real_equipment_pixels_with_margin() {
 }
 
 #[test]
-// Issue #6: Windows DX12 WARP capture pixels are unstable, so masking isolation is unproven.
 #[cfg_attr(
     target_os = "windows",
-    ignore = "issue #6: DX12 WARP pixels are unstable, so category isolation is unproven"
+    ignore = "issue #7: masking isolation fails on DX12 WARP for an unproven reason"
 )]
 fn masking_one_equipment_category_fails_that_category_alone() {
     let run = rendered_run();
@@ -3097,10 +3088,6 @@ fn masking_one_equipment_category_fails_that_category_alone() {
 
 #[test]
 // Issue #6: Windows DX12 WARP capture pixels are unstable, so row isolation is unproven.
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "issue #6: DX12 WARP pixels are unstable, so rack row isolation is unproven"
-)]
 fn masking_one_rack_row_fails_only_that_rack_row() {
     let run = rendered_run();
     for frame in CENTER_FRAMES {
@@ -3196,10 +3183,6 @@ fn every_rack_row_is_measured_on_at_least_three_centre_frames() {
 
 #[test]
 // Issue #6: Windows DX12 WARP capture pixels are unstable, so cart isolation is unproven.
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "issue #6: DX12 WARP pixels are unstable, so cart isolation is unproven"
-)]
 fn hiding_the_utility_cart_passes_every_global_contract_and_fails_the_equipment_one() {
     let run = rendered_run();
     let frame = FrameName::HealthyCenterNorthEast;
@@ -3296,10 +3279,9 @@ fn slow_rendered_run() -> &'static RenderedRun {
 /// child to be the control would spend a whole cold software-rendered run —
 /// tens of seconds on llvmpipe — re-establishing something already on disk.
 #[test]
-// Issue #6: Windows DX12 WARP changes pixel hashes when readback timing changes.
 #[cfg_attr(
     target_os = "windows",
-    ignore = "issue #6: DX12 WARP evidence varies with readback timing"
+    ignore = "issue #7: readback cost flips silhouette-edge pixels on DX12 WARP"
 )]
 fn the_readback_pump_count_never_reaches_the_evidence() {
     let quick = rendered_run();
@@ -4126,11 +4108,15 @@ fn the_parent_watchdog_kills_the_exact_child_and_keeps_its_artifacts() {
     fs::create_dir_all(&root).expect("the render contract owns target/render-contract");
     // The cap here is a fast test override, not the production one. Production
     // is `PARENT_WATCHDOG`, and waiting it out would add over fourteen minutes
-    // to prove a kill that is provable in ten seconds: what is under
+    // to prove a kill that is provable in under a minute: what is under
     // test is that the parent kills *that exact child process* and keeps its
     // artifacts, which is the same code path at any cap. The child has had its
     // own watchdog disabled by the injected fault, so nothing else can stop it.
-    const HANG_PARENT_CAP: Duration = Duration::from_secs(10);
+    // The cap has to outlast one real capture, though, because the assertion
+    // below is about a frame that already landed: booting the game, loading
+    // every generated asset, and compiling the mesh pipelines synchronously on
+    // a software adapter is what that first frame costs.
+    const HANG_PARENT_CAP: Duration = Duration::from_secs(60);
     assert!(HANG_PARENT_CAP < PARENT_WATCHDOG);
     let launched = launch(&root, Some(VerificationFault::Hang), HANG_PARENT_CAP);
 
@@ -4142,7 +4128,9 @@ fn the_parent_watchdog_kills_the_exact_child_and_keeps_its_artifacts() {
     assert!(
         root.join(FrameName::HealthyCenterNorthEast.file_name())
             .is_file(),
-        "a killed run must keep the frames it already captured"
+        "a killed run must keep the frames it already captured; if this fires on a \
+         colder machine the cause is {HANG_PARENT_CAP:?} being too short for the \
+         first capture rather than artifact retention being broken"
     );
     let _ = fs::remove_dir_all(&root);
 }

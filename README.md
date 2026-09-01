@@ -841,11 +841,19 @@ the render contract runs the whole journey twice with different values and
 requires the canonical report to match byte for byte and all fourteen decoded
 pixel rasters to match exactly.
 
-Windows DX12 WARP pixel fidelity and delayed-readback pixel reproducibility are
-quarantined under issue #6. Six pixel-level tests are reported as ignored on
-Windows rather than passed; semantic journey, artifact, timeout, failure, and
-report reproducibility contracts remain active. G0 must not freeze a Phase 1
-visual baseline until issue #6 is resolved and those tests run normally.
+Windows DX12 WARP has two remaining contract failures tracked in issue #7. One
+is equipment-category masking isolation. The other is pixel reproducibility:
+two journeys that differ only in injected readback cost produce one to two
+differing pixels on roughly four of the fourteen frames, and the affected set
+moves between runs. With `Msaa::Off` these are binary coverage flips on
+silhouette edges, where a pixel takes `INK` instead of the neighbouring fill.
+Those two tests are reported as ignored on Windows rather than passed, and they
+still execute on every other platform.
+
+Captured pixels are therefore not yet a pure function of game state on this
+adapter. G0 must not freeze a Phase 1 visual baseline until issue #7 is
+resolved and those tests run normally, because a frozen baseline would encode
+which render pump each readback happened to land on.
 
 ### The software compatibility render profile
 

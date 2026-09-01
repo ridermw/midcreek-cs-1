@@ -135,6 +135,14 @@ pub fn run_verification(
                 render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
                     verification_wgpu_settings(),
                 )),
+                // Asynchronous pipeline compilation lets a frame draw without
+                // the pipeline it needs, which a software adapter is slow
+                // enough to expose: the first two captures came back carrying
+                // the HUD over an empty hall while the mesh pipelines were
+                // still compiling. A capture is a photograph of a named
+                // moment, so it has to wait for the pipeline rather than
+                // record its absence.
+                synchronous_pipeline_compilation: true,
                 ..default()
             })
             .set(runtime_asset_plugin()),
@@ -162,8 +170,9 @@ pub fn run_verification(
 /// `GpuPreprocessingSupport` report `GpuPreprocessingMode::None`, and the CPU
 /// mesh uniform path draws the world correctly.
 ///
-/// This is the second render setting verification changes, after
-/// [`verification::VERIFICATION_MSAA`], and unlike MSAA it is not cosmetic: a
+/// This is the third render setting verification changes, after
+/// [`verification::VERIFICATION_MSAA`] and synchronous pipeline compilation,
+/// and unlike MSAA it is not cosmetic: a
 /// captured frame is drawn through the software compatibility profile rather
 /// than through the native default path the shipped game uses on real
 /// hardware. The captured hall, camera, materials, and palette are the
