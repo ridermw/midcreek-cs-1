@@ -8,6 +8,39 @@ Items here were considered and deferred during the plan-exit review of
 
 ---
 
+## Do not add `[profile.dev.package."*"] opt-level = 3`
+
+**What.** U2 books adding optimized dependency builds to the dev profile, after
+measuring the compile-versus-capture split. The measurement was taken on
+2026-09-02 and argues against it.
+
+**Measurement.**
+
+| quantity | value |
+| --- | --- |
+| Incremental rebuild of every test binary after touching `src/lib.rs` | 60.9 s |
+| One software-rendered journey, dev profile | ~215 s |
+| One software-rendered journey, release profile | ~143 s |
+| Full serialized `render_contract` | ~774 s |
+
+Capture dominates a warm gate run by roughly an order of magnitude, so the
+change would not help compile time. It would help capture, because the game
+itself would run optimized, worth perhaps 70 s per journey.
+
+**Why not.** `.cargo/config.toml` records that CI does not cache target
+artifacts, and the workflow already runs a `Release build` gate. Optimizing dev
+dependencies would therefore make CI build the whole dependency graph optimized
+**twice** on every run, once for the dev profile and once for release. The
+release build alone measured 18 m 49 s from cold. That trade is clearly
+negative for CI: it buys back a few minutes of capture and spends far more on
+compilation.
+
+**If revisited.** It is a local-developer optimization only, and belongs in a
+personal `config.toml` rather than the committed one. Do not commit it without
+first making CI cache target artifacts, which changes the trade entirely.
+
+---
+
 ## Widen reference_metrics to the union of contract regions
 
 **What.** Make `reference_metrics()` (`src/metrics.rs`) compute the approved key
