@@ -956,7 +956,7 @@ pub fn update_player_animation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::design::{AISLE_CENTER_X, CAMERA_OFFSET_DIRECTION, RACK_ROW_X};
+    use crate::design::{AISLE_CENTER_X, RACK_ROW_X, camera_offset_proportions};
 
     const HEADINGS: [f32; 4] = [45.0, 135.0, 225.0, 315.0];
 
@@ -983,7 +983,7 @@ mod tests {
         assert_eq!(basis.yaw_degrees(), INITIAL_CAMERA_YAW_DEGREES);
         assert!(close(
             basis.camera_offset(),
-            CAMERA_OFFSET_DIRECTION.xz().normalize()
+            camera_offset_proportions().xz().normalize()
         ));
         assert!(close(basis.forward(), Vec2::new(-0.70710677, -0.70710677)));
         assert!(close(basis.right(), Vec2::new(0.70710677, -0.70710677)));

@@ -150,16 +150,20 @@ fn the_contract_row_angle_is_what_the_authority_image_measures() {
     // Tight, because this is not a tolerance: it is the assertion that the
     // number frozen in the contract is the number the authority image produces
     // rather than one typed in beside it. The band below is the tolerance.
+    //
+    // `row_degrees` rather than `low_degrees`: it is the mean of the two
+    // mirrored families, which cancels the bias either one carries alone, and
+    // it is what `elevation_degrees` derives from.
     assert!(
-        (angle.low_degrees - calibrated.value()).abs() < 1.0e-9,
+        (angle.row_degrees() - calibrated.value()).abs() < 1.0e-9,
         "the contract pins {} but the key art measures {}",
         calibrated.value(),
-        angle.low_degrees
+        angle.row_degrees()
     );
     assert!(
-        (calibrated.min()..=calibrated.max()).contains(&angle.low_degrees),
+        (calibrated.min()..=calibrated.max()).contains(&angle.row_degrees()),
         "the measured row angle {} must lie inside its own reviewed tolerance {:?}",
-        angle.low_degrees,
+        angle.row_degrees(),
         calibrated.range()
     );
 }

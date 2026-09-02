@@ -302,7 +302,7 @@ mod tests {
     fn the_contract_pins_every_calibrated_bound() {
         let bounds = bounds();
 
-        assert_eq!(bounds.projected_row_angle.value(), 30.533_256_422_850_364);
+        assert_eq!(bounds.projected_row_angle.value(), 30.505_530_591_671_54);
         assert_eq!(bounds.projected_row_angle.range(), (25.0, 35.0));
         assert_eq!(bounds.sentinel.max(), 0.001);
         assert_eq!(bounds.luminance.range(), (0.48, 0.88));
