@@ -8,6 +8,40 @@ Items here were considered and deferred during the plan-exit review of
 
 ---
 
+## Splitting `CornerProbes` forces a Phase 1 baseline rebind
+
+**What.** U2 books splitting the `CornerProbes` stage, which emits four frames
+from one stage, so the continuous profile can take `CornerNorthEast` alone.
+Before starting, know that it is not a local change to the stage machine.
+
+**Why it is coupled.** The stage name is recorded per frame and in the `stages`
+array of every verification report. Splitting it therefore touches:
+
+* `src/verification.rs`: the enum, the transition table, `name`, the
+  stage-to-frame mapping, and the driver arm.
+* `docs/reference/phase-1-baseline/report.json`, the committed baseline run,
+  which records `corner-probes` for frames 10 through 13 and in its stage list.
+  After the split that report describes a stage machine that no longer exists.
+* `tests/fixtures/sitegen/verification/report.json` and `failed-report.json`,
+  which carry the same names and are the inputs the publication contracts run
+  against.
+* The stage diagrams in `README.md` and `docs/implementation-plan.md`.
+
+**The decision it forces.** The baseline's composition vector is stable across
+journeys, so re-taking it is safe, but a rebind changes every pinned `sha256`
+and the committed frames. Either accept that the baseline report documents a
+superseded stage machine, which weakens its value as provenance, or rebind the
+baseline as part of the split and say so in the commit.
+
+**Recommendation.** Rebind. The baseline exists to be the thing M0.5 and M1 are
+measured against, and a baseline whose journey definition no longer matches the
+code is exactly the kind of stale authority G0 must not freeze.
+
+**Depends on.** Nothing technically. Sequence it early in U2, before any other
+journey change, so the rebind happens once.
+
+---
+
 ## Do not add `[profile.dev.package."*"] opt-level = 3`
 
 **What.** U2 books adding optimized dependency builds to the dev profile, after
