@@ -7,6 +7,9 @@
       "min": 25.0,
       "max": 35.0
     },
+    "diagonal_band_half_width": {
+      "value": 10.0
+    },
     "sentinel": {
       "max": 0.001
     },

@@ -4540,7 +4540,7 @@ pub fn evaluate_frame(
         if metrics.diagonal_band_low < diagonal_band_min {
             failures.push(failure(
                 name,
-                "diagonal-edge-band-30-50",
+                "diagonal-edge-band-low",
                 metrics.diagonal_band_low,
                 format!("at least {diagonal_band_min}"),
             ));
@@ -4548,7 +4548,7 @@ pub fn evaluate_frame(
         if metrics.diagonal_band_high < diagonal_band_min {
             failures.push(failure(
                 name,
-                "diagonal-edge-band-130-150",
+                "diagonal-edge-band-high",
                 metrics.diagonal_band_high,
                 format!("at least {diagonal_band_min}"),
             ));

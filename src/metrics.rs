@@ -171,6 +171,10 @@ impl FrameMetrics {
         let mut edge_mass = 0.0;
         let mut band_low = 0.0;
         let mut band_high = 0.0;
+        // The diagonal windows are centred on the authority's projected
+        // ground-axis angle rather than on a literal, so a camera that matches
+        // the reference lands its rows mid-window instead of at the edge.
+        let (low_window, high_window) = crate::reference::diagonal_band_windows();
 
         let names = regions.keys().cloned().collect::<Vec<_>>();
         let rects = names.iter().map(|name| regions[name]).collect::<Vec<_>>();
@@ -278,9 +282,9 @@ impl FrameMetrics {
                 // gradient turned a quarter turn, and only its axis matters.
                 let direction =
                     (gradient_x.atan2(-gradient_y).to_degrees() + 180.0).rem_euclid(180.0);
-                if (30.0..50.0).contains(&direction) {
+                if low_window.contains(&direction) {
                     band_low += magnitude;
-                } else if (130.0..150.0).contains(&direction) {
+                } else if high_window.contains(&direction) {
                     band_high += magnitude;
                 }
             }

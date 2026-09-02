@@ -144,6 +144,15 @@ pub struct Bounds {
     /// asserted before the value was frozen here, so it is a reviewed number
     /// rather than one chosen to fit.
     pub projected_row_angle: Bound,
+    /// Half-width of the two diagonal edge windows, in degrees.
+    ///
+    /// The windows are centred on [`Bounds::projected_row_angle`] and its
+    /// mirror, because that is where a correctly projected ground axis lands.
+    /// They used to be hard-coded as 30 to 50 and 130 to 150, which is 40
+    /// degrees plus or minus this half-width: 40 is where the POC's 57-degree
+    /// camera put its axes, so the windows silently encoded the camera the
+    /// authority image disagrees with.
+    pub diagonal_band_half_width: Bound,
     pub sentinel: Bound,
     pub luminance: Bound,
     pub luminance_reference_tolerance: Bound,
@@ -164,9 +173,10 @@ pub struct Bounds {
 
 impl Bounds {
     /// Every bound beside the name the contract spells it with.
-    fn named(&self) -> [(&'static str, Bound); 17] {
+    fn named(&self) -> [(&'static str, Bound); 18] {
         [
             ("projected_row_angle", self.projected_row_angle),
+            ("diagonal_band_half_width", self.diagonal_band_half_width),
             ("sentinel", self.sentinel),
             ("luminance", self.luminance),
             (
@@ -270,6 +280,22 @@ pub fn bounds() -> &'static Bounds {
     &contract().bounds
 }
 
+/// The two diagonal edge windows, in screen degrees.
+///
+/// Both are centred on the authority's projected ground-axis angle rather than
+/// on a literal, so a camera that matches the reference puts its rows in the
+/// middle of the window instead of at its edge.
+#[must_use]
+pub fn diagonal_band_windows() -> (std::ops::Range<f64>, std::ops::Range<f64>) {
+    let bounds = bounds();
+    let centre = bounds.projected_row_angle.value();
+    let half = bounds.diagonal_band_half_width.value();
+    (
+        (centre - half)..(centre + half),
+        (180.0 - centre - half)..(180.0 - centre + half),
+    )
+}
+
 /// The approved hash of one vendored reference image.
 ///
 /// Panics on an unknown path: the manifest is committed repository data, so a
@@ -304,6 +330,7 @@ mod tests {
 
         assert_eq!(bounds.projected_row_angle.value(), 30.505_530_591_671_54);
         assert_eq!(bounds.projected_row_angle.range(), (25.0, 35.0));
+        assert_eq!(bounds.diagonal_band_half_width.value(), 10.0);
         assert_eq!(bounds.sentinel.max(), 0.001);
         assert_eq!(bounds.luminance.range(), (0.48, 0.88));
         assert_eq!(bounds.luminance_reference_tolerance.max(), 0.18);
