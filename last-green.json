@@ -1,0 +1,34 @@
+{
+  "source_commit": "19716a91e23a229700738827dfab10a72cca27ea",
+  "semantic_visual_hash": "532d35a53d2a181e9eeec772f1468cfa826c9c7ff30319863f2a77aefc5a99eb",
+  "game_files": [
+    "play/assets/generated/cooling-unit.glb",
+    "play/assets/generated/infrastructure.glb",
+    "play/assets/generated/rack.glb",
+    "play/assets/generated/technician.glb",
+    "play/assets/generated/utility-props.glb",
+    "play/game.js",
+    "play/game_bg.wasm",
+    "play/index.html",
+    "play/play.css",
+    "play/play.js"
+  ],
+  "screenshot_files": [
+    "screenshots/current/01-healthy-center-ne.png",
+    "screenshots/current/02-fault-queue-ne.png",
+    "screenshots/current/03-walk-ne.png",
+    "screenshots/current/04-repairing-ne.png",
+    "screenshots/current/05-resolved-ne.png",
+    "screenshots/current/06-settled-se.png",
+    "screenshots/current/07-settled-sw.png",
+    "screenshots/current/08-settled-nw.png",
+    "screenshots/current/09-mid-orbit.png",
+    "screenshots/current/10-corner-ne.png",
+    "screenshots/current/11-corner-se.png",
+    "screenshots/current/12-corner-sw.png",
+    "screenshots/current/13-corner-nw.png",
+    "screenshots/current/14-low-resolution-queue.png",
+    "screenshots/current/browser-canvas.png",
+    "screenshots/current/worker-crop.png"
+  ]
+}

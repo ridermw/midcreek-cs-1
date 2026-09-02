@@ -1,0 +1,1151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Live implementation status for the Cell Shift Data Center POC.">
+  <title>Cell Shift Data Center POC &mdash; Progress Hub</title>
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <header class="status-strip" id="build-status">
+    <a class="brand" href="#top" aria-label="Cell Shift progress hub home">
+      <span class="brand-mark">CS</span>
+      <span>Progress Hub</span>
+    </a>
+    <div class="status-grid"><div class="status-item"><span>Source</span><strong>19716a91</strong></div>
+        <div class="status-item"><span>Native</span><strong class="status-passed">Passed</strong></div>
+        <div class="status-item"><span>Web</span><strong class="status-passed">Passed</strong></div>
+        <div class="status-item status-current"><span>Working now</span><strong>Add CI and publish the reproducible POC baseline</strong></div>
+        <div class="status-item"><span>Updated</span><strong>2026-09-02T00:16:53-04:00</strong></div></div>
+  </header>
+
+  <div class="page-shell" id="top">
+    <aside class="rail">
+      <nav aria-label="Progress hub sections">
+        <a href="#play">Play</a>
+        <a href="#comparison">Compare</a>
+        <a href="#progress">Progress</a>
+        <a href="#screenshots">Screens</a>
+        <a href="#plan">Plan</a>
+        <a href="#challenges">Challenges</a>
+        <a href="#tests">Tests</a>
+        <a href="#commits">Commits</a>
+      </nav>
+    </aside>
+
+    <main>
+      <section class="hero">
+        <div>
+          <span class="eyebrow">Live build record</span>
+          <h1>Cell Shift Data Center POC</h1>
+          <p>A public, source-backed view of what is done, what is being built, what is blocked, and how the game is tracking toward the approved cel-shift direction.</p>
+        </div>
+        <!--mode--><div class="hero-badge" aria-label="Current publication mode">
+          <span>Mode</span>
+          <strong>Verified</strong>
+          <small>Playable build and current evidence</small>
+        </div><!--/mode-->
+      </section>
+
+      <section class="panel section-panel" id="play">
+        <div class="section-heading">
+          <div><span class="section-number">01</span><span class="eyebrow">Playable build</span></div>
+          <h2>Play</h2>
+        </div>
+        <!--play--><div class="play-frame play-frame-live">
+          <iframe class="play-embed" src="play/index.html" title="Playable Cell Shift data centre build" loading="lazy"></iframe>
+        </div>
+        <div class="control-strip" aria-label="Game controls">
+          <span><kbd>Arrow keys</kbd> Move</span>
+          <span><kbd>Q</kbd>/<kbd>E</kbd> Orbit</span>
+          <span><kbd>Space</kbd> Repair</span>
+        </div>
+        <dl class="provenance">
+          <div><dt>Playable build</dt><dd><code>19716a91</code></dd></div>
+          <div><dt>Proof</dt><dd><a href="https://github.com/ridermw/midcreek-cs-1/actions/runs/33590215810">Browser gate run</a></dd></div>
+          <div><dt>Direct link</dt><dd><a href="play/index.html">Open the playable build</a></dd></div>
+        </dl><!--/play-->
+      </section>
+
+      <section class="panel section-panel" id="comparison">
+        <div class="section-heading">
+          <div><span class="section-number">02</span><span class="eyebrow">Visual direction</span></div>
+          <h2>Approved target vs. current proof</h2>
+        </div>
+        <div class="comparison-grid">
+          <article class="comparison-card comparison-card-wide">
+            <div class="panel-heading"><span class="eyebrow">Key art / current frame</span><span class="pending-chip">Current frame verified</span></div>
+            <div class="comparison-stage" data-comparison style="--comparison: 50%">
+              <div class="comparison-layer comparison-reference">
+                <img src="reference/cel-shift-key-art.png" alt="Approved Cel Shift key art reference">
+              </div>
+              <div class="comparison-layer comparison-current" data-comparison-current>
+                <img src="screenshots/current/01-healthy-center-ne.png" alt="Current verified Cell Shift game frame at the healthy north-east heading">
+              </div>
+              <input data-compare-control type="range" min="0" max="100" value="50" aria-label="Reveal approved key art versus the current frame">
+            </div>
+            <p class="sr-only">The approved key art and the current verified game frame are shown under one slider.</p>
+            <dl class="provenance">
+          <div><dt>Source</dt><dd><code>../midcreek-concept/themes/cel-shift/masters/key-art/04-diamond-bright.png</code></dd></div>
+          <div><dt>Repository</dt><dd><code>docs/reference/cel-shift-key-art.png</code></dd></div>
+          <div><dt>SHA-256</dt><dd><code>a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75</code></dd></div>
+        </dl>
+          </article>
+          <article class="comparison-card">
+            <div class="panel-heading"><span class="eyebrow">Character target</span><span class="pending-chip">Worker crop verified</span></div>
+            <div class="character-comparison">
+              <img src="reference/cel-shift-character-sheet.png" alt="Approved Cel Shift technician character sheet">
+              <img src="screenshots/current/worker-crop.png" alt="Current verified technician crop taken from the reported worker rectangle">
+            </div>
+            <p class="sr-only">The approved character sheet is shown beside the crop the report projected.</p>
+            <dl class="provenance">
+          <div><dt>Source</dt><dd><code>../midcreek-concept/themes/cel-shift/masters/animation/01-model-sheet.png</code></dd></div>
+          <div><dt>Repository</dt><dd><code>docs/reference/cel-shift-character-sheet.png</code></dd></div>
+          <div><dt>SHA-256</dt><dd><code>8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25</code></dd></div>
+        </dl>
+            <figure class="browser-proof"><img src="screenshots/current/browser-canvas.png" alt="Canvas region the headless browser captured from the packaged game"><figcaption>Headless browser canvas</figcaption></figure>
+          </article>
+        </div>
+      </section>
+
+      <section class="section-panel" id="progress">
+        <div class="section-heading">
+          <div><span class="section-number">03</span><span class="eyebrow">Canonical task graph</span></div>
+          <h2>Progress</h2>
+        </div>
+        <div class="progress-grid"><section class="progress-column progress-done">
+          <div class="column-heading"><span>Done</span><strong>12</strong></div>
+          <article class="task-card">
+          <a data-progress-task="foundation-contracts" href="#plan-foundation-contracts"><h3>Establish the project and reviewed contracts</h3></a>
+          <p>Pinned the Bevy project and established reviewed contracts.</p>
+          <div class="task-meta"><span>Starts the plan</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/df0da32ab61a6cb6901bfd4b3cdbbcaec75bccc2">Commit df0da32a</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="pages-foundation" href="#plan-pages-foundation"><h3>Publish the status-only progress hub</h3></a>
+          <p>Published the status, plan, challenge, comparison, test, and commit sections as the status-only Pages hub.</p>
+          <div class="task-meta"><span>After foundation-contracts</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="autonomous-assets" href="#plan-autonomous-assets"><h3>Build the autonomous no-Blender asset pipeline</h3></a>
+          <p>Generated every cel-shift asset autonomously from declarative RON: an 11-bone rigged technician with Idle, Walk and Repair clips, a merged eight-cabinet rack row with server slots and status lights, a cooling unit, the red utility cart and yellow step stool, and overhead tray plus black hose modules.</p>
+          <div class="task-meta"><span>After pages-foundation</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="data-hall" href="#plan-data-hall"><h3>Load assets and build the data hall</h3></a>
+          <p>Loaded every generated GLB through an explicit Loading, Ready, and Failed asset state with no procedural fallback, cached one unit mesh per primitive shape and one unlit material per palette role, and spawned the authored 40 m square hall: a polished floor inside low perimeter walls, four rack rows separated by three traversable aisles, four cooling units, three overhead trays with hose drops, painted yellow aisle and walkway markings, the red service cart, and the yellow step stool. Visual and collider lists stay separate and are joined by stable PropId, the colliders are extracted once into a cached vector, and a room-wide flood fill proves every aisle checkpoint shares one walkable component with the player spawn.</p>
+          <div class="task-meta"><span>After autonomous-assets</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="technician-movement" href="#plan-technician-movement"><h3>Add the rigged technician and real keyboard movement</h3></a>
+          <p>Spawned the generated 11-bone technician only after the assets and the hall were both ready, bound every required rig node into explicit PlayerParts with the rest transform captured before any clip played, and moved it from the real ButtonInput&lt;KeyCode&gt; arrow state. A public ViewBasis resource, initialised to the reviewed NorthEast 45-degree view, is the only screen-to-world interface movement reads, so the orbit task becomes its runtime updater without changing a movement rule. Opposite arrows cancel and diagonals are normalized, world X and world Z resolve separately against the cached colliders and radius-aware room bounds so the technician slides along rack faces, and facing plus the Idle and Walk clips follow the accepted displacement rather than the request. The idle transition stops Walk, explicitly restores every PlayerParts rest transform, and only then plays Idle; the Repair clip is bound for the operations task and nothing plays it yet. Missing, duplicate, and stale rig nodes are typed failures that stop movement instead of being silently skipped.</p>
+          <div class="task-meta"><span>After data-hall</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="camera-orbit" href="#plan-camera-orbit"><h3>Add clamped four-way camera orbit</h3></a>
+          <p>Spawned the one orthographic game camera with the reviewed fixed 26 m by 14.625 m rectangle, 57-degree elevation, zero roll, and the initial NorthEast 45-degree yaw, which is all the authored unlit hall needs to be visible. Real Q and E just_pressed frames retarget the desired heading immediately, opposite keys on one frame cancel exactly, and the yaw eases with smoothstep at a constant 90 degrees per 0.30 seconds, so a retarget mid-tween starts at the interpolated yaw and its duration scales with the shortest remaining angle instead of restarting a fixed clock. CameraPlugin is now the sole runtime updater of ViewBasis and publishes the live interpolated basis in UpdateOrbitIntent, before MovePlayer reads it, so the technician walks along the camera it can actually see mid-orbit. Every frame the ground quadrilateral is cast from the current yaw, its axis-aligned extents are subtracted from the active blueprint&#39;s own room.coverage, and the followed technician is clamped into what remains before the transform is derived, so an overridden hall is followed by the coverage it declares rather than by the authored constant. The walkable room stays exactly 40 m, but the camera is clamped against the rendered coverage the new visual apron fills, so it overhangs the room freely and follows every legal player position exactly: every room corner is centred with the full 360 px of margin at every heading and at every exact tween midpoint, while the whole view stays inside the apron and zoom, elevation, and roll stay fixed. Framing is measured against the technician&#39;s whole generated spatial envelope rather than its ground origin -- the rest pose and every sampled Idle, Walk, and Repair pose, cel outlines included, 0.7998 m of radius and a 1.9704 m crown -- and every corner of it keeps at least 32 logical pixels of viewport margin, calibrated against an independent 49.23077 px per metre edge point.</p>
+          <div class="task-meta"><span>After technician-movement</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="operations-loop" href="#plan-operations-loop"><h3>Add recurring faults, prioritized tickets, and repair</h3></a>
+          <p>Attached the documented rack state machine to the four authored rack-row HallProp entities by stable PropId, joined to their cached collider rectangles once, and drove it from one seeded ChaCha8 fault stream. The scheduler is a pure sequence generator: every four simulated seconds an opportunity matures and the timer stops accumulating, a full queue pauses it without consuming a single word of randomness, and a drawn candidate whose rack already holds a ticket or is still resolving or cooling down is held rather than rerolled, so the exact rack and severity order is the same whatever the player does and only its timing moves. Tickets carry stable monotonic identifiers and sort Critical before Warning, then by creation tick, then by rack; the queue enforces the maximum of three active tickets and one ticket per rack and reports which rack it refused. A real Space press gathers only open faults, measures distance to each rack&#39;s collider rectangle rather than its centre, and selects by severity, then distance, then creation tick, then rack, so an out-of-range press changes nothing and is recorded as a named rejection instead of a silent no-op. Starting a repair in UpdateOperations locks movement in the same frame, before MovePlayer runs, zeroes the published motion, plays the generated Repair clip, and exposes the blue wrench state for the HUD task while the camera keeps orbiting and following. Repair completes on its own after three seconds and releases the lock, the healthy indicator shows for two seconds, the ticket then leaves the queue as the rack begins an eight second cooldown, and only a fully recovered rack is eligible again.</p>
+          <div class="task-meta"><span>After data-hall, technician-movement</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="operations-hud" href="#plan-operations-hud"><h3>Add operations HUD and diegetic badges</h3></a>
+          <p>Added src/hud.rs, which draws the whole operations HUD from the live operations model and owns no gameplay state of its own: every frame it reads TicketQueue, RackOperations, RackRoster, MovementLock, LastInteraction, and the real camera, and writes only presentation components plus one observable HudReport, so there is no second ticket model to drift. The top-left stack renders up to three rows straight out of the queue&#39;s own global priority order rather than re-sorting it, each row carrying a severity chip, a rack-state chip, a short real label such as T0002 R01 Critical, and a dwell-progress bar; shape carries meaning beside colour, with a square critical chip against a round warning chip and sharp, rounded, and pill badges for fault, repair, and resolved. The status line is derived from live state alone, preferring a running repair, then a real out-of-range rejection while that rejection is still true of the one rack it named, then the queue; move_closer_still_stands re-reads the live queue, that rack&#39;s live state, its roster collider, and the technician&#39;s live position every frame, so the prompt clears the moment that rack&#39;s ticket leaves the queue, that rack stops being Faulted, or the technician walks inside repair range, and another rack&#39;s open ticket can never keep a stale prompt alive. Badges are fixed-size screen-space UI nodes anchored every frame from a stable world point 2.4 m above each rack&#39;s collider centre through the real Camera::world_to_viewport, reading the camera&#39;s own Transform rather than its propagated GlobalTransform so they never lag a tween by a frame, a substitution the camera query enforces with Without&lt;ChildOf&gt; so a parented camera is refused as unusable and its badges are hidden rather than projected through a local transform pretending to be a global one; a visible anchor always gets a fully visible badge because the badge box is clamped inside the viewport and its thin leader line is rotated to end exactly on the projected anchor, while an anchor that leaves the viewport hides explicitly and a refused projection is recorded as a typed error. The bottom-right strip names Arrows, Q, E, and Space and shows which are live, turning the Space cap hard-hat blue and flattening the Arrows cap while a repair holds the technician still. Every colour is a typed PaletteRole, the 216 px queue stack and 40 px control strip keep a 16 px margin and stay outside the central 50% x 50% play rectangle at both 1280x720 and 960x540, and HudReport reports a rack that lost its RackOperations, a ticket whose rack is unknown, a missing row node, a missing badge node exactly once rather than once per write and again per hide, an unusable game camera, and a camera with no viewport, each under its own BadgeVisibility variant so no failure is ever explained with another&#39;s name. Shape, glyph, and progress are node-level contracts: the app tests read Node::border_radius off the severity chips and off all three badge states, the glyph text off the real RackBadgeLabel node, and the progress bar&#39;s Node::width against the live dwell progress, and each is covered by a mutation that fails when the write is deleted or swapped.</p>
+          <div class="task-meta"><span>After camera-orbit, operations-loop</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="pages-playable" href="#plan-pages-playable"><h3>Publish the playable WASM game</h3></a>
+          <p>Packaged the production game for wasm32-unknown-unknown with a pinned wasm-bindgen, added a wasm-only WebReadyPlugin handshake, published it under play/ with last-green metadata, and proved it in headless Chromium.</p>
+          <div class="task-meta"><span>After operations-hud</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="autonomous-verification" href="#plan-autonomous-verification"><h3>Build autonomous verification and visual hill-climb gates</h3></a>
+          <p>Build deterministic gameplay and render verification.</p>
+          <div class="task-meta"><span>After operations-hud</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="pages-verification" href="#plan-pages-verification"><h3>Publish comparisons, evidence, and verification</h3></a>
+          <p>Published the strict public projection of the verification and browser-gate reports, the current frames beside the approved references, the deduplicated screenshot history, and the sanitized gate and metric evidence.</p>
+          <div class="task-meta"><span>After pages-playable, autonomous-verification</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article><article class="task-card">
+          <a data-progress-task="pages-status-always" href="#plan-pages-status-always"><h3>Publish current status while retaining last-green artifacts</h3></a>
+          <p>Wired the Pages workflow to measure every named gate, upload each job&#39;s result and evidence before it concludes, and publish the current commit&#39;s status on every push while retaining the last green game, screenshots, and history.</p>
+          <div class="task-meta"><span>After pages-verification</span><a class="commit-link" href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Commit 19716a91</a></div>
+        </article>
+        </section><section class="progress-column progress-working">
+          <div class="column-heading"><span>Working now</span><strong>1</strong></div>
+          <article class="task-card">
+          <a data-progress-task="ci-baseline" href="#plan-ci-baseline"><h3>Add CI and publish the reproducible POC baseline</h3></a>
+          <p>Publish and verify the final POC baseline.</p>
+          <div class="task-meta"><span>After pages-status-always</span></div>
+        </article>
+        </section><section class="progress-column progress-future">
+          <div class="column-heading"><span>Future</span><strong>0</strong></div>
+          <div class="empty-state"><span class="empty-mark">+</span><p>No tasks in this state.</p></div>
+        </section></div>
+      </section>
+
+      <section class="panel section-panel" id="screenshots">
+        <div class="section-heading">
+          <div><span class="section-number">04</span><span class="eyebrow">Deterministic visual history</span></div>
+          <h2>Screenshot timeline</h2>
+        </div>
+        <div class="timeline"><article class="screenshot-entry">
+          <div class="timeline-dot"></div>
+          <div>
+            <span class="eyebrow">This build &middot; every promoted frame</span>
+            <p>The complete set of captures behind the evidence published on this page.</p>
+            <div class="screenshot-strip"><figure><img src="screenshots/current/01-healthy-center-ne.png" alt="Verified healthy-capture capture at the north-east heading" loading="lazy"><figcaption>healthy-capture</figcaption></figure><figure><img src="screenshots/current/02-fault-queue-ne.png" alt="Verified fault-queue-capture capture at the north-east heading" loading="lazy"><figcaption>fault-queue-capture</figcaption></figure><figure><img src="screenshots/current/03-walk-ne.png" alt="Verified walk-capture capture at the north-east heading" loading="lazy"><figcaption>walk-capture</figcaption></figure><figure><img src="screenshots/current/04-repairing-ne.png" alt="Verified repair-capture capture at the north-east heading" loading="lazy"><figcaption>repair-capture</figcaption></figure><figure><img src="screenshots/current/05-resolved-ne.png" alt="Verified resolved-capture capture at the north-east heading" loading="lazy"><figcaption>resolved-capture</figcaption></figure><figure><img src="screenshots/current/06-settled-se.png" alt="Verified settled-south-east-capture capture at the south-east heading" loading="lazy"><figcaption>settled-south-east-capture</figcaption></figure><figure><img src="screenshots/current/07-settled-sw.png" alt="Verified settled-south-west-capture capture at the south-west heading" loading="lazy"><figcaption>settled-south-west-capture</figcaption></figure><figure><img src="screenshots/current/08-settled-nw.png" alt="Verified settled-north-west-capture capture at the north-west heading" loading="lazy"><figcaption>settled-north-west-capture</figcaption></figure><figure><img src="screenshots/current/09-mid-orbit.png" alt="Verified mid-orbit-capture capture at the north-east heading" loading="lazy"><figcaption>mid-orbit-capture</figcaption></figure><figure><img src="screenshots/current/10-corner-ne.png" alt="Verified corner-probes capture at the north-east heading" loading="lazy"><figcaption>corner-probes</figcaption></figure><figure><img src="screenshots/current/11-corner-se.png" alt="Verified corner-probes capture at the south-east heading" loading="lazy"><figcaption>corner-probes</figcaption></figure><figure><img src="screenshots/current/12-corner-sw.png" alt="Verified corner-probes capture at the south-west heading" loading="lazy"><figcaption>corner-probes</figcaption></figure><figure><img src="screenshots/current/13-corner-nw.png" alt="Verified corner-probes capture at the north-west heading" loading="lazy"><figcaption>corner-probes</figcaption></figure><figure><img src="screenshots/current/14-low-resolution-queue.png" alt="Verified low-resolution-capture capture at the north-west heading" loading="lazy"><figcaption>low-resolution-capture</figcaption></figure></div>
+          </div>
+        </article><article class="screenshot-entry">
+          <div class="timeline-dot"></div>
+          <div>
+            <span class="eyebrow">3d05ae2d &middot; <time>2026-09-01T18:50:19-04:00</time></span>
+            <p>Working on ci-baseline</p>
+            <p class="hash"><code>532d35a53d2a181e9eeec772f1468cfa826c9c7ff30319863f2a77aefc5a99eb</code></p>
+            <div class="screenshot-strip"><figure><img src="screenshots/history/3d05ae2d/01-healthy-center-ne.png" alt="center frame verified at commit 3d05ae2d" loading="lazy"><figcaption>center</figcaption></figure><figure><img src="screenshots/history/3d05ae2d/02-fault-queue-ne.png" alt="fault frame verified at commit 3d05ae2d" loading="lazy"><figcaption>fault</figcaption></figure><figure><img src="screenshots/history/3d05ae2d/04-repairing-ne.png" alt="repair frame verified at commit 3d05ae2d" loading="lazy"><figcaption>repair</figcaption></figure><figure><img src="screenshots/history/3d05ae2d/05-resolved-ne.png" alt="resolved frame verified at commit 3d05ae2d" loading="lazy"><figcaption>resolved</figcaption></figure><figure><img src="screenshots/history/3d05ae2d/worker-crop.png" alt="worker frame verified at commit 3d05ae2d" loading="lazy"><figcaption>worker</figcaption></figure></div>
+            <p class="history-note">No published metric moved.</p>
+            
+          </div>
+        </article></div>
+      </section>
+
+      <section class="panel section-panel" id="plan">
+        <div class="section-heading">
+          <div><span class="section-number">05</span><span class="eyebrow">Reviewed implementation path</span></div>
+          <h2>Plan and diagrams</h2>
+        </div>
+        <article class="plan-document"><h1>Cell Shift Data Center POC - Reviewed Autonomous Implementation Plan</h1><blockquote>
+<p><strong>Execution rule:</strong> Use <code>subagent-driven-development</code> or <code>executing-plans</code>, implement one task at a time, commit and push directly to <code>main</code> after every independently green increment, and never pause for human visual approval. Every gate below is executable and deterministic.</p>
+</blockquote>
+<h2>Goal</h2><p>Build a polished Bevy 0.19.1 proof of concept for the larger Midcreek game:</p>
+<ul>
+<li>A cel-shift data-center technician walks through one fixed-layout data hall.</li>
+<li>Arrow keys move relative to the current camera view.</li>
+<li>Q/E smoothly orbit the orthographic camera through four 90-degree diamond views.</li>
+<li>A seeded recurring fault scheduler creates up to three simultaneous prioritized tickets.</li>
+<li>The player walks to a faulted rack and presses Space to repair it.</li>
+<li>Repair locks movement, plays a repair animation, updates badges/HUD, resolves the ticket, and returns the rack to the recurring fault pool after cooldown.</li>
+<li>All room, equipment, technician, rig, and animation assets are generated autonomously from repository-owned declarative source. Blender is never used.</li>
+<li>Pure state contracts, real input integration, generated-asset checks, a scripted real-app journey, and rendered-image analysis decide whether each hill-climb step passes.</li>
+<li>GitHub Pages continuously publishes current progress, the playable WASM game, concept-art comparisons, screenshots, plans, ASCII diagrams, challenges, tests, and commit history.</li>
+</ul>
+<h2>Source of Truth</h2><ul>
+<li><code>../midcreek-concept/ART-BIBLE.md</code></li>
+<li><code>../midcreek-concept/themes/_shared/foundation.md</code></li>
+<li><code>../midcreek-concept/themes/cel-shift/theme.yaml</code></li>
+<li><code>../midcreek-concept/themes/cel-shift/prompts/key-art-diamond.mock.md</code></li>
+<li><code>../midcreek-concept/themes/cel-shift/prompts/animation-sheet.mock.md</code></li>
+<li><code>docs/superpowers/specs/2026-08-29-github-pages-progress-hub-design.md</code></li>
+<li><code>docs/superpowers/plans/2026-08-29-github-pages-progress-hub.md</code></li>
+<li>Key-art SHA-256: <code>a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75</code></li>
+<li>Character-sheet SHA-256: <code>8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25</code></li>
+</ul>
+<h2>What Already Exists</h2><ul>
+<li><code>main</code> contains the initial repository commit plus the approved Pages design and implementation plan through commit <code>504efdb</code>.</li>
+<li>Rust 1.98.0 and Cargo 1.98.0 are installed.</li>
+<li>The concept repository already provides the approved camera, palette, equipment identity, UI language, worker design, and animation poses. This plan vendors only the two approved reference images and reuses those decisions.</li>
+<li>Bevy 0.19.1 supplies orthographic cameras, glTF loading, skeletal animation, UI layout, and <code>Screenshot::primary_window().observe(save_to_disk(...))</code>; the plan uses those APIs rather than creating substitutes.</li>
+<li>No prior implementation or review-driven refactor exists.</li>
+</ul>
+<h2>Locked Review Decisions</h2><ul>
+<li>Preserve the expanded POC scope: orbit, autonomous authored assets, and recurring multi-ticket repair gameplay are mandatory.</li>
+<li>Use as many cohesive Bevy plugins as the POC needs; do not create trivial one-system plugins.</li>
+<li>Keep visual and collider specifications separate, joined by stable <code>PropId</code>, with mandatory validation.</li>
+<li>Verification injects the real <code>ButtonInput&lt;KeyCode&gt;</code> path.</li>
+<li>Use exact semantic-report hashes plus mandatory bounded image metrics; do not require cross-GPU PNG byte equality.</li>
+<li>Use typed <code>PaletteRole</code>/<code>Srgba</code> constants, not runtime hex parsing.</li>
+<li>Keep ordered visual/collider lists and validate duplicate, missing, and orphan IDs.</li>
+<li>Keep explicit <code>PlayerParts</code> handles and reset rig nodes deliberately on idle/repair transitions.</li>
+<li>Drive verification through an explicit <code>VerificationStage</code> state machine.</li>
+<li>Cache unit meshes and palette materials once.</li>
+<li>Generate combined static rack/equipment meshes rather than one entity per server slot or LED.</li>
+<li>Compute every image's metrics in one pass and cache reference metrics once.</li>
+<li>Extract colliders once and linearly scan the cached vector; no spatial index for one room.</li>
+<li>Q/E perform eased 90-degree orbit transitions.</li>
+<li>Generate assets with Rust from declarative RON source; no Blender, manual export, or third-party art pipeline.</li>
+<li>Use a seeded recurring queue with multiple simultaneous tickets and deterministic priority ordering.</li>
+<li>Work directly on <code>main</code>; no pull request or human review is required during this unattended hill climb.</li>
+<li>Run the largest available clean gate before every push, then push immediately so progress stays visible.</li>
+<li>Publish a status-only Pages hub after project foundation and before visual game work.</li>
+<li>Publish current status on every <code>main</code> push, but replace the playable WASM game and screenshots only after all associated gates pass.</li>
+<li>Keep Done, Working Now, Future, and Challenges in one validated <code>docs/progress.json</code> source.</li>
+</ul>
+<h2>Architecture</h2><pre><code class="language-text">                         CellShiftPlugin
+                               |
+          +--------------------+--------------------+
+          |                    |                    |
+       AssetPlugin          HallPlugin        TechnicianPlugin
+          |                    |                    |
+ RON source -&gt; assetgen     SceneBlueprint      ButtonInput
+          |               visuals + colliders       |
+ generated GLBs                 |             movement/collision
+          |                     |                    |
+          +-----------&gt; loaded scene handles &lt;-------+
+                               |
+                +--------------+--------------+
+                |                             |
+           CameraPlugin                 OperationsPlugin
+       follow + Q/E orbit          seeded faults + tickets
+                |                   repair interaction/state
+                +--------------+--------------+
+                               |
+                            HudPlugin
+                  queue + meters + badges + controls
+                               |
+                    VerificationPlugin (test mode)
+                   stages -&gt; frames + semantic report
+                               |
+             asset/state/input/render contracts -&gt; pass/fail
+</code></pre>
+<h3>Progress publication</h3><pre><code class="language-text">green increment -&gt; update progress/challenges -&gt; commit -&gt; push main
+                                                        |
+                                                        v
+                                                   Pages workflow
+                             +--------------------------+------------------+
+                             |                                             |
+                     always publish current                       replace only if green
+                     status/plan/tests                            WASM game/screenshots
+                             |                                             |
+                             +--------------------------+------------------+
+                                                        |
+                                                        v
+                                                   GitHub Pages
+</code></pre>
+<p>The detailed Pages design and seven-task implementation plan live in the two
+repository documents listed under Source of Truth. They are authoritative for
+site generation, WASM packaging, last-green retention, and browser testing.</p>
+<h3>Runtime data flow</h3><pre><code class="language-text">ButtonInput&lt;KeyCode&gt;
+   |
+   +-- Arrow keys ------------------------------+
+   |                                            v
+   |                                  camera-relative direction
+   |                                            |
+   |                               cached linear collider scan
+   |                                            |
+   |                                     player transform
+   |                                            |
+   +-- Q/E -&gt; desired heading -&gt; eased orbit ---+--&gt; clamped camera
+   |
+   +-- Space -&gt; in-range ticket? -- no --&gt; unchanged
+                                  |
+                                 yes
+                                  v
+             TicketOpen -&gt; Repairing -&gt; Resolved -&gt; Cooldown -&gt; Healthy
+                              |             |
+                       movement locked   ticket removed
+                       repair clip       rack returns later
+</code></pre>
+<h3>Asset pipeline</h3><pre><code class="language-text">assets/source/*.ron
+        |
+        v
+schema + invariant validation
+        |
+        v
+primitive tessellation + rigid bone weights + animation tracks
+        |
+        v
+merge static geometry by asset/material/bone
+        |
+        v
+deterministic GLB writer (stable ordering, no timestamps/absolute paths)
+        |
+        +--&gt; --write -&gt; assets/generated/*.glb
+        |
+        +--&gt; --check -&gt; temp generation -&gt; byte compare -&gt; pass/fail
+</code></pre>
+<h3>Plugin scheduling</h3><p>Use explicit system sets in <code>src/lib.rs</code>:</p>
+<pre><code class="language-text">AssetReady
+   -&gt; SpawnWorld
+   -&gt; ReadInput
+   -&gt; UpdateOrbitIntent
+   -&gt; UpdateOperations
+   -&gt; MovePlayer
+   -&gt; UpdateAnimation
+   -&gt; FollowCamera
+   -&gt; UpdateHudAndBadges
+   -&gt; VerificationProbe
+</code></pre>
+<p>Each plugin registers systems into these shared sets. Startup and update ordering must not depend on plugin insertion order.</p>
+<h2>Fixed Product Contract</h2><ul>
+<li><strong>Window:</strong> 1280x720 default; 960x540 verification resize.</li>
+<li><strong>Walkable room:</strong> 40m x 40m, polished light concrete, low perimeter walls. This is the only ground the technician may stand on and the only ground colliders enclose.</li>
+<li><strong>Rendered coverage:</strong> a 72m x 72m non-playable visual apron of building shell, centred on the walkable room, drawn beneath it in a cel-shift shadow role with no collider and a small downward offset so the coplanar 40m square never z-fights. It exists only so the camera never renders the void; it is background, not a second room.</li>
+<li><strong>Layout:</strong> four parallel rack rows, three traversable aisles, cooling units, overhead trays, black hose drops, yellow floor markings, red cart, yellow stool.</li>
+<li><strong>Projection:</strong> orthographic 26m x 14.625m, 57-degree elevation, four headings separated by 90 degrees, initial yaw 45 degrees.</li>
+<li><strong>Camera offset direction:</strong> normalized <code>(1, 2.1776979, 1)</code> because <code>sqrt(2) * tan(57 degrees) = 2.1776979</code>.</li>
+<li><strong>Camera orbit:</strong> Q counter-clockwise, E clockwise, 0.30-second smoothstep quarter turn; opposite keys on one frame cancel.</li>
+<li><strong>Camera follow:</strong> fixed zoom/elevation; the camera follows the technician anywhere in the walkable room, overhanging it freely, and is clamped only so the current yaw's ground-plane frustum footprint stays inside the 72m rendered coverage.</li>
+<li><strong>Movement:</strong> arrow keys, screen-relative to the live interpolated camera basis, normalized diagonals, no wall/equipment penetration.</li>
+<li><strong>Interaction:</strong> Space starts repair only for the highest-priority in-range ticket within 1.5m.</li>
+<li><strong>Fault queue:</strong> deterministic seed, maximum three active tickets, no duplicate active ticket per rack.</li>
+<li><strong>Priority:</strong> Critical before Warning, then creation tick, then stable rack ID.</li>
+<li><strong>Timing:</strong> new fault opportunity every 4 seconds while under capacity; repair duration 3 seconds; resolved display 2 seconds; rack cooldown 8 seconds.</li>
+<li><strong>Repair behavior:</strong> movement disabled during repair; camera remains active; repair animation plays; completion is automatic.</li>
+<li><strong>Technician:</strong> adult proportions; blue hard hat, hi-vis vest, slate shirt, dark trousers, brown boots, tool belt; Idle, Walk, and Repair clips.</li>
+<li><strong>Style:</strong> typed cel-shift palette, unlit base/shadow materials, explicit hard shadow geometry, dark outlines, no gradients, grunge, bloom, depth of field, or texture noise.</li>
+<li><strong>UI:</strong> top-left prioritized ticket queue/status stack, floating red fault and blue wrench badges, bottom-right Arrow/Q/E/Space controls; no minimap, inventory, or build toolbar.</li>
+</ul>
+<h3>Typed palette</h3><p>Define <code>PaletteRole</code> and const <code>Srgba</code> values for:</p>
+<ul>
+<li>Rack white <code>#FBFCFD</code></li>
+<li>Rack shadow <code>#C6D5E0</code></li>
+<li>Floor light <code>#DEE6EB</code></li>
+<li>Floor shadow <code>#B2C0CB</code></li>
+<li>Signature yellow <code>#FFC93C</code></li>
+<li>Teal accent <code>#2FB8A8</code></li>
+<li>Hose charcoal <code>#2E353B</code></li>
+<li>Ink <code>#1F2A33</code></li>
+<li>Sky-bounce blue <code>#9FD0F0</code></li>
+<li>Healthy green <code>#4ADE80</code></li>
+<li>Fault red <code>#FF4B4B</code></li>
+<li>Worker hi-vis <code>#C8D94A</code></li>
+<li>Worker slate <code>#55707F</code></li>
+<li>Worker trousers <code>#2F3A42</code></li>
+<li>Worker boots <code>#7A5233</code></li>
+<li>Worker hard hat <code>#2C6FB8</code></li>
+<li>Worker skin <code>#C98F6A</code></li>
+</ul>
+<p>Only one material handle per <code>PaletteRole</code> may be created at runtime.</p>
+<h2>Planned Repository Shape</h2><ul>
+<li><code>.gitignore</code></li>
+<li><code>rust-toolchain.toml</code></li>
+<li><code>Cargo.toml</code></li>
+<li><code>Cargo.lock</code></li>
+<li><code>README.md</code></li>
+<li><code>src/main.rs</code></li>
+<li><code>src/lib.rs</code></li>
+<li><code>src/design.rs</code> — typed palette, IDs, visual/collider specs, scene blueprint, validators.</li>
+<li><code>src/assetgen.rs</code> — RON schemas, mesh/skin/animation generation, deterministic GLB writer.</li>
+<li><code>src/bin/assetgen.rs</code> — thin <code>--write</code>/<code>--check</code> CLI.</li>
+<li><code>src/assets.rs</code> — generated-asset handles, load-state validation, shared <code>RenderAssets</code>.</li>
+<li><code>src/world.rs</code> — hall spawning from validated visual specs.</li>
+<li><code>src/player.rs</code> — real keyboard movement, collision, rig discovery, animation state.</li>
+<li><code>src/camera.rs</code> — four headings, tweening, frustum clamp, follow.</li>
+<li><code>src/operations.rs</code> — seeded fault scheduler, tickets, repair state machine.</li>
+<li><code>src/hud.rs</code> — ticket stack, badges, controls, status visualization.</li>
+<li><code>src/verification.rs</code> — explicit verification stages, screenshots, semantic report, watchdog.</li>
+<li><code>src/sitegen.rs</code> — canonical progress validation, the strict public projection of the verification and browser-gate reports, static-site rendering, gallery history, and last-green assembly. Native-only: publication decodes verified frames and writes files, so the browser build never carries it.</li>
+<li><code>src/bin/sitegen.rs</code> — <code>validate</code>, <code>build</code>, and <code>assemble</code> CLI.</li>
+<li><code>src/web.rs</code> — WASM-only browser readiness bridge.</li>
+<li><code>assets/source/technician.ron</code></li>
+<li><code>assets/source/rack.ron</code></li>
+<li><code>assets/source/cooling-unit.ron</code></li>
+<li><code>assets/source/utility-props.ron</code></li>
+<li><code>assets/source/infrastructure.ron</code></li>
+<li><code>assets/generated/technician.glb</code></li>
+<li><code>assets/generated/rack.glb</code></li>
+<li><code>assets/generated/cooling-unit.glb</code></li>
+<li><code>assets/generated/utility-props.glb</code></li>
+<li><code>assets/generated/infrastructure.glb</code></li>
+<li><code>tests/asset_contract.rs</code></li>
+<li><code>tests/app_contract.rs</code></li>
+<li><code>tests/render_contract.rs</code></li>
+<li><code>tests/sitegen_contract.rs</code></li>
+<li><code>tests/pages_assembly_contract.rs</code></li>
+<li><code>tests/support/mod.rs</code></li>
+<li><code>scripts/check.sh</code></li>
+<li><code>scripts/build-web.sh</code></li>
+<li><code>scripts/web-smoke.sh</code></li>
+<li><code>.github/workflows/ci.yml</code></li>
+<li><code>.github/workflows/pages.yml</code></li>
+<li><code>docs/progress.json</code></li>
+<li><code>docs/implementation-plan.md</code></li>
+<li><code>docs/reference/cel-shift-key-art.png</code></li>
+<li><code>docs/reference/cel-shift-character-sheet.png</code></li>
+<li><code>docs/reference/manifest.json</code></li>
+<li><code>docs/verification/v0-center.png</code></li>
+<li><code>docs/verification/v0-report.json</code></li>
+<li><code>site/templates/index.html</code></li>
+<li><code>site/templates/play.html</code></li>
+<li><code>site/static/site.css</code></li>
+<li><code>site/static/site.js</code></li>
+<li><code>site/static/play.js</code></li>
+</ul>
+<p>This is intentionally larger than the walking-only draft because the user explicitly moved orbit, the asset pipeline, and recurring repair gameplay into the POC. Files remain cohesive; no class/plugin count cap may reduce visual quality.</p>
+<h2>Continuous Publication Protocol</h2><p>After Task 1 establishes the Rust project, execute Pages-plan Tasks 1-3 before
+starting autonomous asset work. This publishes the status-only hub, reviewed
+plans, diagrams, and cel-shift references early.</p>
+<p>For every later increment:</p>
+<ol>
+<li>Confirm <code>git branch --show-current</code> returns <code>main</code>.</li>
+<li>Update <code>docs/progress.json</code> so exactly one dependency-ready task is
+<code>in_progress</code>.</li>
+<li>Update challenge records, the implementation plan, and nearby ASCII diagrams
+when the increment changes them.</li>
+<li>Run the targeted tests, asset/progress freshness checks, and largest
+available clean gate.</li>
+<li>Commit with the required Copilot co-author trailer.</li>
+<li>Push directly with <code>git push origin main</code>.</li>
+<li>Let Pages publish current status. Promote new game/screenshots only when
+native, render, WASM, and browser gates are green.</li>
+</ol>
+<p>Cross-plan ordering:</p>
+<pre><code class="language-text">Game Task 1
+   |
+   v
+Pages Tasks 1-3: status-only hub live
+   |
+   v
+Game Tasks 2-7
+   |
+   +--------------------+
+   |                    |
+   v                    v
+Pages Task 4       Game Task 8
+playable WASM      verification
+   |                    |
+   +----------+---------+
+              v
+       Pages Tasks 5-6
+       evidence + status-always
+              |
+              v
+          Game Task 9
+              |
+              v
+         Pages Task 7
+         final published baseline
+</code></pre>
+<h2>Core Types and Invariants</h2><h3>Scene specification</h3><pre><code class="language-rust">struct PropId(String);
+
+struct VisualSpec {
+    id: PropId,
+    asset: AssetKind,
+    transform: TransformSpec,
+    collision_required: bool,
+}
+
+struct ColliderSpec {
+    id: PropId,
+    center: Vec2,
+    half_extents: Vec2,
+}
+
+struct SceneBlueprint {
+    room: RoomSpec,
+    visuals: Vec&lt;VisualSpec&gt;,
+    colliders: Vec&lt;ColliderSpec&gt;,
+    player_spawn: Vec2,
+}
+</code></pre>
+<p><code>SceneBlueprint::validate()</code> returns all errors at once:</p>
+<ul>
+<li>duplicate visual IDs;</li>
+<li>duplicate collider IDs;</li>
+<li>required collider missing;</li>
+<li>orphan collider;</li>
+<li>collider outside room;</li>
+<li>player spawn outside room or inside collider;</li>
+<li>fewer/more than four rack rows or three aisles;</li>
+<li>blocked aisle topology;</li>
+<li>camera target interval empty for any settled or mid-orbit heading.</li>
+</ul>
+<h3>Operations state machine</h3><p>Keep this diagram in <code>src/operations.rs</code> and update it with any state change:</p>
+<pre><code class="language-text">Healthy
+   |
+   | seeded scheduler; capacity available
+   v
+Faulted + TicketOpen
+   |
+   | player in range + Space just_pressed
+   v
+Repairing (3 s, movement locked, blue wrench badge)
+   |
+   | timer complete
+   v
+Resolved (2 s, healthy indicator)
+   |
+   | display timer complete
+   v
+Cooldown (8 s, no active ticket)
+   |
+   | cooldown complete
+   v
+Healthy and eligible again
+</code></pre>
+<h3>Camera clamp</h3><p>Keep this diagram in <code>src/camera.rs</code>:</p>
+<pre><code class="language-text">current interpolated yaw + fixed ortho rectangle
+                     |
+                     v
+cast viewport corners onto Y=0
+                     |
+                     v
+ground quadrilateral -&gt; X/Z extents
+                     |
+                     v
+RENDER_COVERAGE_SIZE minus extents = legal target rectangle
+        (which contains the whole 40m walkable room)
+                     |
+                     v
+clamp followed player -&gt; derive camera transform
+</code></pre>
+<p>The walkable room and the rendered coverage are two different squares. The
+clamp is against the 72m coverage, never the 40m room, so every legal player
+position is followed exactly: <code>72/2 - hypot(13, 8.71916) = 20.3468m</code> exceeds
+the room's 20m half extent by 0.3468m at the worst yaw. The clamp therefore
+only ever engages for a position the technician cannot reach.</p>
+<h3>Verification state machine</h3><p>Keep the complete transition table and this summary in <code>src/verification.rs</code>:</p>
+<pre><code class="language-text">Boot
+ -&gt; WaitForAssets
+ -&gt; ValidateBlueprint
+ -&gt; HealthyCapture
+ -&gt; SeedThreeFaults
+ -&gt; FaultQueueCapture
+ -&gt; KeyboardJourney
+ -&gt; WalkCapture
+ -&gt; BeginRepair
+ -&gt; RepairCapture
+ -&gt; CompleteRepair
+ -&gt; ResolvedCapture
+ -&gt; OrbitNE/SE/SW/NW Captures
+ -&gt; MidOrbitCapture
+ -&gt; CornerProbes
+ -&gt; LowResolutionCapture
+ -&gt; AnalyzeReady
+ -&gt; WriteReport
+ -&gt; Success
+
+Any invalid transition, missing entity, asset failure, capture failure, or
+watchdog expiry -&gt; Failure -&gt; AppExit::error()
+</code></pre>
+<h2>Deterministic Test Diagram</h2><pre><code class="language-text">asset source
+├── parse error ----------------------------&gt; explicit assetgen failure
+├── invariant error ------------------------&gt; all schema errors reported
+└── valid -&gt; generate twice -&gt; byte equal? -+-&gt; inspect GLB contract
+                                             |
+real ButtonInput&lt;KeyCode&gt;                    |
+├── Arrow combinations x 4 camera headings  |
+├── Q/E/or opposing orbit keys               |
+└── Space in/out of repair range             |
+        |                                    |
+        v                                    v
+movement -&gt; collision -&gt; rig animation -&gt; operations state
+   |           |             |                 |
+   |           |             |                 +-&gt; queue capacity/priority/recurrence
+   |           |             +-&gt; idle/walk/repair/reset
+   |           +-&gt; wall/rack/slide/reachability
+   +-&gt; cardinal/diagonal/current-camera basis
+        |
+        v
+camera follow + orbit -&gt; center/corners/mid-tween x resolutions
+        |
+        v
+14 real screenshots + canonical semantic report
+        |
+        +-&gt; dimensions / sentinel / palette / luminance
+        +-&gt; diagonal edges in all four views
+        +-&gt; worker identity and animation deltas
+        +-&gt; red fault + blue repair badges
+        +-&gt; queue/HUD layout and state colors
+        +-&gt; reference histogram relationship
+        |
+        v
+all mandatory thresholds pass -&gt; continue
+any failure -&gt; metric + expected bound + artifact path -&gt; iterate
+</code></pre>
+<p>No LLM or prompt file is modified, so no model eval suite applies.</p>
+<h2>Objective Gates</h2><p>No gate may require a person to play, resize, inspect, score, or approve anything.</p>
+<table><thead><tr><th>Requirement</th><th>Objective proof</th></tr></thead><tbody>
+<tr><td>Generated assets are current</td><td><code>assetgen --check</code> regenerates in a temp directory and byte-compares every GLB.</td></tr>
+<tr><td>Asset identity</td><td>GLB parser asserts node/material/mesh/joint/animation names and counts.</td></tr>
+<tr><td>Rig works</td><td>Bevy loads technician, discovers required named bones, and plays Idle/Walk/Repair.</td></tr>
+<tr><td>Hall identity</td><td>Exact scene specs and rendered color/edge/category metrics.</td></tr>
+<tr><td>Separate visuals/colliders stay aligned</td><td>Stable <code>PropId</code> join validator with duplicate/missing/orphan tests.</td></tr>
+<tr><td>Every aisle is usable</td><td>Grid flood-fill plus real-arrow-key waypoint traversal through all three aisles.</td></tr>
+<tr><td>Controls remain screen-relative</td><td>Real <code>ButtonInput&lt;KeyCode&gt;</code> table across all four headings and mid-orbit samples.</td></tr>
+<tr><td>Orbit is correct</td><td>Heading/tween math, duration, cancellation, current-basis movement, and all-view screenshots.</td></tr>
+<tr><td>Camera never leaks outside</td><td>Frustum math proving the ground quadrilateral stays inside the 72m rendered coverage at every player position, heading, and tween sample, plus the magenta sentinel ratio at corners and mid-orbit.</td></tr>
+<tr><td>Ticket queue is deterministic</td><td>Fixed seed produces exact rack/severity/tick sequence.</td></tr>
+<tr><td>Multi-ticket behavior works</td><td>Capacity, no duplicates, priority order, resolve/cooldown/recurrence tests.</td></tr>
+<tr><td>Repair interaction works</td><td>Out-of-range Space is rejected; in-range Space locks movement, plays Repair, resolves automatically.</td></tr>
+<tr><td>HUD/badges match state</td><td>ECS layout/state contracts plus pixel-presence checks for red/blue/green states.</td></tr>
+<tr><td>Visual gate is meaningful</td><td>Generated bad-image fixtures must fail the specific analyzer metric they target.</td></tr>
+<tr><td>Verification cannot false-pass</td><td>Every legal/illegal stage transition and timeout/callback/report error is fault-injected.</td></tr>
+<tr><td>Current semantic state is reproducible</td><td>Canonical report excludes time/absolute paths, sorts maps, rounds floats to 1e-6, and hashes identically.</td></tr>
+<tr><td>Progress status is accurate</td><td><code>sitegen validate</code> enforces one current task, completed dependencies, valid commit references, plan IDs, and complete challenge context.</td></tr>
+<tr><td>Published plans and diagrams are current</td><td><code>sitegen check</code> parses <code>docs/implementation-plan.md</code>, validates progress links, and rejects generated-source drift.</td></tr>
+<tr><td>Browser game is playable</td><td>Pinned WASM build plus headless Chromium requires <code>data-game-state="ready"</code>, a nonblank canvas, working control-key suppression, and no captured browser errors.</td></tr>
+<tr><td>Failed pushes preserve a working game</td><td>Assembly fixtures prove failed native/render/WASM runs update status while retaining prior game and screenshot hashes.</td></tr>
+<tr><td>Concept comparisons are authentic</td><td>Published reference files must match approved source SHA-256 values and expose their provenance, and a report whose recorded reference hashes disagree with the approved manifest is refused.</td></tr>
+<tr><td>Published evidence is sanitized</td><td>The site renders only a strict projection of <code>report.json</code> and <code>browser-gate.json</code>; both raw shapes deny unknown fields, and no command line, captured output, host or environment value, absolute path, or free-text failure reason is published.</td></tr>
+<tr><td>Published artifacts are contained</td><td>Every declared frame resolves strictly inside the directory that declared it; an absolute path, a <code>..</code> escape, a symbolic link, a missing file, an undecodable image, and a size that disagrees with its own report are all refused before a byte is copied.</td></tr>
+<tr><td>Screenshot history is honest</td><td>A history point is appended only when the semantic hash moves; an unchanged hash, a recorded commit, and a failed run leave the history untouched, and a green run whose hash did not move still republishes the current frames.</td></tr>
+<tr><td>Pages deployment succeeds</td><td>GitHub's Pages deployment API must report success for the pushed <code>main</code> commit.</td></tr>
+</tbody></table>
+<h2>Failure Registry</h2><table><thead><tr><th>Failure</th><th>Test coverage</th><th>Runtime handling</th><th>Visibility</th></tr></thead><tbody>
+<tr><td>Source asset malformed</td><td>Parser fixture</td><td><code>assetgen</code> returns nonzero with file/path field</td><td>Explicit</td></tr>
+<tr><td>Generated GLB stale</td><td>Double generation and <code>--check</code></td><td>Build gate stops</td><td>Explicit</td></tr>
+<tr><td>Required GLB/node/animation missing</td><td>Asset contract + real-app load</td><td>Enter <code>AssetLoadState::Failed</code>, verification exits error</td><td>Explicit</td></tr>
+<tr><td>Duplicate/orphan <code>PropId</code></td><td>Validator tests</td><td>World never spawns</td><td>Explicit</td></tr>
+<tr><td>Aisle accidentally blocked</td><td>Flood-fill + waypoint route</td><td>Contract fails before acceptance</td><td>Explicit</td></tr>
+<tr><td>Arrow mapping wrong after orbit</td><td>4-heading real-input matrix</td><td>Contract names heading/key/actual vector</td><td>Explicit</td></tr>
+<tr><td>Orbit interrupted/opposite keys</td><td>Tween branch tests</td><td>Defined cancellation/retarget behavior</td><td>Explicit</td></tr>
+<tr><td>Mid-orbit camera exposes background</td><td>Sentinel mid-tween frame</td><td>Render contract fails</td><td>Explicit</td></tr>
+<tr><td>Duplicate rack ticket</td><td>Seeded scheduler tests</td><td>Scheduler rejects invariant and reports rack</td><td>Explicit</td></tr>
+<tr><td>Queue exceeds three</td><td>Capacity tests</td><td>No new fault emitted</td><td>Observable in report</td></tr>
+<tr><td>Repair begins out of range</td><td>Interaction test</td><td>Input ignored and reason recorded in verification report</td><td>Observable</td></tr>
+<tr><td>Rig part handle stale</td><td>Fault-injection test</td><td>Animation system reports missing named part; verification fails</td><td>Explicit</td></tr>
+<tr><td>HUD layout not ready</td><td>Stage transition test</td><td>Capture waits; watchdog identifies stage</td><td>Explicit</td></tr>
+<tr><td>Screenshot callback lost</td><td>Fault-injection test</td><td><code>CAPTURE_TIMEOUT</code> fails the run naming the frame; the parent cap is the backstop</td><td>Explicit</td></tr>
+<tr><td>Slow renderer mistaken for a stuck run</td><td>Active-work watchdog unit regression</td><td>Readback waiting is excluded from <code>APP_WATCHDOG</code>; only active time expires it</td><td>Explicit</td></tr>
+<tr><td>Analyzer accidentally accepts bad frame</td><td>Generated negative fixtures</td><td>Unit test fails</td><td>Explicit</td></tr>
+<tr><td>Renderer unavailable</td><td>End-to-end child test</td><td>Capture stderr/nonzero; no skip</td><td>Explicit</td></tr>
+<tr><td>Output path unsafe/unwritable</td><td>CLI tests</td><td>Write only named files; never recursive-delete; nonzero error</td><td>Explicit</td></tr>
+<tr><td>Progress data contradicts the plan</td><td>Sitegen validator fixtures</td><td>Pages build stops before publishing false status</td><td>Explicit</td></tr>
+<tr><td>WASM compiles but never renders</td><td>Headless Chromium readiness and canvas analysis</td><td>Current failure published; last green game retained</td><td>Explicit</td></tr>
+<tr><td>Current build fails after a green deployment</td><td>Pages assembly success/failure fixtures</td><td>Status updates; previous game/screenshots remain</td><td>Explicit</td></tr>
+<tr><td>First Pages run fails</td><td>First-run assembly fixture</td><td>Status-only page states no verified game exists</td><td>Explicit</td></tr>
+<tr><td>Pages deployment races a newer push</td><td>Workflow contract</td><td>Non-canceling single concurrency group serializes deploys</td><td>Explicit</td></tr>
+</tbody></table>
+<p>There are no remaining silent failures with neither a test nor error handling.</p>
+<hr />
+<h2 id="plan-foundation-contracts">Task 1: Establish the project and reviewed contracts</h2><p><strong>Files:</strong> <code>.gitignore</code>, <code>rust-toolchain.toml</code>, <code>Cargo.toml</code>, <code>src/main.rs</code>, <code>src/lib.rs</code>, <code>src/design.rs</code>, <code>README.md</code>, reference PNGs, <code>tests/app_contract.rs</code>.</p>
+<ol>
+<li>Rename <code>readme.md</code> with <code>git mv readme.md README.md</code>.</li>
+<li>Pin Rust 1.98.0 with rustfmt and clippy.</li>
+<li>Add Bevy 0.19.1 with 3D/UI/glTF/PNG support plus serialization, deterministic RNG, GLB-writing, hashing, image-analysis, and GLB-inspection dependencies; lock exact versions in <code>Cargo.lock</code>.</li>
+<li>Add <code>.gitignore</code> for <code>/target</code>, temporary verification output, and macOS metadata.</li>
+<li>Vendor the two approved reference images and assert their SHA-256 values.</li>
+<li>Implement typed <code>PaletteRole</code>, camera/room/timing constants, <code>PropId</code>, ordered <code>VisualSpec</code>/<code>ColliderSpec</code>, and aggregate <code>SceneBlueprint::validate()</code>.</li>
+<li>Add validator tests for every error branch, including duplicate/missing/orphan IDs and invalid camera room geometry.</li>
+<li>Add <code>CellShiftPlugin</code> and shared ordered system sets.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test design
+</code></pre>
+<p>Expected: all palette/reference/blueprint branches pass; malformed fixtures fail with exact variants.</p>
+<p>Commit: <code>chore: establish reviewed cell shift contracts</code></p>
+<h2 id="plan-pages-foundation">Pages Milestone A: Publish the status-only progress hub</h2><p>Execute Tasks 1-3 from
+<code>docs/superpowers/plans/2026-08-29-github-pages-progress-hub.md</code> before starting
+game asset work.</p>
+<p>This milestone must:</p>
+<ul>
+<li>create and validate <code>docs/progress.json</code>;</li>
+<li>copy the reviewed overall plan into the repository;</li>
+<li>publish both approved cel-shift references with hashes;</li>
+<li>render Done, Working Now, Future, Plans, Diagrams, Challenges, Tests, and
+Commits;</li>
+<li>create the <code>pages-live</code> persistence branch;</li>
+<li>deploy a status-only Pages site that clearly states no verified game exists
+yet.</li>
+</ul>
+<p>Run the Pages-plan gates, commit each green increment, and push each commit
+directly to <code>main</code>. Do not proceed to Task 2 until GitHub's Pages deployment API
+reports success for the current <code>main</code> commit.</p>
+<h2 id="plan-autonomous-assets">Task 2: Build the autonomous no-Blender asset pipeline</h2><p><strong>Files:</strong> <code>src/assetgen.rs</code>, <code>src/bin/assetgen.rs</code>, <code>assets/source/*.ron</code>, <code>assets/generated/*.glb</code>, <code>tests/asset_contract.rs</code>.</p>
+<ol>
+<li>Write failing schema, determinism, and GLB-structure tests.</li>
+<li>Define declarative primitives, transforms, palette roles, parent/bone bindings, and animation keyframes in RON.</li>
+<li>Implement deterministic tessellation and stable ordering. Never embed timestamps, temp paths, host names, or nondeterministic map iteration.</li>
+<li>Merge static rack/equipment geometry by material and asset so server slots and LEDs do not become individual runtime entities.</li>
+<li>Generate:
+<ul>
+<li>technician: adult silhouette, 11-bone rigid-weight skin, Idle/Walk/Repair clips;</li>
+<li>rack: top and two readable faces, server slots, status lights, outline shell;</li>
+<li>cooling unit;</li>
+<li>utility props: cart and stool;</li>
+<li>infrastructure: trays and hose modules.</li>
+</ul>
+</li>
+<li>Implement <code>assetgen --write</code> and <code>assetgen --check</code>.</li>
+<li>Parse every output GLB and assert required names, 11 joints, three clips, approved materials, finite bounds, valid indices/weights, and bounded primitive counts.</li>
+<li>Generate twice in different temp directories and require byte-identical GLBs.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo run --bin assetgen -- --write
+cargo run --bin assetgen -- --check
+cargo test --test asset_contract
+</code></pre>
+<p>Expected: committed GLBs exactly match autonomous generation; no Blender executable or manual step appears anywhere.</p>
+<p>Commit: <code>feat: generate rigged cell shift assets autonomously</code></p>
+<h2 id="plan-data-hall">Task 3: Load assets and build the data hall</h2><p><strong>Files:</strong> <code>src/assets.rs</code>, <code>src/world.rs</code>, <code>src/design.rs</code>, <code>tests/app_contract.rs</code>.</p>
+<ol>
+<li>Add <code>AssetPlugin</code> with explicit <code>Loading</code>, <code>Ready</code>, and <code>Failed</code> states; no procedural fallback on load failure.</li>
+<li>Add <code>RenderAssets</code> caching one unit primitive mesh per shape and one material per <code>PaletteRole</code>.</li>
+<li>Define the fixed 40m square walkable hall with four rack rows, three aisles, cooling units, trays, hoses, markings, cart, and stool, and the 72m non-playable visual apron beneath and outside it.</li>
+<li>Keep visual and collider lists separate by selected design; validate their stable IDs before spawning. The apron is visual-only and must never carry a collider.</li>
+<li>Extract collider rectangles once into a cached resource.</li>
+<li>Spawn generated GLB modules only after all handles are loaded.</li>
+<li>Add a grid flood-fill proving all aisle checkpoints and the player spawn share one walkable component.</li>
+<li>Test exact counts, transforms, material roles, load failures, and collider joins.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo run --bin assetgen -- --check
+cargo test world
+cargo test --test app_contract hall
+</code></pre>
+<p>Expected: asset and hall contracts pass; any missing asset or blocked aisle is an explicit failure.</p>
+<p>Commit: <code>feat: build the authored cel shift data hall</code></p>
+<h2 id="plan-technician-movement">Task 4: Add the rigged technician and real keyboard movement</h2><p><strong>Files:</strong> <code>src/player.rs</code>, <code>src/lib.rs</code>, <code>tests/app_contract.rs</code>.</p>
+<ol>
+<li>Spawn the technician GLB and discover named rig nodes into <code>PlayerParts</code>; missing or duplicate names are errors.</li>
+<li>Read actual <code>ButtonInput&lt;KeyCode&gt;</code> arrow state, normalize diagonal input, and map it through the live camera basis.</li>
+<li>Resolve X and Z separately against the cached collider vector and room bounds to permit sliding.</li>
+<li>Set facing from accepted displacement, not requested input.</li>
+<li>Drive Idle/Walk animation clips from accepted velocity.</li>
+<li>On idle transition, stop Walk and explicitly reset every <code>PlayerParts</code> node before playing Idle, per selected review decision.</li>
+<li>Add the full key matrix for none, opposites, cardinals, and diagonals.</li>
+<li>Add real-input waypoint traversal through all three aisles plus collision and boundary probes.</li>
+<li>Fault-inject a stale part handle and require an explicit verification failure.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo test player
+cargo test --test app_contract keyboard_movement
+cargo test --test app_contract aisle_waypoint_journey
+</code></pre>
+<p>Expected: movement, collision, facing, rig animation, reset, and reachability contracts pass.</p>
+<p>Commit: <code>feat: add rigged camera-relative technician movement</code></p>
+<h2 id="plan-camera-orbit">Task 5: Add clamped four-way camera orbit</h2><p><strong>Files:</strong> <code>src/camera.rs</code>, <code>src/design.rs</code>, <code>src/world.rs</code>, <code>src/lib.rs</code>, <code>tests/app_contract.rs</code>.</p>
+<ol>
+<li>Implement <code>CameraHeading::{NorthEast, SouthEast, SouthWest, NorthWest}</code>.</li>
+<li>Read actual Q/E <code>just_pressed</code>; simultaneous Q+E cancels.</li>
+<li>Retarget desired heading immediately and interpolate current yaw with smoothstep over 0.30 seconds.</li>
+<li>Use current interpolated camera basis for movement throughout the tween.</li>
+<li>Compute ground footprint and legal follow target from current yaw every frame; keep zoom, elevation, and roll fixed. Clamp against the 72m rendered coverage, not the walkable room, so the camera may overhang the room.</li>
+<li>Test four settled headings, both directions, wraparound, simultaneous cancellation, rapid retarget, exact duration, midpoint, and final angle.</li>
+<li>For center/four room corners at all headings and tween midpoints, assert player viewport margin &gt;=32px, that the follow target is unclamped, and that the full ground quadrilateral stays inside the 72m rendered coverage.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo test camera
+cargo test --test app_contract camera_orbit
+</code></pre>
+<p>Expected: all orbit/follow/projection branches pass with values named in failures.</p>
+<p>Commit: <code>feat: add four-way isometric camera orbit</code></p>
+<h2 id="plan-operations-loop">Task 6: Add recurring faults, prioritized tickets, and repair</h2><p><strong>Files:</strong> <code>src/operations.rs</code>, <code>src/player.rs</code>, <code>tests/app_contract.rs</code>.</p>
+<ol>
+<li>Implement the documented rack state machine and keep its ASCII diagram beside the enum.</li>
+<li>Add deterministic seeded scheduler, stable <code>TicketId</code>, severities, and maximum active capacity three.</li>
+<li>Prevent duplicate active tickets for one rack.</li>
+<li>Sort Critical before Warning, then creation tick, then rack ID.</li>
+<li>On Space <code>just_pressed</code>, find only in-range open tickets and select deterministically by priority then distance then ID.</li>
+<li>Enter Repairing for three seconds, lock movement, play Repair, and show blue wrench.</li>
+<li>Resolve automatically, show healthy state for two seconds, remove the active ticket, cool down eight seconds, then permit recurrence.</li>
+<li>Test exact seeded sequences, capacity, priority ties, duplicate suppression, out-of-range rejection, in-range start, movement lock, timer boundaries, resolution, cooldown, and recurring re-fault.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo test operations
+cargo test --test app_contract recurring_ticket_journey
+</code></pre>
+<p>Expected: the exact multi-ticket lifecycle passes for at least two recurrence cycles.</p>
+<p>Commit: <code>feat: add recurring fault and repair gameplay</code></p>
+<h2 id="plan-operations-hud">Task 7: Add operations HUD and diegetic badges</h2><p><strong>Files:</strong> <code>src/hud.rs</code>, <code>src/operations.rs</code>, <code>tests/app_contract.rs</code>.</p>
+<ol>
+<li>Build a top-left queue showing up to three tickets in deterministic priority order.</li>
+<li>Use icon/shape/color first; short real labels are permitted because Bevy renders text reliably.</li>
+<li>Add red fault badges and blue repair badges with thin leader lines over affected racks.</li>
+<li>Add compact bottom-right Arrow/Q/E/Space controls.</li>
+<li>Read operations state directly; do not copy ticket state into a second UI model.</li>
+<li>Test healthy, one-ticket, three-ticket, repairing, resolved, and post-removal UI states.</li>
+<li>At 1280x720 and 960x540, query <code>ComputedNode</code> and assert all panels are on-screen, ordered, and outside the central 50% play rectangle.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">cargo test hud
+cargo test --test app_contract operations_hud
+</code></pre>
+<p>Expected: state-to-UI and layout contracts pass without a screenshot judgment.</p>
+<p>Commit: <code>feat: add ticket hud and rack status badges</code></p>
+<h2 id="plan-pages-playable">Pages Milestone B: Publish the playable WASM game</h2><p>Execute Task 4 from the Pages implementation plan.</p>
+<p>The milestone builds the same production plugins for <code>wasm32-unknown-unknown</code>,
+packages them with the pinned wasm-bindgen CLI, and uses headless Chromium to
+prove the game reaches Ready, renders nonblank cel-shift pixels, handles Arrow,
+Q/E, and Space without scrolling the page, and reports no captured browser
+errors.</p>
+<p>Commit and push the green WASM increment directly to <code>main</code>. A failed web gate
+must update Pages status while retaining the previous status-only or playable
+artifact.</p>
+<h2 id="plan-autonomous-verification">Task 8: Build the autonomous verification and visual hill-climb gate</h2><p><strong>Files:</strong> <code>src/verification.rs</code>, <code>src/main.rs</code>, <code>tests/render_contract.rs</code>, <code>scripts/check.sh</code>.</p>
+<ol>
+<li>Add <code>--verify-output &lt;directory&gt;</code>; invalid/unsafe/unwritable paths return code 2 with stderr. Write only exact named files and never recursively delete a supplied path.</li>
+<li>Implement the documented <code>VerificationStage</code> enum and test every legal and illegal transition.</li>
+<li>Inject real <code>ButtonInput&lt;KeyCode&gt;</code> presses/releases for movement, Q/E orbit, and Space repair.</li>
+<li>Run fixed 1/60-second time, fixed fault seed, MSAA off, and magenta sentinel clear color.</li>
+<li>Capture 14 named frames:
+<ul>
+<li>healthy center NE;</li>
+<li>three-fault queue NE;</li>
+<li>walk pose NE;</li>
+<li>repairing NE;</li>
+<li>resolved NE;</li>
+<li>settled SE, SW, NW;</li>
+<li>Q/E tween midpoint;</li>
+<li>the technician in one room corner for each heading;</li>
+<li>960x540 three-ticket layout.</li>
+</ul>
+</li>
+<li>Write canonical <code>report.json</code>: sorted maps, relative paths, no wall-clock/host fields, floats rounded to 1e-6, exact source/reference hashes, asset hashes, gameplay results, camera states, ticket histories, UI rectangles, and frame paths.</li>
+<li>Hash canonical JSON and prove equal output for semantically identical runs in different temp directories.</li>
+<li>Bound the run with three budgets that each measure a different thing, and derive the outermost one rather than choosing it:
+<ul>
+<li><code>CAPTURE_TIMEOUT</code> 10 seconds per screenshot readback, from request to landing;</li>
+<li><code>APP_WATCHDOG</code> 45 seconds of <em>active, non-capture</em> wall time. The watchdog names a state machine that stopped moving; it is not a budget for the run as a whole. While a capture is outstanding its clock does not run, and when that capture resolves — landed, timed out, or refused — the whole wall duration of the wait is excluded for good, exactly once. A lost callback still fails, through <code>CAPTURE_TIMEOUT</code>, naming its frame;</li>
+<li><code>PARENT_WATCHDOG</code> = <code>APP_WATCHDOG</code> + <code>FrameName::ALL.len()</code> x <code>CAPTURE_TIMEOUT</code> + <code>LAUNCH_MARGIN</code> = 45 + 14 x 10 + 25 = 210 seconds, the parent's absolute cap on one child process. <code>LAUNCH_MARGIN</code> is the 25 seconds that belong to neither child budget: process start, asset load, window creation, report write, and shutdown. The equation is asserted against <code>FrameName::ALL.len()</code>, so a fifteenth frame moves the cap on its own.
+Retain stdout, stderr, report, and frames on failure.</li>
+</ul>
+</li>
+<li>Implement single-pass <code>FrameMetrics</code> per image and one cached reference metric record.</li>
+<li>Enforce mandatory frame contracts:
+<ul>
+<li>exact dimensions and artifact names;</li>
+<li>&lt;=0.1% magenta sentinel at settled corners and tween midpoint, which is the rendered-coverage gate: any clear color on screen means the ground quadrilateral left the 72m apron;</li>
+<li>mean linear luminance <code>[0.48, 0.88]</code>, within 0.18 of key art;</li>
+<li>
+<blockquote>
+<p>=60% pixels within RGB distance 24 of approved palette;</p>
+</blockquote>
+</li>
+<li>floor &gt;=20%, rack base/shadow &gt;=6%, yellow &gt;=0.5%, ink/hose 3%-35%;</li>
+<li>each diagonal edge band 30-50 and 130-150 degrees &gt;=8% strong-edge mass in every settled heading;</li>
+<li>hard-hat and hi-vis pixels in projected worker crop;</li>
+<li>bounded Idle/Walk/Repair crop differences and &lt;=1% outside-crop change for same-position captures;</li>
+<li>red badge pixels for open faults, blue badge pixels during repair, healthy green after resolution;</li>
+<li>computed HUD rectangles match screenshot state and remain on-screen;</li>
+<li>nearest-palette histogram L1 distance from key art &lt;=0.90;</li>
+<li>edge density between 0.35x and 2.5x key-art density.</li>
+</ul>
+</li>
+<li>Generate in-memory bad fixtures and prove targeted rejection: all-black, gradient-noise, magenta-border, axis-aligned-only, missing worker colors, missing badge colors, and blank HUD.</li>
+<li><code>scripts/check.sh</code> runs fmt, clippy, assetgen check, all pure/integration tests, rendered contract, and release build. On headless Linux it requires Xvfb; missing renderer/display is a hard failure.</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">./scripts/check.sh
+</code></pre>
+<p>Expected: every asset, state, input, simulation, camera, UI, image, timeout, and release-build gate passes.</p>
+<p>Commit: <code>test: add autonomous gameplay and render verification</code></p>
+<h2 id="plan-pages-verification">Pages Milestone C: Publish comparisons, evidence, and last-green retention</h2><span class="plan-anchor" id="plan-pages-status-always"></span><p>Execute Tasks 5-6 from the Pages implementation plan.</p>
+<p>This milestone must:</p>
+<ul>
+<li>publish current game frames beside the approved key art;</li>
+<li>publish the worker crop beside the character sheet;</li>
+<li>add screenshot history only when the semantic visual hash changes;</li>
+<li>publish sanitized gate counts, durations, and metric deltas;</li>
+<li>show current failures and challenges without exposing raw logs or local paths;</li>
+<li>retain the previous playable game and screenshots whenever native, render, or
+WASM verification fails.</li>
+</ul>
+<p>Commit and push every green increment directly to <code>main</code>.</p>
+<h2 id="plan-ci-baseline">Task 9: Add CI and publish the reproducible POC baseline</h2><p><strong>Files:</strong> <code>.github/workflows/ci.yml</code>, <code>README.md</code>, <code>docs/verification/v0-center.png</code>, <code>docs/verification/v0-report.json</code>.</p>
+<ol>
+<li>Use <code>ubuntu-24.04</code>, pinned Rust, cache Cargo, install Bevy Linux prerequisites plus Mesa Vulkan and Xvfb.</li>
+<li>Run pure checks and asset generation normally.</li>
+<li>Run rendered contract with:</li>
+</ol>
+<pre><code class="language-bash">LIBGL_ALWAYS_SOFTWARE=1 \
+WGPU_BACKEND=vulkan \
+WGPU_ADAPTER_NAME=llvmpipe \
+xvfb-run -a cargo test --test render_contract -- --nocapture
+</code></pre>
+<ol start="4">
+<li>Upload frames, report, stdout, and stderr on failure.</li>
+<li>Generate the documented baseline by setting <code>CELL_SHIFT_VERIFY_OUTPUT=docs/verification</code>; retain only canonical center PNG and canonical semantic report after all assertions pass.</li>
+<li>Run baseline generation twice and require identical semantic hashes. PNG bytes are documentation, not a cross-GPU golden gate.</li>
+<li>Document controls, architecture, asset regeneration, simulation rules, all gates, artifact diagnostics, and exclusions.</li>
+<li>Run <code>./scripts/check.sh</code> after documentation/baseline generation.</li>
+</ol>
+<p>Commit: <code>docs: publish verified cell shift poc baseline</code></p>
+<h2>Pages Milestone D: Publish the final project baseline</h2><p>Execute Task 7 from the Pages implementation plan after Task 9.</p>
+<p>Run the unified native, asset, progress, site, render, WASM, browser, and
+release gate. Update <code>docs/progress.json</code>, <code>docs/implementation-plan.md</code>,
+challenges, screenshots, and README from their canonical sources. Commit and
+push directly to <code>main</code>, then require a successful Pages deployment associated
+with that commit.</p>
+<h2>NOT in Scope</h2><ul>
+<li>Multiplayer, networking, accounts, cloud services, or persistence: the POC is local and deterministic.</li>
+<li>Procedurally generated room layouts: one authored hall is required for stable art comparison.</li>
+<li>Economy, inventory, staffing, shift scheduling, or spare-parts systems: the operations slice is tickets/faults/repair only.</li>
+<li>Continuous free camera, mouse orbit, or zoom: Q/E four-way orbit is the locked interaction.</li>
+<li>Audio: it does not prove the requested visual/gameplay hill climb.</li>
+<li>Blender or any manual DCC/export step: autonomy is a hard constraint.</li>
+<li>ML/network aesthetic evaluation: local deterministic metrics are the acceptance authority.</li>
+<li>Human playtest, screenshot review, or subjective score: explicitly prohibited as gates.</li>
+</ul>
+<h2>TODOS.md Disposition</h2><p>No <code>TODOS.md</code> is created. The user directed every proposed valuable follow-on—four-way orbit, autonomous authored/rigged assets, and recurring ticket/fault/repair gameplay—into the POC itself. Remaining exclusions are intentionally outside the stated product slice rather than deferred implementation debt.</p>
+<h2>Completion Summary</h2><ul>
+<li>Step 0: Scope Challenge — user chose scope reduction, then explicitly expanded the mandatory POC; structural discipline retained, no requested feature deferred.</li>
+<li>Architecture Review: 4 issues found and decided.</li>
+<li>Code Quality Review: 4 issues found and decided.</li>
+<li>Test Review: diagram produced; 4 critical silent gaps identified and closed in the plan.</li>
+<li>Performance Review: 4 issues found and decided.</li>
+<li>Additional scope review: Q/E orbit, autonomous no-Blender rigged assets, and recurring prioritized tickets added.</li>
+<li>Continuous publication review: playable WASM, status-always Pages deployment, concept comparisons, progress/challenge tracking, screenshot history, plans, diagrams, tests, and commits added.</li>
+<li>NOT in scope: written.</li>
+<li>What already exists: written.</li>
+<li>TODOS.md updates: 0; user moved all proposed valuable items into POC scope.</li>
+<li>Failure modes: 17 registered; 0 remain without both detection and explicit handling.</li>
+<li>Unresolved decisions that may bite later: none.</li>
+</ul>
+<h2>Definition of Done</h2><ul>
+<li><code>cargo run</code> loads only generated, repository-owned GLBs and presents the cel-shift hall.</li>
+<li>Arrow keys move the rigged worker correctly at every settled heading and during orbit.</li>
+<li>Q/E animate deterministic quarter-turns; the camera follows the technician anywhere in the walkable room and its footprint stays inside the rendered coverage throughout.</li>
+<li>Up to three seeded prioritized tickets recur; Space repairs only an in-range ticket; repair animation/state/HUD complete correctly.</li>
+<li>All three aisles are reachable and walls/equipment remain impassable.</li>
+<li>The no-Blender asset generator reproduces committed GLBs byte-for-byte.</li>
+<li>Every pure, real-input, state-machine, asset-load, UI-layout, and failure-injection test passes.</li>
+<li>Every one of the 14 real frames passes every mandatory visual metric.</li>
+<li>The canonical semantic report hash reproduces across output directories.</li>
+<li><code>./scripts/check.sh</code>, the software-rendered CI job, and release build pass.</li>
+<li><code>docs/progress.json</code> accurately drives Done, Working Now, Future, and
+Challenges, and <code>sitegen</code> rejects drift from the reviewed plan.</li>
+<li>GitHub Pages publishes the current <code>main</code> status after every push while
+retaining the last verified playable game and screenshots after failures.</li>
+<li>The Pages comparison view publishes both approved cel-shift references,
+current game/worker captures, visual metric deltas, plans, ASCII diagrams,
+test results, challenges, and commit history.</li>
+<li>The Bevy WASM build passes the headless Chromium readiness, input, error, and
+nonblank-canvas contract.</li>
+<li>GitHub's Pages deployment API reports success for the final <code>main</code> commit.</li>
+<li>No human gate exists.</li>
+</ul>
+</article>
+      </section>
+
+      <section class="section-panel" id="challenges">
+        <div class="section-heading">
+          <div><span class="section-number">06</span><span class="eyebrow">Engineering record</span></div>
+          <h2>Challenges</h2>
+        </div>
+        <div class="challenge-grid"><article class="challenge-card challenge-open">
+          <div class="panel-heading"><span class="eyebrow">Open</span></div>
+          <h3>Screenshot readback time consumed the active-work watchdog</h3>
+          <dl><div><dt>Impact</dt><dd>The Ubuntu llvmpipe verification run reached the keyboard journey after landing real screenshots, then failed because the 45-second state-machine watchdog counted time already governed by each capture&#39;s independent timeout. A progressing but slow software renderer was therefore indistinguishable from a stuck application.</dd></div><div><dt>Approach</dt><dd>Measure only active non-capture work in the child, settle each capture wait exactly once, keep the per-capture timeout responsible for lost callbacks, and derive the parent process cap from the active-work budget, the number of named frames, each capture budget, and the launch margin. Keep the challenge open until the corrected behavior passes the live Linux workflow.</dd></div></dl>
+        </article><article class="challenge-card challenge-open">
+          <div class="panel-heading"><span class="eyebrow">Open</span></div>
+          <h3>A retained playable build exists but the homepage hides it</h3>
+          <dl><div><dt>Impact</dt><dd>After a failed current run, status-always assembly keeps the previous play package, so the direct /play/ route works, but site generation receives no current playable candidate and renders the homepage&#39;s no-game state. Visitors cannot discover or launch the verified retained game from the project homepage.</dd></div><div><dt>Approach</dt><dd>Separate the current candidate from the playable build displayed by the homepage. Failed runs must publish current red status while rendering the retained game&#39;s commit metadata, iframe, and direct-play link without claiming that the failed commit verified those bytes. Cover the fallback through assembly tests and a real homepage browser journey.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Byte-reproducible rigged assets with no external content tool</h3>
+          <dl><div><dt>Impact</dt><dd>The plan forbids Blender, manual export, and human approval, so the rig, animation clips, and merged equipment geometry had to come from repository-owned source that a build gate can regenerate and byte-compare. Any hash-ordered map, embedded timestamp, or unquantized trigonometric value would have made the committed GLBs unverifiable.</dd></div><div><dt>Approach</dt><dd>Assets are declared in assets/source/*.ron and tessellated by src/assetgen.rs. Every collection is ordered by declaration order or by the fixed PaletteRole order, every float is quantized onto a 1e-6 grid with negative zero normalised away, and the asset generator string is a constant with no version, host, path, or time data. Static geometry is merged into one primitive per palette role so server slots and LEDs never become runtime entities.</dd></div><div><dt>Resolution</dt><dd>assetgen --check regenerates all five assets into two separate temporary roots, requires the two generations to be byte identical, and then requires the committed GLBs to match them exactly. tests/asset_contract.rs additionally parses every output and asserts node and scene names, the 11 named joints, the three clips, rigid skin weights, approved palette materials, finite bounds, valid indices, and the merge and triangle budgets.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Proving real Bevy asset loading and hall identity with no GPU and no fallback</h3>
+          <dl><div><dt>Impact</dt><dd>The reviewed plan forbids any procedural fallback when a generated asset is missing or wrong, but a hall that silently substitutes geometry looks identical to a healthy one in a screenshot. The contract therefore had to be proved inside a real Bevy app, and the verification machine has no GPU adapter, so a normal windowed run could not be the gate.</dd></div><div><dt>Approach</dt><dd>src/assets.rs loads every generated document and every declared module scene, polls recursive dependency load state, and additionally requires each loaded glTF document to expose the module scene name the pipeline declares, so a mislabelled but structurally valid file still fails. Failures are recorded in AssetLoadReport and move the app to AssetLoadState::Failed; src/world.rs only spawns on entering AssetLoadState::Ready and refuses to spawn an invalid blueprint at all. Tests drive a real App built from DefaultPlugins with WinitPlugin disabled and RenderPlugin created with no wgpu backend, which registers every asset type and runs the real glTF loader headlessly.</dd></div><div><dt>Resolution</dt><dd>tests/app_contract.rs boots that headless app against the committed assets and asserts Ready, exact spawned entity, transform, cached mesh, palette material, and shared scene-handle contracts, then repeats the run against private copies of the assets with one file removed, one file truncated, and one file replaced by a different module, requiring AssetLoadState::Failed, a report naming the offending path, and zero spawned props each time.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Explicit rig handles that fail loudly without breaking on Bevy instance respawn</h3>
+          <dl><div><dt>Impact</dt><dd>The reviewed plan requires explicit named rig handles and an explicit failure when one goes missing, duplicated, or stale, because a movement system that silently skips a bone looks identical to a working one. Bevy despawns and respawns a whole glTF world instance whenever a sub-asset event arrives for the file it came from, so handles captured on the first spawn can be invalidated wholesale through no fault of the game. A binder that only ran once produced an intermittent all-parts-stale failure under parallel test load, and a binder that healed on any change would have silently swallowed the real fault the plan requires it to report.</dd></div><div><dt>Approach</dt><dd>The generated technician root shares its name with the glTF scene, so it is deliberately excluded from the rig contract and the spawned entity is the stable handle for the instance; the contract covers the skinned mesh node and the eleven skin joints. One binder runs every frame: it costs twelve name lookups while the bound handles still resolve, and otherwise rescans the spawned instance. A rescan that yields a complete rig is a legal rebind, an empty rescan means the instance is mid-respawn and the bound handles are left untouched, and an incomplete rescan keeps the previously bound handles and reports them as typed StalePart errors. Movement and animation are gated on the report being empty in the same frame, not on a state transition that lands a frame late.</dd></div><div><dt>Resolution</dt><dd>tests/app_contract.rs fault-injects the failure by despawning bone-tool inside a running app and requires exactly PlayerRigError::StalePart for that node, PlayerRigState::Failed, and a technician position that does not move again. Pure tests in src/player.rs cover missing and duplicate names directly. The full app contract suite, which builds several real headless Bevy apps in parallel, was run ten consecutive times with no failures after the binder became rescan based instead of change-detection based.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Framing every room corner without ever rendering the void outside the hall</h3>
+          <dl><div><dt>Impact</dt><dd>Task 5 asked for two properties at once: a camera whose ground footprint never leaves the 40 m room, and a technician framed with at least 32 pixels of viewport margin at every room corner, at every heading, and at every tween midpoint. Those cannot both hold. Because the orthographic rectangle is rotated relative to the room, the legal follow rectangle is room bounds minus the rotated footprint&#39;s axis-aligned extents, which is strictly smaller than the standard axis-aligned clamp that keeps a followed point exactly on the view edge. A technician standing in a corner fell 12.505 m behind the far ground edge, 516 px off screen, and no room size fixed it because the room cancels out of the algebra: framing a corner would have needed an orthographic width of at most 0.99 m instead of the reviewed 26 m.</dd></div><div><dt>Approach</dt><dd>The controller separated the two squares the old rule conflated. The walkable, collidable room stays exactly 40 m with its existing perimeter walls, and nothing about the reviewed projection, elevation, headings, tween, or ViewBasis ordering moved. Beneath and outside it the blueprint now authors a 72 m square non-playable visual apron in the cel-shift floor-shadow role, dropped 0.05 m so the coplanar 40 m floor never z-fights, with no collider and no walkable cells: building shell, not a second room. The camera clamp is now taken against RENDER_COVERAGE_SIZE rather than ROOM_SIZE, so the camera overhangs the room freely and follows every legal player position exactly. 72 m is the smallest whole metre that works: the widest ground overhang is hypot(13, 8.71916) = 15.6532 m, so covering a 20 m room half extent needs 71.3065 m, leaving 0.3468 m of slack at the worst yaw.</dd></div><div><dt>Resolution</dt><dd>The impossibility contract was replaced by positive real-app contracts. camera_orbit_frames_every_room_corner_with_the_reviewed_margin drives the running app to all four room corners at all four settled headings and two tween samples each, asserts each tween sample really lies between headings, and requires both the reachable corner and the wall corner itself to keep at least 32 px of margin through Bevy&#39;s real Camera::world_to_viewport, with the followed corner centred to within half a pixel and holding the full 360 px half-viewport. camera_orbit_holds_the_rendered_apron_instead_of_leaking_past_it proves the follow target is never clamped at a corner, that the whole ground quadrilateral stays inside the 72 m coverage, and that it genuinely does overhang the 40 m room, so the apron is load bearing rather than decorative. camera_orbit_renders_the_apron_over_every_position_the_camera_can_reach sweeps 720 yaws by every framing sample and pins the 15.6532 m and 71.3065 m closed forms. The blueprint validator replaced the non-empty-interval rule with RoomOutsideCameraCoverage, which rejects any coverage that cannot follow the whole walkable room, and added MissingRenderApron, RenderApronDoesNotCoverRenderedArea, and RenderApronHasCollider so the apron cannot silently shrink, rise into the floor, or gain a collider.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>A recurring fault stream whose order the player cannot change</h3>
+          <dl><div><dt>Impact</dt><dd>Task 6 demanded two properties that pull against each other: an exact seeded rack and severity sequence that a test can pin, and a live queue capped at three tickets with no duplicate rack, whose occupancy depends entirely on when the player chooses to walk over and press Space. The obvious scheduler draws a rack every four seconds and rerolls whenever the drawn rack is unavailable, but then the number of words consumed from the stream is a function of player behaviour, so repairing early or late silently produces a different sequence and the pinned expectation becomes untestable.</dd></div><div><dt>Approach</dt><dd>The stream was made a pure ordered generator rather than a sampler of the current world. The four second timer arms an opportunity and then stops accumulating, so a pause can never stack two opportunities. Nothing is drawn at all while the queue holds three tickets, and a candidate that has been drawn is held, never discarded: if its rack already holds a ticket, or is still repairing, resolving, or cooling down, the scheduler reports exactly which rack and which state blocked it and waits. Consumption is therefore always two words per candidate and never a function of the player. The seeded RNG is wrapped in a counter so the draw total is observable, and every timer is a std Duration of whole nanoseconds rather than an accumulated f32, so the exact tick boundaries are reproducible.</dd></div><div><dt>Resolution</dt><dd>operations_scheduler_sequence_is_independent_of_repair_timing drives the same scheduler through a hostile timeline of irregular repairs and recoveries and requires the emitted pairs to equal the undisturbed sequence exactly. operations_scheduler_consumes_no_randomness_while_the_queue_is_full holds the queue at capacity for ten further seconds and requires zero draws, one recorded pause, and immediate emission on the tick capacity reopens. operations_scheduler_holds_a_drawn_candidate_whose_rack_is_busy proves a held candidate is never rerolled and is released unchanged. In the real app, recurring_ticket_journey runs 2106 fixed sixtieth of a second frames, fills the queue to three simultaneous tickets, completes at least three real Space repairs, and observes two racks fault again after their cooldowns, one of them on the exact tick its eight second cooldown ended, while the opened sequence still matches the pinned seed prefix.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Diegetic rack badges that stay legible through every heading, tween, and resize</h3>
+          <dl><div><dt>Impact</dt><dd>Task 7 asks for badges that float over the racks they belong to while the camera orbits through four headings and tweens between them, and for fixed panels that never cover the middle of the screen at either supported window size. A world-space badge satisfies the first requirement by rotating, shearing, and resizing with the isometric camera, which is exactly what a readable status marker must not do. Anchoring a fixed-size screen-space node instead moves the whole problem into projection, where three failures are silent by default: a rack behind the camera or outside the viewport projects to a meaningless point, a rack near an edge produces a badge that is half off screen, and a camera transform that is one frame stale makes every badge lag visibly through a 0.30 s orbit.</dd></div><div><dt>Approach</dt><dd>Badges are Bevy UI nodes of fixed pixel size, anchored every frame from a stable authored world point 2.4 m above each rack collider centre through the real Camera::world_to_viewport. The pass reads the camera entity&#39;s own Transform rather than its propagated GlobalTransform, because propagation runs in PostUpdate and the HUD runs in Update after the camera follow; the camera has no parent, so its transform is its global transform and the badge is anchored against this frame&#39;s camera rather than last frame&#39;s. Off-screen and refused projections are distinct typed outcomes rather than a shared silent skip: an anchor outside the viewport hides as OffScreen, and a ViewportConversionError becomes a typed ProjectionFailure recorded in HudReport. A visible anchor always yields a fully visible badge because the badge box is clamped inside the viewport, and because clamping breaks the vertical relationship between badge and rack, the leader line is a rotated thin node whose local +Y axis is turned onto the direction of the anchor, so it still ends exactly on the rack it names. The fixed panels avoid the central play rectangle on one axis each: the queue stack is 216 px wide, narrower than a quarter of the 960 px verification viewport, and the control strip is 40 px tall, shorter than a quarter of its 540 px height.</dd></div><div><dt>Resolution</dt><dd>operations_hud_badges_track_the_projected_rack_at_every_heading_and_mid_tween sweeps all four headings and one genuine mid-tween frame at each, and requires every badge&#39;s recorded anchor to equal the test&#39;s own independent projection of the same world point, its visibility to agree with whether that projection is on screen, its laid-out ComputedNode to stay exactly 34x22 px and fully inside the viewport, and its leader line to end within 1.5 px of the anchor. operations_hud_clamps_an_edge_badge_and_still_points_its_leader_at_the_rack walks the technician until a faulted rack is pushed against a side edge, the only case where the leader is not vertical, and proves the clamped badge stays on screen while the tilted leader still ends on the rack; flipping the sign of the leader rotation fails only this contract. operations_hud_panels_stay_on_screen_and_clear_of_the_play_rectangle resizes the real window to 1280x720 and 960x540 through a real WindowResized message and re-checks the 16 px margins, the row order, the panel containment, and the play rectangle at both sizes. operations_hud_hides_a_badge_whose_rack_leaves_the_viewport, operations_hud_reports_a_rack_that_lost_its_operational_state, and operations_hud_reports_a_missing_camera_instead_of_drawing_stale_badges cover the three hiding paths, two of them fault-injected into a running app and required to name a typed HudError.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Proving a real rendered browser frame without npm, Selenium, or a GPU</h3>
+          <dl><div><dt>Impact</dt><dd>The reviewed plan forbids npm and any browser automation package, so nothing off the shelf could drive Chrome. A gate that only waited for a load event, or only screenshotted a page, would pass on a blank canvas, on a game that threw during initialization, and on a build whose WebGL context never produced a frame. The two obvious readiness signals are also both unreliable on their own: a Bevy app reaches its first Update long before the hall, rig, roster, and HUD exist, and a canvas can carry the right CSS box while rendering nothing.</dd></div><div><dt>Approach</dt><dd>Readiness and rendering are proved independently. src/web.rs holds a pure, natively tested handshake model: every production subsystem is mapped onto Pending, Ready, or Failed, a missing camera or viewport stays Pending because it is an unfinished startup frame, and only two consecutive settled PostUpdate frames latch data-game-state=&quot;ready&quot;. A failure latches data-game-state=&quot;error&quot; once and appends a sanitized detail, with absolute paths reduced to file names and the message bounded, so a browser never shows a build host path. scripts/browser_gate.py is a repository-owned Chrome DevTools Protocol client written against the Python standard library, including a hand-rolled RFC 6455 WebSocket frame codec and a minimal PNG decoder, so the gate injects trusted keyboard input and reads real pixels with no third-party package. Chromium runs headless on SwiftShader, so no GPU is required.</dd></div><div><dt>Resolution</dt><dd>scripts/web-smoke.sh serves the package below the /midcreek-cs-1/ project prefix on an available loopback port, requires HTTP 200 for every packaged URL, requires data-game-state=&quot;ready&quot; within 30 seconds, requires #browser-errors to be empty, requires the canvas to be visible and 16:9 within one pixel, and requires the canvas region of a real screenshot to carry at least three approved palette classes and real channel variance. The no-scroll assertion carries its own positive control: the same trusted Arrow, Q, E, and Space events must scroll the page while the canvas is blurred and must not scroll it while the canvas is focused, so a page that simply could not scroll fails instead of passing. Deleting one generated GLB from a packaged build drives the gate to exit 1 with the sanitized &#39;assets: generated/rack.glb failed to load&#39; detail, and the healthy package reports ready in about five seconds with five approved palette classes over the full 1152x648 canvas.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Shipping the whole production game as one publishable WebAssembly file</h3>
+          <dl><div><dt>Impact</dt><dd>The Pages site is published by force-pushing a generated pages-live branch, so every published file must clear GitHub&#39;s hard 100 MB blob limit. A stock release build of the full Bevy game for wasm32-unknown-unknown produced a 117.7 MB module, which could never have been pushed, and no amount of retrying the deployment would have revealed the real cause.</dd></div><div><dt>Approach</dt><dd>The module was measured section by section rather than guessed at: the WebAssembly name section alone was 49.7 MB and the code section was 59.1 MB. wasm-bindgen now runs with --remove-name-section and --remove-producers-section, the release profile uses fat LTO with one codegen unit and panic=abort, and .cargo/config.toml applies -Copt-level=s only to wasm32-unknown-unknown so the native release build keeps its own optimization level. The same file also supplies the getrandom wasm_js backend the browser target requires.</dd></div><div><dt>Resolution</dt><dd>The published game_bg.wasm is 34.5 MB, comfortably inside the blob limit, and scripts/build-web.sh refuses to publish a package that is missing any of index.html, play.js, play.css, game.js, game_bg.wasm, or any of the five generated GLBs, that contains a root-absolute URL, or that leaks a build host path into the generated bindings.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Every generated surface rendered far brighter than the typed cel-shift palette</h3>
+          <dl><div><dt>Impact</dt><dd>The first real screenshots looked washed out and no frame could ever have met the visual contracts: ink measured 0.07 percent of the frame against a mandatory 3 percent floor, rack shadow measured 0.05 percent, and mean linear luminance sat at 0.743 against a ceiling of 0.572. The cause was invisible from the source data, because the RON palette roles, the GLB material names, and the committed bytes were all exactly right.</dd></div><div><dt>Approach</dt><dd>Sampling the exact rendered colours showed the pattern: white came out white but ink #1F2A33 came out #2F3A43 and teal #2FB8A8 came out #77DDD4, a brightening that only spares saturated whites. That is the signature of an sRGB value being interpreted as linear. glTF defines baseColorFactor in linear space, while the typed palette is sRGB, and the generator was writing the sRGB channels straight through.</dd></div><div><dt>Resolution</dt><dd>assetgen now converts each role with LinearRgba::from before writing baseColorFactor, the asset contract asserts the linear value rather than the sRGB one, and every GLB was regenerated. Palette accuracy went from 90 to 98 percent of pixels within RGB distance 24 of an approved role, and the same fix moved ink, rack shadow, hose charcoal, teal, and yellow onto their authored values in one step.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>The overhead cable trays hid the technician at two of the four camera headings</h3>
+          <dl><div><dt>Impact</dt><dd>The projected-worker-crop contract found no hard hat and no hi-vis pixels at all in the settled north-west capture and only 0.04 percent in the south-west one. The technician was completely behind a cable tray, which is a real playability failure rather than a measurement artefact: at half the headings the player could not see their own character while standing at a rack.</dd></div><div><dt>Approach</dt><dd>An orthographic camera at 57 degrees elevation projects anything at height h onto the ground point cot(57 deg) / sqrt(2) times h away along each ground axis, which is 0.459h per axis. At the original 4 m the trays landed 1.84 m away, right on top of a technician standing at a rack face. Every height was checked against the 6 m rack row spacing rather than nudged.</dd></div><div><dt>Resolution</dt><dd>OVERHEAD_TRAY_HEIGHT is now 6.54 m, the height whose 3 m per-axis offset is exactly half the rack row spacing, so a tray hung over an aisle always projects over a rack row and never over the walkway. The trays were also narrowed and their hanging hose runs removed. All fourteen frames now carry hard hat and hi-vis pixels inside the projected worker crop, and the constant carries the derivation beside it so it cannot be tuned away.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>The screenshot history links images the build that renders the page never writes</h3>
+          <dl><div><dt>Impact</dt><dd>Site generation validates that every local link resolves to a real file, which is what keeps a published page from shipping a broken image. The visual history breaks that assumption: only the newest accepted point is written by the build that renders the page, and every earlier point is a file the assembly step copies forward from the previous pages-live branch. Rendering the history therefore failed validation, and rendering it without images would have published a history nobody can look at.</dd></div><div><dt>Approach</dt><dd>The alternative of passing the whole previous site into the generator was rejected: the generator would then have to trust and copy an arbitrary directory of images, which is exactly the containment the publication rules exist to prevent. Instead the generated site declares what it expects assembly to supply.</dd></div><div><dt>Resolution</dt><dd>build_site publishes gallery.json beside index.html, and validate_site_output reads that manifest and accepts a screenshots/history/ link the manifest declares. A history link the manifest does not declare is still a broken link, assemble_site now carries screenshots/history/ forward through a green replacement, and a failed build renders the history without images because it publishes no manifest of its own.</dd></div></dl>
+        </article><article class="challenge-card challenge-resolved">
+          <div class="panel-heading"><span class="eyebrow">Resolved</span><a href="https://github.com/ridermw/midcreek-cs-1/commit/19716a91e23a229700738827dfab10a72cca27ea">Resolved in 19716a91</a></div>
+          <h3>Publishing why a build failed, from a job that stops at its first failure</h3>
+          <dl><div><dt>Impact</dt><dd>The hub exists to show the current commit&#39;s real status, and the gate matrix is most valuable exactly when something is red. A workflow step runs its commands under `set -e`, so the first failing gate ends the step and every later gate is never measured: a run whose formatting drifted would publish one red row and say nothing about the tests, the render contract, or the release build. Worse, the obvious fix of marking the whole step `continue-on-error` makes the job report success, and a job that never fails cannot gate the web build or the deployment.</dd></div><div><dt>Approach</dt><dd>Two rejected alternatives shaped this. Running each gate as its own workflow step with `continue-on-error` loses the measured duration and forces every result to be reassembled from step outcomes in workflow expressions, which cannot be tested anywhere. Parsing the job log for results was rejected outright: raw command output is exactly what may never reach a public page.</dd></div><div><dt>Resolution</dt><dd>scripts/run-gate.sh runs one named gate, measures its wall clock, appends a single line naming the gate, its status, and its duration, and always exits zero, so every later gate still runs. Each job then summarizes those lines into a strict result manifest, uploads the manifest with its evidence in an `if: always()` step, and only afterwards fails once in a verdict step of its own. Publish merges the two manifests, synthesizing skipped and failed rows for a job that produced none, so a job that never uploaded anything publishes the gap it left instead of a silent green.</dd></div></dl>
+        </article></div>
+      </section>
+
+      <section class="panel section-panel" id="tests">
+        <div class="section-heading">
+          <div><span class="section-number">07</span><span class="eyebrow">Latest gate matrix</span></div>
+          <h2>Tests</h2>
+        </div>
+        <div class="table-wrap"><table><caption>Latest gate matrix</caption><thead><tr><th>Gate</th><th>Status</th><th>Checks</th><th>Duration</th><th>Evidence</th></tr></thead><tbody><tr><th scope="row">Published history bound</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>57 ms</td><td>&mdash;</td></tr><tr><th scope="row">Browser gate unit tests</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>40.81 s</td><td>&mdash;</td></tr><tr><th scope="row">Workflow lint</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>11.20 s</td><td>&mdash;</td></tr><tr><th scope="row">Published progress data</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>223.89 s</td><td>&mdash;</td></tr><tr><th scope="row">History bound tests</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>4.19 s</td><td>&mdash;</td></tr><tr><th scope="row">Rust formatting</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>472 ms</td><td>&mdash;</td></tr><tr><th scope="row">Clippy lints</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>101.33 s</td><td>&mdash;</td></tr><tr><th scope="row">Generated asset freshness</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>2.29 s</td><td>&mdash;</td></tr><tr><th scope="row">Library and binary tests</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>26.01 s</td><td>&mdash;</td></tr><tr><th scope="row">Asset contracts</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>3.37 s</td><td>&mdash;</td></tr><tr><th scope="row">Application contracts</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>200.29 s</td><td>&mdash;</td></tr><tr><th scope="row">Site generation contracts</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>49.45 s</td><td>&mdash;</td></tr><tr><th scope="row">Pages assembly contracts</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>3.27 s</td><td>&mdash;</td></tr><tr><th scope="row">Rendered image contracts</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>232.85 s</td><td>&mdash;</td></tr><tr><th scope="row">Release build</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>978.58 s</td><td>&mdash;</td></tr><tr><th scope="row">Published history bound</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>63 ms</td><td>&mdash;</td></tr><tr><th scope="row">WebAssembly toolchain</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>97.56 s</td><td>&mdash;</td></tr><tr><th scope="row">WebAssembly package</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>650.71 s</td><td>&mdash;</td></tr><tr><th scope="row">Headless browser gate</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>499.12 s</td><td>&mdash;</td></tr><tr><th scope="row">Verified frame captures</th><td><span class="gate gate-passed">Passed</span></td><td>14 passed / 0 failed</td><td>0 ms</td><td>&mdash;</td></tr><tr><th scope="row">Verification stages</th><td><span class="gate gate-passed">Passed</span></td><td>24 passed / 0 failed</td><td>0 ms</td><td>&mdash;</td></tr><tr><th scope="row">Browser readiness</th><td><span class="gate gate-passed">Passed</span></td><td>1 passed / 0 failed</td><td>8.96 s</td><td>&mdash;</td></tr><tr><th scope="row">Browser canvas palette</th><td><span class="gate gate-passed">Passed</span></td><td>9 passed / 0 failed</td><td>0 ms</td><td>&mdash;</td></tr></tbody></table></div>
+        
+        <div class="table-wrap"><table><caption>Published metrics</caption><thead><tr><th>Metric</th><th>Value</th><th>Change</th></tr></thead><tbody><tr><th scope="row"><code>browser.canvas-height</code></th><td>648</td><td>no change</td></tr><tr><th scope="row"><code>browser.canvas-width</code></th><td>1152</td><td>no change</td></tr><tr><th scope="row"><code>browser.palette-classes</code></th><td>9</td><td>no change</td></tr><tr><th scope="row"><code>browser.ready-seconds</code></th><td>8.960</td><td>+0.600</td></tr><tr><th scope="row"><code>browser.unmatched-share</code></th><td>0.020</td><td>no change</td></tr><tr><th scope="row"><code>camera.msaa-samples</code></th><td>1</td><td>no change</td></tr><tr><th scope="row"><code>camera.yaw-degrees</code></th><td>45</td><td>no change</td></tr><tr><th scope="row"><code>equipment.on-screen</code></th><td>17</td><td>no change</td></tr><tr><th scope="row"><code>gameplay.busy-pauses</code></th><td>1</td><td>no change</td></tr><tr><th scope="row"><code>gameplay.capacity-pauses</code></th><td>1</td><td>no change</td></tr><tr><th scope="row"><code>gameplay.duplicate-pauses</code></th><td>0</td><td>no change</td></tr><tr><th scope="row"><code>gameplay.tickets-emitted</code></th><td>4</td><td>no change</td></tr><tr><th scope="row"><code>hall.aisles</code></th><td>3</td><td>no change</td></tr><tr><th scope="row"><code>hall.colliders</code></th><td>13</td><td>no change</td></tr><tr><th scope="row"><code>hall.rack-rows</code></th><td>4</td><td>no change</td></tr><tr><th scope="row"><code>hall.visuals</code></th><td>35</td><td>no change</td></tr><tr><th scope="row"><code>render.blueprint-validation-errors</code></th><td>0</td><td>no change</td></tr><tr><th scope="row"><code>render.frames-captured</code></th><td>14</td><td>no change</td></tr><tr><th scope="row"><code>render.stages</code></th><td>24</td><td>no change</td></tr><tr><th scope="row"><code>tickets.peak-open</code></th><td>3</td><td>no change</td></tr><tr><th scope="row"><code>worker.crop-height</code></th><td>162</td><td>no change</td></tr><tr><th scope="row"><code>worker.crop-pixels</code></th><td>19116</td><td>no change</td></tr><tr><th scope="row"><code>worker.crop-width</code></th><td>118</td><td>no change</td></tr></tbody></table></div>
+        
+        <dl class="provenance">
+          <div><dt>Semantic hash</dt><dd><code>532d35a53d2a181e9eeec772f1468cfa826c9c7ff30319863f2a77aefc5a99eb</code></dd></div>
+          <div><dt>Camera</dt><dd><code>None / Disabled / MSAA 1</code></dd></div>
+        </dl>
+        <div class="table-wrap"><table><caption>Verification sources</caption><thead><tr><th>Path</th><th>SHA-256</th></tr></thead><tbody><tr><th scope="row"><code>src/camera.rs</code></th><td><code>3a6027e94ecc1554d0ca38e5f61fb74d1b3bb74e87c0497c7ef0b50402c37f39</code></td></tr><tr><th scope="row"><code>src/design.rs</code></th><td><code>ba6db3023f2c1a817498bfb45407c4c85e07208615dc6cb39866c9ce9c0802fd</code></td></tr><tr><th scope="row"><code>src/hud.rs</code></th><td><code>5a46ef2d7ef416f51f83dcf989244f3f27b6ef56bff36509f8552a78619d7ab5</code></td></tr><tr><th scope="row"><code>src/metrics.rs</code></th><td><code>9d88181a2326258bccb3a106b00f18f80a9101fdac9fb500ee8dae68a439da88</code></td></tr><tr><th scope="row"><code>src/operations.rs</code></th><td><code>daa27c4161495068e177eb71db2596b103884f76fbece4dca15685be4a811eb8</code></td></tr><tr><th scope="row"><code>src/player.rs</code></th><td><code>4e6e676ac37610c6540ecbfb7ac2510f05deb48a93973ae40a79702f51212d41</code></td></tr><tr><th scope="row"><code>src/verification.rs</code></th><td><code>a4e2e0036be5c92c61d4184ec901a7e568a68df2982994219136bc63eeabc79f</code></td></tr><tr><th scope="row"><code>src/world.rs</code></th><td><code>01905ff23513555fb2f2696f52903eb9df1ce30af9f339f9ea22b0718e03a416</code></td></tr></tbody></table></div><div class="table-wrap"><table><caption>Generated assets</caption><thead><tr><th>Path</th><th>SHA-256</th></tr></thead><tbody><tr><th scope="row"><code>assets/generated/cooling-unit.glb</code></th><td><code>576beb4dcfa468f875a32b7dd3a3e09c28b3ecb3ffe20c4a70ad8453e771fe1c</code></td></tr><tr><th scope="row"><code>assets/generated/infrastructure.glb</code></th><td><code>31946ce8b869506d0ba170867a165d4c8388f240294f6a6d9e5ef2335be8bd0d</code></td></tr><tr><th scope="row"><code>assets/generated/rack.glb</code></th><td><code>088bcf31d9ed75e057abff432e88be7bc71e584a001a094ed030a4a760e47480</code></td></tr><tr><th scope="row"><code>assets/generated/technician.glb</code></th><td><code>db0582eb1d7976651522e0bacf9e57e2ebbef19b95320e130fb439dea9bb3606</code></td></tr><tr><th scope="row"><code>assets/generated/utility-props.glb</code></th><td><code>3ac07a9b2835896dcdbdeeb03bd333868327e7f0cca3dfd6618bd009f4099d9c</code></td></tr></tbody></table></div><div class="table-wrap"><table><caption>Asset sources</caption><thead><tr><th>Path</th><th>SHA-256</th></tr></thead><tbody><tr><th scope="row"><code>assets/source/cooling-unit.ron</code></th><td><code>e93fc327ca3f3bf34e0b0757ad468c047ed55bdb61796beb115d91a25db024e1</code></td></tr><tr><th scope="row"><code>assets/source/infrastructure.ron</code></th><td><code>8507f9dabd07fcfa97ba5b629d9ad7a2b9e08a8814a8fbc8095592b5b85edbef</code></td></tr><tr><th scope="row"><code>assets/source/rack.ron</code></th><td><code>767de7dcacbb435fc6f1b9c66943ef172f6d35dbb762773b3f98a80072f1c868</code></td></tr><tr><th scope="row"><code>assets/source/technician.ron</code></th><td><code>e1fe6064efe498f0511b5ea443d3370ce034bd852d75fa1f717276f4b739c8f1</code></td></tr><tr><th scope="row"><code>assets/source/utility-props.ron</code></th><td><code>93d497c8c69331e72ebaa9610d9258204e4d51627e4d416fda7508185069662d</code></td></tr></tbody></table></div><div class="table-wrap"><table><caption>Approved references</caption><thead><tr><th>Path</th><th>SHA-256</th></tr></thead><tbody><tr><th scope="row"><code>docs/reference/cel-shift-character-sheet.png</code></th><td><code>8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25</code></td></tr><tr><th scope="row"><code>docs/reference/cel-shift-key-art.png</code></th><td><code>a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75</code></td></tr></tbody></table></div>
+        <p class="section-link"><a href="verification.json">Open the sanitized verification report</a></p>
+        <p class="section-link"><a href="https://github.com/ridermw/midcreek-cs-1/actions/runs/33590215810">Open the workflow run</a></p>
+      </section>
+
+      <section class="panel section-panel" id="commits">
+        <div class="section-heading">
+          <div><span class="section-number">08</span><span class="eyebrow">Recent main history</span></div>
+          <h2>Commits</h2>
+        </div>
+        <div class="commit-list"><article class="commit-entry">
+          <div class="commit-sha">19716a91</div>
+          <div><h3>docs: record that splitting CornerProbes forces a baseline rebind</h3><p><time>2026-09-02T00:16:53-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">fefb948d</div>
+          <div><h3>docs: record the measurement that argues against optimized dev dependencies</h3><p><time>2026-09-02T00:15:42-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">3d05ae2d</div>
+          <div><h3>test: quarantine the software-rasterizer pixel defects on every platform</h3><p><time>2026-09-01T18:50:19-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">cb9fd3a3</div>
+          <div><h3>Revert &quot;feat: derive the camera elevation from the authority image&quot;</h3><p><time>2026-09-01T14:51:44-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">685c7ca2</div>
+          <div><h3>feat: derive the camera elevation from the authority image</h3><p><time>2026-09-01T14:02:00-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">7e43fda2</div>
+          <div><h3>feat: calibrate the projected row angle into the fidelity contract</h3><p><time>2026-09-01T13:35:39-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">64776970</div>
+          <div><h3>feat: pin focal placement in the Phase 1 baseline</h3><p><time>2026-09-01T13:28:08-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">ee7c5aef</div>
+          <div><h3>docs: amend U1 for the build.rs decision and the constant count</h3><p><time>2026-09-01T13:25:11-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">25121636</div>
+          <div><h3>docs: record the deferred reference_metrics widening</h3><p><time>2026-09-01T10:48:08-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">eb50dacb</div>
+          <div><h3>refactor: pin report references from the manifest</h3><p><time>2026-09-01T10:47:09-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">0046c631</div>
+          <div><h3>refactor: make the manifest the single runtime source of approved hashes</h3><p><time>2026-09-01T10:43:02-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">51f1d404</div>
+          <div><h3>refactor: move every fidelity bound out of the measurement engine</h3><p><time>2026-09-01T10:05:12-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">08569000</div>
+          <div><h3>feat: add the machine-readable fidelity contract</h3><p><time>2026-09-01T09:39:28-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">e703627c</div>
+          <div><h3>feat: bind the Phase 1 baseline</h3><p><time>2026-09-01T09:18:11-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">2426711c</div>
+          <div><h3>chore: restore LF line endings</h3><p><time>2026-09-01T07:46:03-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">fc427953</div>
+          <div><h3>test: activate the pixel fidelity contracts on Windows</h3><p><time>2026-09-01T07:46:02-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">2362451b</div>
+          <div><h3>chore: restore LF line endings</h3><p><time>2026-09-01T06:55:11-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">2737f8a4</div>
+          <div><h3>fix: draw the hall in software-rendered verification captures</h3><p><time>2026-09-01T06:54:53-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">4d71538e</div>
+          <div><h3>chore: restore LF line endings</h3><p><time>2026-09-01T00:16:12-04:00</time> · Unassociated</p></div>
+        </article><article class="commit-entry">
+          <div class="commit-sha">a860d07a</div>
+          <div><h3>test: stabilize Windows WARP render gate</h3><p><time>2026-09-01T00:15:32-04:00</time> · Unassociated</p></div>
+        </article></div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

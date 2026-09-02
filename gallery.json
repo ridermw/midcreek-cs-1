@@ -1,0 +1,43 @@
+{
+  "entries": [
+    {
+      "semantic_visual_hash": "532d35a53d2a181e9eeec772f1468cfa826c9c7ff30319863f2a77aefc5a99eb",
+      "source_commit": "3d05ae2d3233eef6cc916714a8eec2d7f49a71c5",
+      "committed_at": "2026-09-01T18:50:19-04:00",
+      "current_task": "ci-baseline",
+      "frames": {
+        "center": "screenshots/history/3d05ae2d/01-healthy-center-ne.png",
+        "fault": "screenshots/history/3d05ae2d/02-fault-queue-ne.png",
+        "repair": "screenshots/history/3d05ae2d/04-repairing-ne.png",
+        "resolved": "screenshots/history/3d05ae2d/05-resolved-ne.png",
+        "worker": "screenshots/history/3d05ae2d/worker-crop.png"
+      },
+      "metrics": {
+        "browser.canvas-height": 648.0,
+        "browser.canvas-width": 1152.0,
+        "browser.palette-classes": 9.0,
+        "browser.ready-seconds": 8.36,
+        "browser.unmatched-share": 0.020426097393689988,
+        "camera.msaa-samples": 1.0,
+        "camera.yaw-degrees": 45.0,
+        "equipment.on-screen": 17.0,
+        "gameplay.busy-pauses": 1.0,
+        "gameplay.capacity-pauses": 1.0,
+        "gameplay.duplicate-pauses": 0.0,
+        "gameplay.tickets-emitted": 4.0,
+        "hall.aisles": 3.0,
+        "hall.colliders": 13.0,
+        "hall.rack-rows": 4.0,
+        "hall.visuals": 35.0,
+        "render.blueprint-validation-errors": 0.0,
+        "render.frames-captured": 14.0,
+        "render.stages": 24.0,
+        "tickets.peak-open": 3.0,
+        "worker.crop-height": 162.0,
+        "worker.crop-pixels": 19116.0,
+        "worker.crop-width": 118.0
+      },
+      "metric_deltas": {}
+    }
+  ]
+}

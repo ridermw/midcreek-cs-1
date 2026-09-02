@@ -1,0 +1,499 @@
+{
+  "schema_version": 1,
+  "succeeded": true,
+  "failed_stage": null,
+  "stages": [
+    "boot",
+    "wait-for-assets",
+    "validate-blueprint",
+    "healthy-capture",
+    "seed-three-faults",
+    "fault-queue-capture",
+    "keyboard-journey",
+    "walk-capture",
+    "begin-repair",
+    "repair-capture",
+    "complete-repair",
+    "resolved-capture",
+    "orbit-south-east",
+    "settled-south-east-capture",
+    "orbit-south-west",
+    "settled-south-west-capture",
+    "orbit-north-west",
+    "settled-north-west-capture",
+    "mid-orbit-capture",
+    "corner-probes",
+    "low-resolution-capture",
+    "analyze-ready",
+    "write-report",
+    "success"
+  ],
+  "semantic_visual_hash": "532d35a53d2a181e9eeec772f1468cfa826c9c7ff30319863f2a77aefc5a99eb",
+  "camera": {
+    "tonemapping": "None",
+    "deband_dither": "Disabled",
+    "msaa_samples": 1,
+    "clear_color": "#FF00FF"
+  },
+  "hashes": {
+    "assets": {
+      "assets/generated/cooling-unit.glb": "576beb4dcfa468f875a32b7dd3a3e09c28b3ecb3ffe20c4a70ad8453e771fe1c",
+      "assets/generated/infrastructure.glb": "31946ce8b869506d0ba170867a165d4c8388f240294f6a6d9e5ef2335be8bd0d",
+      "assets/generated/rack.glb": "088bcf31d9ed75e057abff432e88be7bc71e584a001a094ed030a4a760e47480",
+      "assets/generated/technician.glb": "db0582eb1d7976651522e0bacf9e57e2ebbef19b95320e130fb439dea9bb3606",
+      "assets/generated/utility-props.glb": "3ac07a9b2835896dcdbdeeb03bd333868327e7f0cca3dfd6618bd009f4099d9c"
+    },
+    "asset_sources": {
+      "assets/source/cooling-unit.ron": "e93fc327ca3f3bf34e0b0757ad468c047ed55bdb61796beb115d91a25db024e1",
+      "assets/source/infrastructure.ron": "8507f9dabd07fcfa97ba5b629d9ad7a2b9e08a8814a8fbc8095592b5b85edbef",
+      "assets/source/rack.ron": "767de7dcacbb435fc6f1b9c66943ef172f6d35dbb762773b3f98a80072f1c868",
+      "assets/source/technician.ron": "e1fe6064efe498f0511b5ea443d3370ce034bd852d75fa1f717276f4b739c8f1",
+      "assets/source/utility-props.ron": "93d497c8c69331e72ebaa9610d9258204e4d51627e4d416fda7508185069662d"
+    },
+    "references": {
+      "docs/reference/cel-shift-character-sheet.png": "8a5a31e7bceb8ad16b3481d2bae89e7a32bb4edd0ef711b7d07a26f177cf6b25",
+      "docs/reference/cel-shift-key-art.png": "a30e12b63a36743015b1c73eeca6248a8b8ee974cf007f23666dc101f06c0e75"
+    },
+    "sources": {
+      "src/camera.rs": "3a6027e94ecc1554d0ca38e5f61fb74d1b3bb74e87c0497c7ef0b50402c37f39",
+      "src/design.rs": "ba6db3023f2c1a817498bfb45407c4c85e07208615dc6cb39866c9ce9c0802fd",
+      "src/hud.rs": "5a46ef2d7ef416f51f83dcf989244f3f27b6ef56bff36509f8552a78619d7ab5",
+      "src/metrics.rs": "9d88181a2326258bccb3a106b00f18f80a9101fdac9fb500ee8dae68a439da88",
+      "src/operations.rs": "daa27c4161495068e177eb71db2596b103884f76fbece4dca15685be4a811eb8",
+      "src/player.rs": "4e6e676ac37610c6540ecbfb7ac2510f05deb48a93973ae40a79702f51212d41",
+      "src/verification.rs": "a4e2e0036be5c92c61d4184ec901a7e568a68df2982994219136bc63eeabc79f",
+      "src/world.rs": "01905ff23513555fb2f2696f52903eb9df1ce30af9f339f9ea22b0718e03a416"
+    }
+  },
+  "frames": [
+    {
+      "name": "01-healthy-center-ne.png",
+      "artifact": "01-healthy-center-ne.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "healthy-capture",
+      "heading": "north-east",
+      "camera_yaw_degrees": 45.0,
+      "camera_settled": true,
+      "hud_status": "all-healthy",
+      "open_tickets": 0,
+      "rack_states": [
+        "healthy",
+        "healthy",
+        "healthy",
+        "healthy"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 17
+    },
+    {
+      "name": "02-fault-queue-ne.png",
+      "artifact": "02-fault-queue-ne.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "fault-queue-capture",
+      "heading": "north-east",
+      "camera_yaw_degrees": 45.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "faulted",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 17
+    },
+    {
+      "name": "03-walk-ne.png",
+      "artifact": "03-walk-ne.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "walk-capture",
+      "heading": "north-east",
+      "camera_yaw_degrees": 45.0,
+      "camera_settled": true,
+      "hud_status": "move-closer",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "faulted",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 580,
+        "y": 252,
+        "width": 117,
+        "height": 162
+      },
+      "equipment_on_screen": 23
+    },
+    {
+      "name": "04-repairing-ne.png",
+      "artifact": "04-repairing-ne.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "repair-capture",
+      "heading": "north-east",
+      "camera_yaw_degrees": 45.0,
+      "camera_settled": true,
+      "hud_status": "repairing",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "repairing",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 23
+    },
+    {
+      "name": "05-resolved-ne.png",
+      "artifact": "05-resolved-ne.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "resolved-capture",
+      "heading": "north-east",
+      "camera_yaw_degrees": 45.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 23
+    },
+    {
+      "name": "06-settled-se.png",
+      "artifact": "06-settled-se.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "settled-south-east-capture",
+      "heading": "south-east",
+      "camera_yaw_degrees": 135.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 25
+    },
+    {
+      "name": "07-settled-sw.png",
+      "artifact": "07-settled-sw.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "settled-south-west-capture",
+      "heading": "south-west",
+      "camera_yaw_degrees": 225.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 23
+    },
+    {
+      "name": "08-settled-nw.png",
+      "artifact": "08-settled-nw.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "settled-north-west-capture",
+      "heading": "north-west",
+      "camera_yaw_degrees": 315.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 25
+    },
+    {
+      "name": "09-mid-orbit.png",
+      "artifact": "09-mid-orbit.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "mid-orbit-capture",
+      "heading": "north-east",
+      "camera_yaw_degrees": 360.0,
+      "camera_settled": false,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 592,
+        "y": 260,
+        "width": 96,
+        "height": 144
+      },
+      "equipment_on_screen": 20
+    },
+    {
+      "name": "10-corner-ne.png",
+      "artifact": "10-corner-ne.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "corner-probes",
+      "heading": "north-east",
+      "camera_yaw_degrees": 44.999992,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 4
+    },
+    {
+      "name": "11-corner-se.png",
+      "artifact": "11-corner-se.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "corner-probes",
+      "heading": "south-east",
+      "camera_yaw_degrees": 135.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "resolved",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 5
+    },
+    {
+      "name": "12-corner-sw.png",
+      "artifact": "12-corner-sw.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "corner-probes",
+      "heading": "south-west",
+      "camera_yaw_degrees": 225.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 2,
+      "rack_states": [
+        "healthy",
+        "cooldown",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 4
+    },
+    {
+      "name": "13-corner-nw.png",
+      "artifact": "13-corner-nw.png",
+      "width": 1280,
+      "height": 720,
+      "stage": "corner-probes",
+      "heading": "north-west",
+      "camera_yaw_degrees": 315.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 2,
+      "rack_states": [
+        "healthy",
+        "cooldown",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 581,
+        "y": 251,
+        "width": 118,
+        "height": 162
+      },
+      "equipment_on_screen": 5
+    },
+    {
+      "name": "14-low-resolution-queue.png",
+      "artifact": "14-low-resolution-queue.png",
+      "width": 960,
+      "height": 540,
+      "stage": "low-resolution-capture",
+      "heading": "north-west",
+      "camera_yaw_degrees": 315.0,
+      "camera_settled": true,
+      "hud_status": "tickets-open",
+      "open_tickets": 3,
+      "rack_states": [
+        "healthy",
+        "faulted",
+        "faulted",
+        "faulted"
+      ],
+      "worker_crop": {
+        "x": 434,
+        "y": 186,
+        "width": 92,
+        "height": 125
+      },
+      "equipment_on_screen": 5
+    }
+  ],
+  "browser": {
+    "ready_seconds": 8.96,
+    "canvas_width": 1152,
+    "canvas_height": 648,
+    "palette_classes": [
+      "FLOOR_SHADOW",
+      "FLOOR_LIGHT",
+      "INK",
+      "RACK_SHADOW",
+      "RACK_WHITE",
+      "WORKER_SLATE",
+      "TEAL_ACCENT",
+      "SIGNATURE_YELLOW",
+      "HOSE_CHARCOAL"
+    ],
+    "unmatched_share": 0.020426097393689988,
+    "sampled_pixels": 46656,
+    "screenshot": "canvas.png"
+  },
+  "metrics": {
+    "browser.canvas-height": 648.0,
+    "browser.canvas-width": 1152.0,
+    "browser.palette-classes": 9.0,
+    "browser.ready-seconds": 8.96,
+    "browser.unmatched-share": 0.020426097393689988,
+    "camera.msaa-samples": 1.0,
+    "camera.yaw-degrees": 45.0,
+    "equipment.on-screen": 17.0,
+    "gameplay.busy-pauses": 1.0,
+    "gameplay.capacity-pauses": 1.0,
+    "gameplay.duplicate-pauses": 0.0,
+    "gameplay.tickets-emitted": 4.0,
+    "hall.aisles": 3.0,
+    "hall.colliders": 13.0,
+    "hall.rack-rows": 4.0,
+    "hall.visuals": 35.0,
+    "render.blueprint-validation-errors": 0.0,
+    "render.frames-captured": 14.0,
+    "render.stages": 24.0,
+    "tickets.peak-open": 3.0,
+    "worker.crop-height": 162.0,
+    "worker.crop-pixels": 19116.0,
+    "worker.crop-width": 118.0
+  },
+  "metric_failures": [],
+  "gates": [
+    {
+      "name": "Verified frame captures",
+      "status": "passed",
+      "passed": 14,
+      "failed": 0,
+      "duration_ms": 0,
+      "artifact_url": null
+    },
+    {
+      "name": "Verification stages",
+      "status": "passed",
+      "passed": 24,
+      "failed": 0,
+      "duration_ms": 0,
+      "artifact_url": null
+    },
+    {
+      "name": "Browser readiness",
+      "status": "passed",
+      "passed": 1,
+      "failed": 0,
+      "duration_ms": 8960,
+      "artifact_url": null
+    },
+    {
+      "name": "Browser canvas palette",
+      "status": "passed",
+      "passed": 9,
+      "failed": 0,
+      "duration_ms": 0,
+      "artifact_url": null
+    }
+  ]
+}
